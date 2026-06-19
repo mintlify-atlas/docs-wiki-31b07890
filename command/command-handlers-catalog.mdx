@@ -5,14 +5,18 @@ description: "How CommandHandlerProvider discovers @CommandType beans, the handl
 ---
 
 Apache Fineract ships **~460 `*CommandHandler.java` classes** across its
-Gradle modules. Every one of them is a Spring `@Service` that implements
-`NewCommandSourceHandler` and carries a `@CommandType(entity, action)`
-annotation. At startup, `CommandHandlerProvider` builds a single
-`HashMap<String, String>` keyed by `entity + "|" + action` so that
-`SynchronousCommandProcessingService` can hand a `CommandWrapper` to the
-right handler in O(1). This page documents the discovery mechanism, the
-handler package layout, and a representative sample of ~30 handlers grouped
-by domain.
+Gradle modules. The majority (~390) are Spring `@Service` beans that
+implement `NewCommandSourceHandler` and carry a `@CommandType(entity, action)`
+annotation; a smaller set (~40) implement the **newer** generic
+`CommandHandler<REQ, RES>` interface from
+[`fineract-command/core/`](/command/command-core) instead. At startup,
+`CommandHandlerProvider` builds a single `HashMap<String, String>` keyed by
+`entity + "|" + action` so that `SynchronousCommandProcessingService` can
+hand a `CommandWrapper` to the right `@CommandType` handler in O(1); the new
+SPI handlers are routed by `DefaultCommandHandlerManager` matching the
+payload class against each handler's generic `REQ`. This page documents
+both discovery mechanisms, the handler package layout, and a representative
+sample of ~30 handlers grouped by domain.
 
 ## The two-piece registration mechanism
 
@@ -179,7 +183,7 @@ fineract-provider/.../portfolio/collectionsheet/handler/             (1)
 fineract-provider/.../portfolio/fund/handler/                        (2)
 fineract-provider/.../portfolio/group/handler/                       (22)
 fineract-provider/.../portfolio/interestratechart/handler/           (6)
-fineract-provider/.../portfolio/loanaccount/handler/                 (~26, post-loan split)
+fineract-provider/.../portfolio/loanaccount/handler/                 (7, post-loan split: LoanInterestPaymentWaiver + loan/{contracttermination,reaging,reamortization})
 fineract-provider/.../portfolio/loanproduct/productmix/handler/      (3)
 fineract-provider/.../portfolio/meeting/handler/                     (4)
 fineract-provider/.../portfolio/note/handler/                        (2)
@@ -297,17 +301,18 @@ representative, not exhaustive — there are ~460 in total.
 
 ### Savings domain (fineract-provider/portfolio/savings/handler)
 
-| `entity`            | `action`           | Handler                                  | Notes                                          |
-|---------------------|--------------------|------------------------------------------|------------------------------------------------|
-| `SAVINGSACCOUNT`    | `CREATE`           | `CreateSavingsAccountCommandHandler`     | submit savings application                     |
-| `SAVINGSACCOUNT`    | `APPROVE`          | `ApproveSavingsAccountCommandHandler`    | manager approves application                   |
-| `SAVINGSACCOUNT`    | `ACTIVATE`         | `ActivateSavingsAccountCommandHandler`   | activate post-approval                         |
-| `SAVINGSACCOUNT`    | `DEPOSIT`          | `DepositSavingsAccountCommandHandler`    | money in                                       |
-| `SAVINGSACCOUNT`    | `WITHDRAWAL`       | `WithdrawSavingsAccountCommandHandler`   | money out                                      |
-| `SAVINGSACCOUNT`    | `CALCULATEINTEREST`| `CalculateInterestSavingsAccountCommandHandler` | nightly job target                       |
-| `SAVINGSACCOUNT`    | `POSTINTEREST`     | `PostInterestSavingsAccountCommandHandler`| post accrued interest                          |
-| `SAVINGSACCOUNT`    | `CLOSE`            | `CloseSavingsAccountCommandHandler`      | terminate account                              |
-| `SAVINGSACCOUNTCHARGE` | `CREATE`        | `CreateSavingsAccountChargeCommandHandler`| add a charge to a savings account            |
+| `entity`               | `action`            | Handler                                                  | Notes                                          |
+|------------------------|---------------------|----------------------------------------------------------|------------------------------------------------|
+| `SAVINGSACCOUNT`       | `CREATE`            | `SavingsAccountApplicationSubmittalCommandHandler`       | submit savings application                     |
+| `SAVINGSACCOUNT`       | `APPROVE`           | `SavingsAccountApplicationApprovalCommandHandler`        | manager approves application                   |
+| `SAVINGSACCOUNT`       | `ACTIVATE`          | `ActivateSavingsAccountCommandHandler`                   | activate post-approval                         |
+| `SAVINGSACCOUNT`       | `DEPOSIT`           | `DepositSavingsAccountCommandHandler`                    | money in                                       |
+| `SAVINGSACCOUNT`       | `WITHDRAWAL`        | `WithdrawSavingsAccountCommandHandler`                   | money out                                      |
+| `SAVINGSACCOUNT`       | `CALCULATEINTEREST` | `CalculateInterestSavingsAccountCommandHandler`          | nightly job target                             |
+| `SAVINGSACCOUNT`       | `POSTINTEREST`      | `PostInterestSavingsAccountCommandHandler`               | post accrued interest                          |
+| `SAVINGSACCOUNT`       | `CLOSE`             | `CloseSavingsAccountCommandHandler`                      | terminate account                              |
+| `SAVINGSACCOUNTCHARGE` | `CREATE`            | `AddSavingsAccountChargeCommandHandler`                  | add a charge to a savings account              |
+| `SAVINGSACCOUNTCHARGE` | `WAIVE`             | `WaiveSavingsAccountChargeCommandHandler`                | waive an unpaid charge                         |
 
 ### Client / Group portfolio (fineract-provider/portfolio/client|group/handler)
 
@@ -335,7 +340,7 @@ representative, not exhaustive — there are ~460 in total.
 | `JOURNALENTRY`  | `REVERSE`             | `ReverseJournalEntryCommandHandler`       | undo with mirror entry               |
 | `ACCOUNTINGRULE` | `CREATE`             | `CreateAccountingRuleCommandHandler`      | reusable account templates           |
 | `GLCLOSURE`     | `CREATE`              | `CreateGLClosureCommandHandler`           | period close                          |
-| `FINANCIALACTIVITYACCOUNT` | `CREATE`   | `CreateFinancialActivityAccountMappingCommandHandler` | map activities ↔ GL accounts |
+| `FINANCIALACTIVITYACCOUNT` | `CREATE`   | `CreateFinancialActivityAccountHandler`               | map activities ↔ GL accounts |
 
 ### Organisation (fineract-branch, fineract-provider)
 
@@ -343,7 +348,7 @@ representative, not exhaustive — there are ~460 in total.
 |-----------------|-----------------|-------------------------------------------|--------------------------------------|
 | `OFFICE`        | `CREATE`        | `CreateOfficeCommandHandler`               | branch hierarchy                     |
 | `OFFICE`        | `UPDATE`        | `UpdateOfficeCommandHandler`               |                                      |
-| `STAFF`         | `CREATE`        | `CreateStaffCommandHandler`                | loan officer / teller                |
+| `STAFF`         | n/a — new SPI   | `StaffCreateCommandHandler`                | loan officer / teller — implements the **new** `CommandHandler<StaffCreateRequest, StaffCreateResponse>` SPI, not `NewCommandSourceHandler` |
 | `HOLIDAY`       | `CREATE`        | `CreateHolidayCommandHandler`              | per-office holiday calendar          |
 | `TELLER`        | `CREATE`        | `CreateTellerCommandHandler`               | teller / cashier                     |
 | `TELLER`        | `ALLOCATECASHIER` | `AllocateCashierToTellerCommandHandler`  | assign cashier shift                 |
@@ -353,10 +358,11 @@ representative, not exhaustive — there are ~460 in total.
 | `entity`                | `action`        | Handler                                                  | Notes                                  |
 |-------------------------|-----------------|----------------------------------------------------------|----------------------------------------|
 | `CONFIGURATION`         | `UPDATE`        | `UpdateGlobalConfigurationCommandHandler`                 | toggle e.g. maker-checker per task     |
-| `PERMISSION`            | `UPDATE`        | `UpdatePermissionsCommandHandler`                         | edit role-permission grid              |
+| `PERMISSION`            | `UPDATE`        | `UpdateMakerCheckerPermissionsCommandHandler`             | toggle maker-checker per task          |
+| `ROLE`                  | `PERMISSIONS`   | `UpdateRolePermissionsCommandHandler`                     | edit role-permission grid              |
 | `ROLE`                  | `CREATE`        | `CreateRoleCommandHandler`                                | user-administration role               |
 | `USER`                  | `CREATE`        | `CreateUserCommandHandler`                                | app user                               |
-| `USER`                  | `CHANGEPWD`     | `ChangePasswordCommandHandler`                            | self-service password change           |
+| `USER`                  | `CHANGEPWD`     | `ChangeUserPasswordCommandHandler`                        | self-service password change           |
 | `SCHEDULER`             | `EXECUTEJOB`    | `ExecuteJobCommandHandler`                                | run named scheduled job                |
 | `EMAIL_CAMPAIGN`        | `CREATE`        | `CreateEmailCampaignCommandHandler`                       | engagement campaigns                   |
 | `SMSCAMPAIGN`           | `ACTIVATE`      | `ActivateSmsCampaignCommandHandler`                       | switch on a campaign                   |
@@ -370,29 +376,36 @@ shape of the bus. The list below is **every distinct entity in use today**
 
 ```
 ACCOUNTINGRULE, ACCOUNTNUMBERFORMAT, ACCOUNTTRANSFER, ADDRESS, ADHOC,
-CALENDAR, CENTER, CHARGE, CLIENT, CLIENTIDENTIFIER, CODE, CODEVALUE,
-COLLATERAL, COLLATERAL_PRODUCT, COLLECTIONSHEET, CONFIGURATION, CREATE,
-CREDITBUREAU_CONFIGURATION, CREDITBUREAU_LOANPRODUCT_MAPPING, CREDITREPORT,
-DELETE, DELINQUENCY_ACTION, DELINQUENCY_BUCKET, DELINQUENCY_RANGE, EMAIL,
-EMAIL_CAMPAIGN, EMAIL_CONFIGURATION, ENTITYMAPPING, ENTITY_DATATABLE_CHECK,
-EXTERNALSERVICES, FAMILYMEMBERS, FINANCIALACTIVITYACCOUNT, FIXEDDEPOSITACCOUNT,
-FIXEDDEPOSITPRODUCT, FLOATINGRATE, FUND, GLACCOUNT, GLCLOSURE, GLIMLOAN, GROUP,
-GSIMACCOUNT, GUARANTOR, HOLIDAY, JOURNALENTRY, LIKELIHOOD, LOAN, LOANCHARGE,
-LOANPRODUCT, LOAN_AVAILABLE_DISBURSEMENT_AMOUNT, LOAN_ORIGINATOR, OFFICE,
-OFFICETRANSACTION, ORGANISATIONCREDITBUREAU, PASSWORD_PREFERENCES,
-PERIODICACCRUALACCOUNTING, PERMISSION, PROVISIONCATEGORY, PROVISIONCRITERIA,
-PROVISIONENTRIES, PROVISIONJOURNALENTRIES, RATE, RECURRINGDEPOSITACCOUNT,
-RECURRINGDEPOSITPRODUCT, REPORT, RESCHEDULELOAN, ROLE, SAVINGSACCOUNT,
-SAVINGSACCOUNTCHARGE, SAVINGSPRODUCT, SCHEDULER, SHAREACCOUNT, SHAREPRODUCT,
-SMS, SMSCAMPAIGN, STANDINGINSTRUCTION, TAXCOMPONENT, TAXGROUP, TELLER, UPDATE,
+ASSET_OWNER_TRANSACTION, BATCH_BUSINESS_STEP, CALENDAR, CENTER, CHARGE,
+CLIENT, CLIENTIDENTIFIER, CODE, CODEVALUE, COLLATERAL, COLLATERAL_PRODUCT,
+COLLECTIONSHEET, CONFIGURATION, CREDITBUREAU_CONFIGURATION,
+CREDITBUREAU_LOANPRODUCT_MAPPING, CREDITREPORT, DELINQUENCY_ACTION,
+DELINQUENCY_BUCKET, DELINQUENCY_RANGE, EMAIL, EMAIL_CAMPAIGN,
+EMAIL_CONFIGURATION, ENTITYMAPPING, ENTITY_DATATABLE_CHECK, EXTERNALSERVICES,
+EXTERNAL_ASSET_OWNER, EXTERNAL_ASSET_OWNER_LOAN_PRODUCT_ATTRIBUTE,
+FAMILYMEMBERS, FINANCIALACTIVITYACCOUNT, FIXEDDEPOSITACCOUNT,
+FIXEDDEPOSITPRODUCT, FLOATINGRATE, FUND, GLACCOUNT, GLCLOSURE, GLIMLOAN,
+GROUP, GSIMACCOUNT, GUARANTOR, HOLIDAY, HUMAN, INLINE_JOB, JOURNALENTRY,
+LIKELIHOOD, LOAN, LOANCHARGE, LOANPRODUCT, LOAN_AVAILABLE_DISBURSEMENT_AMOUNT,
+LOAN_COLLATERAL_PRODUCT, LOAN_ORIGINATOR, OFFICE, OFFICETRANSACTION,
+ORGANISATIONCREDITBUREAU, PASSWORD_PREFERENCES, PERIODICACCRUALACCOUNTING,
+PERMISSION, PROVISIONCATEGORY, PROVISIONCRITERIA, PROVISIONENTRIES,
+PROVISIONJOURNALENTRIES, RATE, RECURRINGDEPOSITACCOUNT,
+RECURRINGDEPOSITPRODUCT, REPAYMENT_WITH_POSTDATEDCHECKS, REPORT,
+RESCHEDULELOAN, ROLE, SAVINGSACCOUNT, SAVINGSACCOUNTCHARGE, SAVINGSPRODUCT,
+SCHEDULER, SHAREACCOUNT, SHAREPRODUCT, SMS, SMSCAMPAIGN, STANDINGINSTRUCTION,
+TAXCOMPONENT, TAXGROUP, TELLER, TWOFACTOR_ACCESSTOKEN, TWOFACTOR_CONFIGURATION,
 USER, WAIVECHARGE, WC_DELINQUENCY_ACTION, WORKINGCAPITALBREACH,
 WORKINGCAPITALLOAN, WORKINGCAPITALLOANPRODUCT, WORKINGCAPITALNEARBREACH
 ```
 
 Plus a handful of handlers that source their entity from a `*ApiConstants`
 constant (`ClientApiConstants.CLIENT_CHARGES_RESOURCE_NAME`,
-`CommandWrapperConstants.ENTITY_WORKINGCAPITALLOAN`, etc.) — these resolve to
-strings in the same UPPERCASE namespace.
+`ClientApiConstants.CLIENT_RESOURCE_NAME`,
+`CommandWrapperConstants.ENTITY_WORKINGCAPITALLOAN`,
+`ReportMailingJobConstants.REPORT_MAILING_JOB_ENTITY_NAME`, and a few
+interoperation `ENTITY_NAME_*` constants) — these resolve to strings in the
+same UPPERCASE namespace.
 
 ## How a `CommandWrapper` ends up at a handler
 

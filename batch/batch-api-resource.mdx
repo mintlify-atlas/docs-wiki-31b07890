@@ -152,7 +152,7 @@ public class BatchResponse {
 | Field | Type | Notes |
 | --- | --- | --- |
 | `requestId` | `Long` | Echoed from the request. The response array is sorted by this field before being returned. |
-| `statusCode` | `Integer` | The HTTP status the underlying handler would have returned. `200` on success, `409` for skipped children when their parent fails, `500` for unexpected exceptions. |
+| `statusCode` | `Integer` | The HTTP status the underlying handler would have returned. `200` on success; skipped children inherit the parent's failure status; `500` (`SC_INTERNAL_SERVER_ERROR`) is used when `buildErrorResponse` cannot derive one from `ErrorInfo`. |
 | `headers` | `Set<Header>` | The request's headers, plus any headers from `ErrorInfo` on failure. |
 | `body` | `String` | Raw JSON body returned by the handler — or a server-generated error message. |
 
@@ -179,9 +179,9 @@ call.
 
 ## Deserialization
 
-The request body comes off the wire as a JSON array. JAX-RS hands it to the
-resource as `List<BatchRequest>` via Jackson; for code paths that need to
-re-parse the string,
+The request body comes off the wire as a JSON array. The Jersey/JAX-RS
+runtime materialises it into `List<BatchRequest>` and passes it to
+`handleBatchRequests`; for code paths that need to re-parse the string,
 [`BatchRequestJsonHelper`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/serialization/BatchRequestJsonHelper.java)
 extends Fineract's Gson-based `FromJsonHelper`:
 
@@ -196,11 +196,10 @@ public class BatchRequestJsonHelper extends FromJsonHelper {
 }
 ```
 
-Two separate JSON stacks coexist deliberately: the inbound array is parsed
-once, while the per-request body field stays a `String` until a handler (or
-the JsonPath resolver) needs to look inside it. That avoids re-serializing
-deeply nested loan-application bodies and lets each handler choose its own
-parser.
+The inbound array is parsed once at the JAX-RS boundary, while the
+per-request `body` field stays a `String` until a handler (or the JsonPath
+resolver) needs to look inside it. That avoids re-serializing deeply nested
+loan-application bodies and lets each handler choose its own parser.
 
 ## Validation: read-only mode
 
@@ -263,7 +262,7 @@ sequenceDiagram
             Svc->>Resv: resolveRequest(child, parentResponse)
             Resv-->>Svc: child with $.fields substituted
         else response != 200
-            Svc->>Svc: parentRequestFailedRecursive (409 skip)
+            Svc->>Svc: parentRequestFailedRecursive (skip children, inherit status)
         end
     end
     Svc-->>Res: List<BatchResponse> sorted
@@ -439,8 +438,9 @@ N: the partial results would be misleading after a rollback.
 <Note>
   In **non-transactional** mode each root sub-request commits independently and
   the response list contains an entry for every input — but children of a
-  failing parent are still skipped, with a synthetic `409` body of
-  `"Parent request with id N was erroneous!"` produced by
+  failing parent are still skipped, with a synthetic response carrying the
+  parent's failure status code and a body of
+  `"Parent request with id N was erroneous!"`, produced by
   `parentRequestFailedRecursive`.
 </Note>
 

@@ -100,9 +100,10 @@ the caller sees a clear error rather than a `NullPointerException`.
 
 ## Handlers grouped by domain
 
-The 50 strategies under
+The 51 strategies under
 `fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/`
-cover five domains. Each table lists:
+cover five domains (a 52nd, `UnknownCommandStrategy`, lives in
+`fineract-core` as the fallback for unmatched routes). Each table lists:
 
 - **Strategy** — the bean class name (file lives in the package above).
 - **Method** — HTTP method for the sub-request.
@@ -183,8 +184,8 @@ This is the largest cluster. Each row covers a forwarded operation on
 | `AdjustLoanTransactionByExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/transactions/external-id/{transactionExternalId}` | `LoanTransactionsApiResource` (external-id overload) |
 | `GetLoanTransactionByIdCommandStrategy` | GET | `v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.retrieveTransaction(...)` |
 | `GetLoanTransactionByExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/transactions/external-id/{transactionExternalId}` | `LoanTransactionsApiResource` (external-id overload) |
-| `GetReagePreviewByLoanIdCommandStrategy` | GET | `v1/loans/{loanId}/transactions/reage-preview` | `LoanTransactionsApiResource.retrieveReagePreview(...)` |
-| `GetReagePreviewByLoanExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/transactions/reage-preview` | `LoanTransactionsApiResource` (external-id overload) |
+| `GetReagePreviewByLoanIdCommandStrategy` | GET | `v1/loans/{loanId}/transactions/reage-preview` | `LoanTransactionsApiResource.previewReAgeSchedule(...)` |
+| `GetReagePreviewByLoanExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/transactions/reage-preview` | `LoanTransactionsApiResource.previewReAgeSchedule(...)` (external-id overload) |
 
 #### Reschedules
 
@@ -200,12 +201,12 @@ loan-ID and external-ID variants:
 
 | Strategy | Method | `relativeUrl` pattern | Upstream resource |
 | --- | --- | --- | --- |
-| `GetLoanInterestPausesByLoanIdCommandStrategy` | GET | `v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.retrieveAll(...)` |
-| `CreateLoanInterestPauseByLoanIdCommandStrategy` | POST | `v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.create(...)` |
-| `UpdateLoanInterestPauseByLoanIdCommandStrategy` | PUT | `v1/loans/{loanId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource.update(...)` |
-| `GetLoanInterestPausesByExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/interest-pauses` | `LoanInterestPauseApiResource` (external-id overload) |
-| `CreateLoanInterestPauseByExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/interest-pauses` | `LoanInterestPauseApiResource` (external-id overload) |
-| `UpdateLoanInterestPauseByExternalIdCommandStrategy` | PUT | `v1/loans/external-id/{externalId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource` (external-id overload) |
+| `GetLoanInterestPausesByLoanIdCommandStrategy` | GET | `v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.retrieveInterestPauses(...)` |
+| `CreateLoanInterestPauseByLoanIdCommandStrategy` | POST | `v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.createInterestPause(...)` |
+| `UpdateLoanInterestPauseByLoanIdCommandStrategy` | PUT | `v1/loans/{loanId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource.updateInterestPause(...)` |
+| `GetLoanInterestPausesByExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/interest-pauses` | `LoanInterestPauseApiResource.retrieveInterestPauses(...)` (external-id overload) |
+| `CreateLoanInterestPauseByExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/interest-pauses` | `LoanInterestPauseApiResource.createInterestPause(...)` (external-id overload) |
+| `UpdateLoanInterestPauseByExternalIdCommandStrategy` | PUT | `v1/loans/external-id/{externalId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource.updateInterestPause(...)` (external-id overload) |
 
 ### Savings accounts
 
@@ -226,13 +227,13 @@ one-to-one and one-to-many variants:
 | Strategy | Method | `relativeUrl` pattern | Upstream resource |
 | --- | --- | --- | --- |
 | `CreateDatatableEntryCommandStrategy` | POST | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.createDatatableEntry(...)` |
-| `UpdateDatatableEntryOneToOneCommandStrategy` | PUT | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.updateDatatableEntryOneToOne(...)` |
+| `UpdateDatatableEntryOneToOneCommandStrategy` | PUT | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.updateDatatableEntryOnetoOne(...)` |
 | `UpdateDatatableEntryOneToManyCommandStrategy` | PUT | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DatatablesApiResource.updateDatatableEntryOneToMany(...)` |
 | `DeleteDatatableEntryOneToOneCommandStrategy` | DELETE | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.deleteDatatableEntries(...)` |
-| `DeleteDatatableEntryOneToManyCommandStrategy` | DELETE | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DatatablesApiResource.deleteDatatableEntries(...)` |
-| `GetDatatableEntryByAppTableIdCommandStrategy` | GET | `v1/datatables/{datatable}/{appTableId}` | `DataTablesApiResource.getDatatable(...)` |
-| `GetDatatableEntryByAppTableIdAndDataTableIdCommandStrategy` | GET | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DataTablesApiResource.getDatatableManyEntry(...)` |
-| `GetDatatableEntryByQueryCommandStrategy` | GET | `v1/datatables/{datatable}/query?<params>` | `DataTablesApiResource.queryValues(...)` |
+| `DeleteDatatableEntryOneToManyCommandStrategy` | DELETE | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DatatablesApiResource.deleteDatatableEntry(...)` |
+| `GetDatatableEntryByAppTableIdCommandStrategy` | GET | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.getDatatable(...)` |
+| `GetDatatableEntryByAppTableIdAndDataTableIdCommandStrategy` | GET | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DatatablesApiResource.getDatatableManyEntry(...)` |
+| `GetDatatableEntryByQueryCommandStrategy` | GET | `v1/datatables/{datatable}/query?<params>` | `DatatablesApiResource.queryValues(...)` |
 
 ```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java
 commandStrategies.put(CommandContext.resource("v1\\/datatables\\/" + ALPHANUMBERIC_WITH_UNDERSCORE_REGEX + "\\/" + NUMBER_REGEX)
@@ -376,7 +377,7 @@ strategies touch it, this is the reverse mapping:
 | `SavingsAccountsApiResource` | `ApplySavingsCommandStrategy`, `GetSavingsAccountByIdCommandStrategy` |
 | `SavingsAccountTransactionsApiResource` | `SavingsAccountTransactionCommandStrategy`, `SavingsAccountAdjustTransactionCommandStrategy` |
 | `SavingsAccountChargesApiResource` | `CreateSavingsAccountChargeCommandStrategy`, `PaySavingsAccountChargeCommandStrategy` |
-| `DatatablesApiResource` / `DataTablesApiResource` | `CreateDatatableEntryCommandStrategy`, `UpdateDatatableEntryOneToOneCommandStrategy`, `UpdateDatatableEntryOneToManyCommandStrategy`, `DeleteDatatableEntryOneToOneCommandStrategy`, `DeleteDatatableEntryOneToManyCommandStrategy`, `GetDatatableEntryByAppTableIdCommandStrategy`, `GetDatatableEntryByAppTableIdAndDataTableIdCommandStrategy`, `GetDatatableEntryByQueryCommandStrategy` |
+| `DatatablesApiResource` | `CreateDatatableEntryCommandStrategy`, `UpdateDatatableEntryOneToOneCommandStrategy`, `UpdateDatatableEntryOneToManyCommandStrategy`, `DeleteDatatableEntryOneToOneCommandStrategy`, `DeleteDatatableEntryOneToManyCommandStrategy`, `GetDatatableEntryByAppTableIdCommandStrategy`, `GetDatatableEntryByAppTableIdAndDataTableIdCommandStrategy`, `GetDatatableEntryByQueryCommandStrategy` |
 | `PortfolioCommandSourceWritePlatformService` | `CreateAccountTransferCommandStrategy` |
 
 ## Where to go next

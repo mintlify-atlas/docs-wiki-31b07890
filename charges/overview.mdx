@@ -48,7 +48,7 @@ The module lives entirely under `fineract-charge/src/main/java/org/apache/finera
 |------------|---------|
 | `api/` | `ChargesApiResource` (`/v1/charges`), `ChargesApiConstants` parameter names, Swagger DTOs |
 | `domain/` | `Charge` JPA entity, the four enum value objects (`ChargeAppliesTo`, `ChargeCalculationType`, `ChargePaymentMode`, plus `ChargeTimeType` from `fineract-core`), and the `ChargeRepository`/`ChargeRepositoryWrapper` pair |
-| `exception/` | 15 typed exceptions: not-found, can-not-be-applied, can-not-be-deleted, can-not-be-updated, due-at-disbursement-can-not-be-penalty, must-be-penalty, plus loan-charge and share-charge specific ones |
+| `exception/` | 16 typed exceptions: not-found, can-not-be-applied, can-not-be-deleted, can-not-be-updated, due-at-disbursement-can-not-be-penalty, is-not-active, must-be-penalty, plus loan-charge and share-charge specific ones |
 | `handler/` | The three command handlers wired to `CHARGE/CREATE`, `CHARGE/UPDATE`, `CHARGE/DELETE` via `@CommandType` |
 | `request/` | `ChargeRequest` — Lombok-`@Data` DTO mirroring the create/update JSON body |
 | `serialization/` | `ChargeDefinitionCommandFromApiJsonDeserializer` — validates the JSON command against allowed parameters |

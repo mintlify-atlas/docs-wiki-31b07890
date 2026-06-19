@@ -10,17 +10,17 @@ Apache Fineract is multi-tenant by design: a single deployment can host **N** fi
 
 ```mermaid
 flowchart LR
-    subgraph tenant-store DB
+    subgraph TStore["tenant-store DB"]
       TS[(tenants table)]
       TSC[(tenant_server_connections table)]
     end
-    subgraph tenant_default DB
+    subgraph TDefault["tenant_default DB"]
       D1[(loan, client, savings,<br/>... 200+ application tables)]
     end
-    subgraph tenant_acme DB
+    subgraph TAcme["tenant_acme DB"]
       D2[(loan, client, savings, ...)]
     end
-    subgraph tenant_demo DB
+    subgraph TDemo["tenant_demo DB"]
       D3[(loan, client, savings, ...)]
     end
     TS -. references .-> TSC
@@ -468,7 +468,7 @@ sequenceDiagram
     participant JT as JdbcTemplate
     participant RDS as RoutingDataSource
     participant TJDS as TomcatJdbcDataSourcePerTenantService
-    participant Pool as Hikari pool (per tenant)
+    participant Pool as Hikari pool per tenant
     participant TenantDB as tenant_default DB
 
     Client->>Tomcat: GET /api/v1/clients/42<br/>Fineract-Platform-TenantId: default

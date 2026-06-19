@@ -63,7 +63,7 @@ tasks.jibDockerBuild.dependsOn(bootJar, resolve, generateGitProperties)
 
 Key points:
 
-- **Base image** — `azul/zulu-openjdk-alpine:21`. Alpine keeps the image small; Zulu's `headful` builds avoid the missing-fontconfig issues that hit some report features on `headless` JDKs.
+- **Base image** — `azul/zulu-openjdk-alpine:21`. Alpine keeps the image small; the Zulu Alpine build ships a known-good musl-compatible OpenJDK 21 distribution.
 - **Multi-arch** — the host's architecture is autodetected, so an Apple Silicon developer builds an `arm64` image and an Intel CI runner builds `amd64`. Cross-arch publishing requires running both targets separately.
 - **Tags** — every build pushes both `${project.version}` (Git-versioning produces e.g. `1.13.1-SNAPSHOT`) and `latest`.
 - **Multi-stage by construction** — Jib does not need a Dockerfile or a builder stage. It receives the already-assembled Spring Boot fat JAR from `bootJar` and projects it into **separate layers** (dependencies, snapshot dependencies, resources, classes) so that a typical code change only invalidates the smallest layer.

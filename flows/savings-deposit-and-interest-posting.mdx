@@ -124,7 +124,7 @@ return new CommandProcessingResultBuilder()
 | Action | Handler | Calls |
 | --- | --- | --- |
 | `DEPOSIT` | `DepositSavingsAccountCommandHandler` | `deposit(...)` |
-| `WITHDRAWAL` | `SavingsAccountWithdrawalCommandHandler` | `withdrawal(...)` |
+| `WITHDRAWAL` | `WithdrawSavingsAccountCommandHandler` | `withdrawal(...)` |
 | `POSTINTEREST` | `PostInterestSavingsAccountCommandHandler` | `postInterest(JsonCommand)` |
 | `POSTINTERESTASONDATE` | `PostSavingsAccountInterestAsOnDateCommandHandler` | `postInterest(JsonCommand)` |
 | `CALCULATEINTEREST` | `CalculateInterestSavingsAccountCommandHandler` | `calculateInterest(...)` |
@@ -184,7 +184,7 @@ sequenceDiagram
 | 2 | Tasklet | `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/jobs/postinterestforsavings/PostInterestForSavingTasklet.java` | Implements `Tasklet.execute(...)` — paging + thread pool fan-out. |
 | 3 | Read service | `fineract-provider/.../service/SavingsAccountReadPlatformServiceImpl.java`, method `retrieveAllSavingsDataForInterestPosting(...)` | Pages `ACTIVE` savings with `id > maxSavingsIdInList`. |
 | 4 | Per-task wrapper | `fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsSchedularInterestPosterTask.java` | Implements `Callable<Void>`; restores `ThreadLocalContextUtil` from the captured `FineractContext` so the worker thread sees the right tenant + business date. |
-| 5 | Poster | `fineract-savings/.../service/SavingsSchedularInterestPoster.java` (impl in `fineract-provider`) | Loops over the assigned `SavingsAccountData` and calls `postInterest(account, ...)` on the write service. |
+| 5 | Poster | `fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsSchedularInterestPoster.java` | Loops over the assigned `SavingsAccountData` and calls `postInterest(account, ...)` on the write service. |
 | 6 | Write service | `SavingsAccountWritePlatformServiceJpaRepositoryImpl.postInterest(SavingsAccount account, boolean postInterestAs, LocalDate transactionDate, boolean backdatedTxnsAllowedTill)` | Produces and persists an `INTEREST_POSTING` transaction with the GL entries. |
 
 ### What the tasklet does, in code
@@ -261,7 +261,7 @@ Although out of scope for the synchronous deposit flow, the **withdrawal** path 
 
 | Step | Withdrawal-specific behaviour |
 | --- | --- |
-| Handler | `SavingsAccountWithdrawalCommandHandler` (`@CommandType(entity="SAVINGSACCOUNT", action="WITHDRAWAL")`). |
+| Handler | `WithdrawSavingsAccountCommandHandler` (`@CommandType(entity="SAVINGSACCOUNT", action="WITHDRAWAL")`). |
 | Write service | `SavingsAccountWritePlatformServiceJpaRepositoryImpl.withdraw(...)`. |
 | Validation | `SavingsAccountTransactionDataValidator.validate(command)` plus a min-balance / overdraft check against the savings product configuration. |
 | Charge applied | Optional `WITHDRAWAL_FEE`; posted as a separate `SavingsAccountTransaction` row inside the same transaction. |

@@ -200,8 +200,10 @@ public class OfficesApiResource {
 | GET    | `/v1/offices`                     | List offices, optional `orderBy`, `sortOrder`   |
 | GET    | `/v1/offices/template`            | New-office template (allowed parents)           |
 | GET    | `/v1/offices/{officeId}`          | Retrieve one office                             |
+| GET    | `/v1/offices/external-id/{externalId}` | Retrieve one office by external id         |
 | POST   | `/v1/offices`                     | Create a child office                           |
 | PUT    | `/v1/offices/{officeId}`          | Rename / re-parent / re-date                    |
+| PUT    | `/v1/offices/external-id/{externalId}` | Update by external id                      |
 | GET    | `/v1/offices/downloadtemplate`    | Excel template for bulk import                  |
 | POST   | `/v1/offices/uploadtemplate`      | Upload bulk-import workbook                     |
 

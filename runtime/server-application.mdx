@@ -253,7 +253,7 @@ sequenceDiagram
     participant SC as Spring Context
     participant FWC as FineractWebApplicationCondition
     participant Web as FineractWebApplicationConfiguration
-    participant Cfg as @ComponentScan(org.apache.fineract.**)
+    participant Cfg as ComponentScan org.apache.fineract
     participant TUS as TenantDatabaseUpgradeService
     participant Tom as Embedded Tomcat
     JVM->>SA: main(args)

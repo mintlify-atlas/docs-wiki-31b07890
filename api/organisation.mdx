@@ -60,8 +60,10 @@ Offices form a tree — every tenant starts with a Head Office row at depth 0 an
 | GET | `/v1/offices/template` | `retrieveOfficeTemplate` |
 | POST | `/v1/offices` | `createOffice` |
 | GET | `/v1/offices/{officeId}` | `retrieveOffice` |
-| GET | `/v1/offices/external-id/{externalId}` | `updateOffice` |
-| PUT | `/v1/offices/external-id/{externalId}` | `getOfficeTemplate` |
+| PUT | `/v1/offices/{officeId}` | `updateOffice` |
+| GET | `/v1/offices/external-id/{externalId}` | `retrieveOfficeByExternalId` |
+| PUT | `/v1/offices/external-id/{externalId}` | `updateOfficeWithExternalId` |
+| GET | `/v1/offices/downloadtemplate` | `getOfficeTemplate` |
 | POST | `/v1/offices/uploadtemplate` | `postOfficeTemplate` |
 
 The list endpoint honours `?includeAllOffices=true` for the org-wide drop-down. `OfficeTransactionsApiResource` (sibling file) records inter-office transfers — those are not lifecycle endpoints and are documented in the source.

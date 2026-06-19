@@ -132,7 +132,7 @@ Returns the full list of registered types and their on/off status:
   "externalEventConfiguration": [
     { "type": "ClientCreateBusinessEvent",   "enabled": true  },
     { "type": "ClientActivateBusinessEvent", "enabled": true  },
-    { "type": "LoanCreateBusinessEvent",     "enabled": false },
+    { "type": "LoanCreatedBusinessEvent",    "enabled": false },
     { "type": "LoanApprovedBusinessEvent",   "enabled": false },
     { "type": "SavingsDepositBusinessEvent", "enabled": true  }
   ]
@@ -161,8 +161,8 @@ Example payload:
 ```json
 {
   "externalEventConfigurations": {
-    "LoanCreateBusinessEvent":   true,
-    "LoanApprovedBusinessEvent": true,
+    "LoanCreatedBusinessEvent":   true,
+    "LoanApprovedBusinessEvent":  true,
     "LoanDisbursalBusinessEvent": true
   }
 }
@@ -176,7 +176,7 @@ the same `changes` shape that the rest of the [command bus](/command/overview) u
 {
   "changes": {
     "externalEventConfigurations": {
-      "LoanCreateBusinessEvent": true,
+      "LoanCreatedBusinessEvent": true,
       "LoanApprovedBusinessEvent": true,
       "LoanDisbursalBusinessEvent": true
     }
@@ -423,8 +423,9 @@ include security/SSL properties if your cluster requires them.
 ## Purge retention
 
 Independent of the producer, the **purge** retention window for `m_external_event` rows is held
-in `c_configuration`, key `external-events-purge-days-criteria`. You can change it through the
-Global Configuration API:
+in `c_configuration` under the key `purge-external-events-older-than-days` (the constant
+`GlobalConfigurationConstants.PURGE_EXTERNAL_EVENTS_OLDER_THAN_DAYS`). You can change it through
+the Global Configuration API:
 
 ```
 PUT /v1/configurations/{configurationId}
@@ -456,7 +457,7 @@ for the tasklet.
 curl -X PUT https://fineract.example.com/fineract-provider/api/v1/externalevents/configuration \
      -H "Content-Type: application/json" \
      -H "Authorization: Basic ..." \
-     -d '{ "externalEventConfigurations": { "LoanInstallmentLevelDelinquencyEvent": false } }'
+     -d '{ "externalEventConfigurations": { "LoanBalanceChangedBusinessEvent": false } }'
 ```
 
 Effective immediately on the next event publish — no restart.

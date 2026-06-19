@@ -1,12 +1,12 @@
 ---
 title: "Loan Transactions & Charge Allocation in Fineract"
 sidebarTitle: "Transactions & Charges"
-description: "Inside Apache Fineract LoanTransaction and the seven transaction processor strategies that allocate money — types, portions, reversal and LoanChargePaidBy."
+description: "Inside Apache Fineract LoanTransaction and the nine transaction processor strategies that allocate money — types, portions, reversal and LoanChargePaidBy."
 ---
 
 Every cent that enters or leaves a loan in Apache Fineract is a row in `m_loan_transaction` mapped to [`LoanTransaction.java`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/LoanTransaction.java). Disbursements, repayments, waivers, write-offs, charge-offs, accruals, refunds and the newer capitalized-income / buy-down-fee / interest-refund flows all share the same table. A small companion entity, [`LoanChargePaidBy`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/LoanChargePaidBy.java), records *which* of the loan's charges a given repayment touched.
 
-How an incoming repayment is split across penalty, fee, interest and principal — and across installments — is the job of a `LoanRepaymentScheduleTransactionProcessor`. Fineract ships **seven** processors so institutions can match their book-keeping policy without forking the code.
+How an incoming repayment is split across penalty, fee, interest and principal — and across installments — is the job of a `LoanRepaymentScheduleTransactionProcessor`. Fineract ships **nine** cumulative processors (plus the progressive `AdvancedPaymentScheduleTransactionProcessor` in `fineract-progressive-loan`) so institutions can match their book-keeping policy without forking the code.
 
 ## LoanTransaction entity
 
@@ -177,7 +177,7 @@ The string lives on `LoanProduct.transactionProcessingStrategyCode` and is copie
 
 ### Shipped strategies
 
-All seven implementations live under [`fineract-loan/.../domain/transactionprocessor/impl/`](https://github.com/apache/fineract/tree/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/transactionprocessor/impl). Each declares a `STRATEGY_CODE` and `STRATEGY_NAME`:
+All nine implementations live under [`fineract-loan/.../domain/transactionprocessor/impl/`](https://github.com/apache/fineract/tree/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/transactionprocessor/impl). Each declares a `STRATEGY_CODE` and `STRATEGY_NAME`:
 
 | Code                                                                  | Name                                                            | Class                                                              |
 | --------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ |
@@ -192,7 +192,7 @@ All seven implementations live under [`fineract-loan/.../domain/transactionproce
 | `due-penalty-interest-principal-fee-in-advance-penalty-interest-principal-fee-strategy` | (long descriptive name)                        | `DuePenIntPriFeeInAdvancePenIntPriFeeLoanRepaymentScheduleTransactionProcessor` |
 
 <Note>
-Counting `FineractStyleLoanRepaymentScheduleTransactionProcessor`, the cumulative module ships nine concrete strategies today; the seven highlighted in earlier docs were the original set. New flavours are added by extending [`AbstractLoanRepaymentScheduleTransactionProcessor`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/transactionprocessor/AbstractLoanRepaymentScheduleTransactionProcessor.java) and overriding `accept(...)` + the per-due-type allocation hooks.
+New strategy flavours are added by extending [`AbstractLoanRepaymentScheduleTransactionProcessor`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/transactionprocessor/AbstractLoanRepaymentScheduleTransactionProcessor.java) and overriding `accept(...)` + the per-due-type allocation hooks. The `mifos-standard-strategy` code is a historical artifact — it ships as `FineractStyleLoanRepaymentScheduleTransactionProcessor`.
 </Note>
 
 ```mermaid

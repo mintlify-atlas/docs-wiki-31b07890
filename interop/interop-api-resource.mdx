@@ -304,14 +304,18 @@ So the Swagger contract is exactly `InteropQuoteRequestData → InteropQuoteResp
 
 ## Authentication and permissions
 
-The resource uses the standard Fineract `PlatformSecurityContext` — every authenticated user has an identity row in `m_appuser`. A handful of read endpoints explicitly check for entity-level read permissions before delegating:
+The resource uses the standard Fineract `PlatformSecurityContext` — every authenticated user has an identity row in `m_appuser`. Three read endpoints explicitly check for entity-level read permissions before delegating:
 
 ```java
+// getTransactionRequest
 context.authenticatedUser().validateHasReadPermission(ENTITY_NAME_REQUEST);
+// getQuote
+context.authenticatedUser().validateHasReadPermission(ENTITY_NAME_QUOTE);
+// getTransfer — reuses the INTERQUOTE permission rather than declaring its own
 context.authenticatedUser().validateHasReadPermission(ENTITY_NAME_QUOTE);
 ```
 
-The entity name strings are the same `ENTITY_NAME_REQUEST` / `ENTITY_NAME_QUOTE` constants used by the command handlers. The permission rows in `m_permission` follow the regular `READ_INTERREQUEST` / `READ_INTERQUOTE` naming.
+The entity name strings are the same `ENTITY_NAME_REQUEST` / `ENTITY_NAME_QUOTE` constants used by the command handlers. The permission rows in `m_permission` follow the regular `READ_INTERREQUEST` / `READ_INTERQUOTE` naming. Note that the transfer read endpoint deliberately piggy-backs on `READ_INTERQUOTE` — there is no separate `READ_INTERTRANSFER` row, since quotes and transfers tend to be granted together in practice.
 
 ## Tips for integrators
 

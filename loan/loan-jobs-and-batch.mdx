@@ -8,7 +8,7 @@ description: "Reference for Apache Fineract scheduled loan jobs: arrears ageing,
 
 Apache Fineract runs most loan back-office processing as **Spring Batch** jobs registered by
 the scheduler. Each job is defined by a name in
-`fineract-core/src/main/java/org/apache/fineract/jobs/overview/service/JobName.java`,
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java`,
 implemented by a Spring Batch `@Configuration` (the `Job` / `Step` wiring) and a `Tasklet`
 that does the work, and packaged under one of the `portfolio/loanaccount/jobs/<name>/`
 directories:
@@ -26,7 +26,7 @@ directories:
 | `fineract-provider`| `src/main/java/org/apache/fineract/portfolio/loanaccount/jobs/generateloanlossprovisioning/`            |
 | `fineract-provider`| `src/main/java/org/apache/fineract/portfolio/loanaccount/jobs/recalculateinterestforloan/`              |
 | `fineract-provider`| `src/main/java/org/apache/fineract/portfolio/loanaccount/jobs/transferfeechargeforloans/`               |
-| `fineract-provider`| `src/main/java/org/apache/fineract/jobs/overview/service/updatenpa/`                              |
+| `fineract-provider`| `src/main/java/org/apache/fineract/infrastructure/jobs/service/updatenpa/`                              |
 
 The COB-style per-loan steps (`UpdateLoanArrearsAgingBusinessStep`, `LoanCOB` etc.) live under
 `fineract-provider/src/main/java/org/apache/fineract/cob/loan/` and are invoked by the
@@ -115,7 +115,7 @@ type *penalty* and become part of the next repayment.
 ## NPA flag
 
 **`UPDATE_NPA`** —
-`fineract-provider/src/main/java/org/apache/fineract/jobs/overview/service/updatenpa/`
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/updatenpa/`
 
 - `UpdateNpaConfig` – step + job wiring:
   ```java
@@ -292,7 +292,7 @@ A few things worth knowing when operating the loan jobs:
 | `fineract-provider/.../jobs/generateloanlossprovisioning/`                                       | `GENERATE_LOANLOSS_PROVISIONING`                                          |
 | `fineract-provider/.../jobs/recalculateinterestforloan/`                                         | `RECALCULATE_INTEREST_FOR_LOAN`                                           |
 | `fineract-provider/.../jobs/transferfeechargeforloans/`                                          | `TRANSFER_FEE_CHARGE_FOR_LOANS`                                           |
-| `fineract-provider/.../jobs/overview/service/updatenpa/`                                   | `UPDATE_NPA`                                                              |
+| `fineract-provider/.../infrastructure/jobs/service/updatenpa/`                              | `UPDATE_NPA`                                                              |
 
 ## Related pages
 

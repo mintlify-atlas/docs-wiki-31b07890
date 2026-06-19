@@ -882,7 +882,7 @@ When an application is submitted, the assembler copies the relevant settings int
 private WorkingCapitalAccountingRuleType accountingRule;
 ```
 
-`WorkingCapitalAccountingRuleType` enumerates the GL posting modes the product wants — `NONE`, `CASH`, `ACCRUAL_PERIODIC`, etc. The selection drives `WorkingCapitalLoanAccountingProcessor` (in `accounting/`).
+`WorkingCapitalAccountingRuleType` is a small enum with two values today — `NONE` (`"wcAccountingRuleType.none"`, "No accounting") and `CASH_BASED` (`"wcAccountingRuleType.cash"`, "Cash based accounting"). The selection drives `WorkingCapitalLoanAccountingProcessor` (in `accounting/`).
 
 ## How the pieces fit together at submittal
 

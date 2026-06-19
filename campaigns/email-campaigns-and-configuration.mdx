@@ -102,9 +102,10 @@ Field highlights:
 (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/email/domain/EmailMessage.java`)
 is the outbound queue row, structurally analogous to `SmsMessage`:
 it carries the rendered subject + body, the recipient address, the
-campaign FK, the status enum (`EmailMessageStatusType` —
-`PENDING`, `SENT`, `FAILED`), and the timestamps the read services use
-to surface "pending" / "sent" / "failed" listings.
+campaign FK, the status enum (`EmailMessageStatusType` — `INVALID(0)`,
+`PENDING(100)`, `SENT(200)`, `DELIVERED(300)`, `FAILED(400)`), and the
+timestamps the read services use to surface "pending" / "sent" /
+"failed" listings.
 
 The table is `scheduled_email_messages_outbound`.
 
@@ -150,6 +151,7 @@ From
 | GET    | `/v1/email/{resourceId}` | Retrieve one |
 | POST   | `/v1/email` | Manually enqueue a message |
 | PUT    | `/v1/email/{resourceId}` | Update (typically a re-target) |
+| DELETE | `/v1/email/{resourceId}` | Remove a queued message |
 
 ### `/v1/email/configuration` — SMTP settings
 
@@ -160,13 +162,26 @@ From
 @Path("/v1/email/configuration")
 ```
 
-A small endpoint surfacing the SMTP host, port, from-address, username,
-password and "use STARTTLS" flag stored as `c_external_service` rows
-with `external_service_name = 'SMTP_EMAIL_ACCOUNT'`. The
+A small endpoint surfacing the SMTP credentials. The values live in
+`c_external_service_properties` joined to a `c_external_service` row
+whose name is `SMTP_Email_Account` (see
+`ExternalServicesConstants.SMTP_SERVICE_NAME`). The property keys are:
+
+| Property key | Meaning |
+| ------------ | ------- |
+| `username`   | SMTP username |
+| `password`   | SMTP password |
+| `host`       | SMTP host |
+| `port`       | SMTP port |
+| `useTLS`     | Whether to enable STARTTLS |
+| `fromEmail`  | Default `From:` address |
+| `fromName`   | Default `From:` display name |
+
 `EmailConfigurationWritePlatformServiceImpl` persists changes; the
-`EmailMessageJobEmailServiceImpl` reads them at send time so a hot
-configuration change is picked up on the next job tick without a
-restart.
+`EmailMessageJobEmailServiceImpl` reads them at send time via
+`ExternalServicesPropertiesReadPlatformService.getSMTPCredentials()`,
+so a hot configuration change is picked up on the next job tick
+without a restart.
 
 ## JavaMail wiring
 
@@ -175,14 +190,17 @@ gateway. `EmailMessageJobEmailServiceImpl`
 (`fineract-provider/.../campaigns/email/service/EmailMessageJobEmailServiceImpl.java`)
 is the single class that:
 
-1. Reads the SMTP configuration via `EmailConfigurationReadPlatformService`.
+1. Reads the SMTP configuration via
+   `ExternalServicesPropertiesReadPlatformService.getSMTPCredentials()`
+   — which returns an `SMTPCredentialsData` populated from the
+   `SMTP_Email_Account` external service row.
 2. Builds a `JavaMailSenderImpl` on the fly (host, port, username,
-   password, STARTTLS).
-3. Creates a `MimeMessage`, attaches the optional file (PDF/XLS/CSV
-   produced by the stretchy report), sets `from`/`to`/`subject`/`body`
-   and calls `JavaMailSenderImpl.send(...)`.
-4. Catches `MailException` / `MessagingException` and flips the row to
-   `FAILED` with the exception message, or to `SENT` on success.
+   password, STARTTLS, `mail.smtp.ssl.trust`).
+3. Creates a `MimeMessage` via `MimeMessageHelper`, attaches any files
+   produced by the stretchy report (PDF/XLS/CSV), sets
+   `from`/`to`/`subject`/`text` and calls `javaMailSenderImpl.send(...)`.
+4. Catches `MessagingException`; the `ExecuteEmailTasklet` flips the
+   row to `SENT` on success or `FAILED` with the exception message.
 
 The mail send happens entirely inside the campaigns module — there is
 no separate `infrastructure/email/` gateway folder, unlike SMS.
@@ -281,10 +299,18 @@ sequenceDiagram
 `PENDING (100)`, `ACTIVE (300)`, `CLOSED (600)` — same scheme as the
 SMS side.
 
-`EmailMessageStatusType`: `PENDING`, `SENT`, `FAILED`.
+`EmailMessageStatusType`: `INVALID(0)`, `PENDING(100)`, `SENT(200)`,
+`DELIVERED(300)`, `FAILED(400)`.
 
-`ScheduledEmailAttachmentFileFormat`: enumerates `PDF`, `XLS`, `XLSX`,
-`CSV` — what the stretchy report should render as.
+`EmailCampaignType`
+(`infrastructure/campaigns/email/domain/EmailCampaignType.java`):
+`DIRECT(1)`, `SCHEDULE(2)`, `TRIGGERED(3)` — mirrors the SMS-side
+trigger split but lives in its own enum.
+
+`ScheduledEmailAttachmentFileFormat`
+(`infrastructure/campaigns/email/domain/ScheduledEmailAttachmentFileFormat.java`):
+`INVALID(0)`, `XLS(1)`, `PDF(2)`, `CSV(3)` — what the stretchy report
+should render as.
 
 ## Common operations
 
@@ -304,9 +330,12 @@ rebuilds the `JavaMailSenderImpl`.
 </Accordion>
 
 <Accordion title="Resend a failed message">
-PATCH the row via `PUT /v1/email/{id}` and reset `status_enum` to
-`PENDING`. The next `EXECUTE_EMAIL` tick picks it up. The `failedEmail`
-listing is the easiest way to find candidates.
+`PUT /v1/email/{id}` only updates the message body (the
+`UPDATE_REQUEST_DATA_PARAMETERS` set in `EmailApiConstants` is just
+`emailMessage`). To re-attempt delivery, reset `status_enum` to `100`
+(`PENDING`) directly in `scheduled_email_messages_outbound`; the next
+`EXECUTE_EMAIL` tick picks it up. `GET /v1/email/failedEmail` is the
+easiest way to find candidates.
 </Accordion>
 
 <Accordion title="Validate templates before activating">

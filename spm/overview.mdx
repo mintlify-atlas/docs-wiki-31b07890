@@ -72,9 +72,10 @@ public class Survey extends AbstractPersistableCustom<Long> {
 }
 ```
 
-- `key` is a short, stable handle (e.g. `PPI_BD_2019`) that clients can reference.
-- `countryCode` is ISO 3166‑1 alpha‑2.
-- `validFrom`/`validTo` make `SpmService.fetchValidSurveys()` and the `isActive=true` query param meaningful — out‑of‑window surveys are excluded.
+- `key` is a short, stable handle (e.g. `PPI_BD_2019`) that clients can reference. Creating a survey whose `key` matches a currently‑valid one auto-deactivates the previous version inside `SpmService.createSurvey`.
+- `countryCode` is intended as an ISO 3166‑1 alpha‑2 code. `SurveyValidator` only enforces that it does not exceed two characters — it does not require *exactly* two.
+- `validFrom`/`validTo` make `SpmService.fetchValidSurveys()` and the `isActive=true` query param meaningful — out‑of‑window surveys are excluded. Note that `createSurvey` and `activateSurvey` ignore any window the caller supplies and set `validFrom = today`, `validTo = today + 100 years`.
+- `description` length: the JPA column allows 4096 chars but `SurveyValidator` caps it at 4000 (the validator wins at the API layer).
 
 ### `Question` — `m_survey_questions`
 

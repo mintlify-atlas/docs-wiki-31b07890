@@ -1,25 +1,39 @@
 ---
 title: "S3 Content Store Configuration in Apache Fineract"
 sidebarTitle: "S3 Content Store"
-description: "Wire Apache Fineract to an S3 bucket for document and image storage, with the AmazonS3Config bean, FineractContentS3Properties, and Localstack support for tests."
+description: "Wire Apache Fineract to an S3 bucket for document and image storage, with the ContentS3Config bean, FineractContentS3Properties, and Localstack-compatible endpoint configuration."
 ---
 
 When Apache Fineract is deployed for high availability, the natural
 content-store backend is S3 — every node sees the same bucket, the
 infrastructure team gets versioning and replication for free, and the
 filesystem on each pod becomes purely ephemeral. The wiring is split
-across two modules: the **shared AWS SDK configuration** in
-`fineract-provider/.../infrastructure/s3/`, and the **content-store
-service** in `fineract-document/.../contentstore/service/`.
+across two modules: the **content-store `S3Client` bean** in
+`fineract-provider/.../infrastructure/core/config/ContentS3Config.java`,
+and the **content-store service** in
+`fineract-document/.../contentstore/service/S3ContentStoreService.java`.
+
+Note that `fineract-provider` also ships a *second* unrelated
+`S3Client` configuration in
+`fineract-provider/.../infrastructure/s3/AmazonS3Config.java`. That one
+powers the **datatable report export** feature
+(`S3DatatableReportExportServiceImpl`) — it reads from
+`fineract.report.export.s3.*` properties, not from
+`fineract.content.s3.*`, and is gated by a separate
+`AmazonS3ConfigCondition`. The two pipelines do not share a client
+bean.
 
 ## Module layout
 
 ```text
-fineract-provider/src/main/java/org/apache/fineract/infrastructure/s3/
-├── AmazonS3Config.java                # Defines the S3Client bean
-├── AmazonS3ConfigCondition.java       # PropertiesCondition driving @Conditional
-├── S3ClientCustomizer.java            # SPI for builder tweaks
-└── LocalstackS3ClientCustomizer.java  # Test-profile customizer
+fineract-provider/src/main/java/org/apache/fineract/infrastructure/
+├── core/config/
+│   └── ContentS3Config.java           # @Bean S3Client contentS3Client - for the content store
+└── s3/
+    ├── AmazonS3Config.java            # @Bean("s3Client") - for report export (separate)
+    ├── AmazonS3ConfigCondition.java
+    ├── S3ClientCustomizer.java        # SPI used only by AmazonS3Config
+    └── LocalstackS3ClientCustomizer.java
 
 fineract-document/src/main/java/org/apache/fineract/infrastructure/contentstore/
 ├── service/S3ContentStoreService.java # Consumes S3Client; @ConditionalOnProperty
@@ -43,68 +57,83 @@ public static class FineractContentS3Properties {
 }
 ```
 
-## `AmazonS3Config` — the `S3Client` bean
+## `ContentS3Config` — the content-store `S3Client` bean
 
-`AmazonS3Config`
-(`fineract-provider/src/main/java/org/apache/fineract/infrastructure/s3/AmazonS3Config.java`)
-is the single Spring `@Configuration` that produces an
-`software.amazon.awssdk.services.s3.S3Client`. The decisive lines:
+`ContentS3Config`
+(`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/ContentS3Config.java`)
+is the Spring `@Configuration` that produces the
+`software.amazon.awssdk.services.s3.S3Client` that
+`S3ContentStoreService` autowires. The whole class is small:
 
 ```java
 @Configuration
-@Conditional(AmazonS3ConfigCondition.class)
-public class AmazonS3Config {
+public class ContentS3Config {
 
     @Bean
-    public DefaultCredentialsProvider awsCredentialsProvider() {
-        return DefaultCredentialsProvider.create();
-    }
-
-    @Bean
-    public AwsRegionProvider awsRegionProvider() {
-        return DefaultAwsRegionProviderChain.builder().build();
-    }
-
-    @Bean("s3Client")
-    public S3Client s3Client(DefaultCredentialsProvider awsCredentialsProvider,
-                             AwsRegionProvider awsRegionProvider,
-                             List<S3ClientCustomizer> customizers) {
+    @ConditionalOnProperty("fineract.content.s3.enabled")
+    public S3Client contentS3Client(FineractProperties fineractProperties) {
         S3ClientBuilder builder = S3Client.builder()
-                .credentialsProvider(awsCredentialsProvider)
-                .region(awsRegionProvider.getRegion());
-        customizers.forEach(customizer -> customizer.customize(builder));
+                .credentialsProvider(getCredentialProvider(fineractProperties.getContent().getS3()));
+
+        if (!Strings.isNullOrEmpty(fineractProperties.getContent().getS3().getRegion())) {
+            builder.region(Region.of(fineractProperties.getContent().getS3().getRegion()));
+        }
+        if (!Strings.isNullOrEmpty(fineractProperties.getContent().getS3().getEndpoint())) {
+            builder.endpointOverride(URI.create(fineractProperties.getContent().getS3().getEndpoint()))
+                    .forcePathStyle(fineractProperties.getContent().getS3().getPathStyleAddressingEnabled());
+        }
+
         return builder.build();
     }
-    // ...
+
+    private AwsCredentialsProvider getCredentialProvider(FineractProperties.FineractContentS3Properties s3Properties) {
+        if (Strings.isNullOrEmpty(s3Properties.getAccessKey()) || Strings.isNullOrEmpty(s3Properties.getSecretKey())) {
+            return DefaultCredentialsProvider.create();
+        }
+
+        return StaticCredentialsProvider.create(
+                AwsBasicCredentials.create(s3Properties.getAccessKey(), s3Properties.getSecretKey()));
+    }
 }
 ```
 
 Three things to notice:
 
-1. **Default credentials chain** — Fineract uses
-   `DefaultCredentialsProvider.create()`, which walks the standard AWS
-   chain: env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`),
-   container/IRSA, profile file, instance metadata. There is **no
-   hard-coded fallback to `accessKey` / `secretKey` properties** in
-   `FineractContentS3Properties`; those exist on the type for downstream
-   customizers but the default config defers to the SDK chain.
-2. **Default region chain** — same story for the region:
-   `AWS_REGION`/`AWS_DEFAULT_REGION`, profile, then instance metadata.
-3. **Customizer hook** — every bean implementing `S3ClientCustomizer`
-   gets a chance to tweak the builder. This is how the test profile
-   redirects the client to Localstack without redefining the bean.
+1. **Credentials resolution.** If *both* `fineract.content.s3.accessKey`
+   and `fineract.content.s3.secretKey` are non-empty, a
+   `StaticCredentialsProvider` is built from them. Otherwise the AWS SDK
+   `DefaultCredentialsProvider.create()` chain is used: env vars
+   (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), container/IRSA,
+   profile file, instance metadata.
+2. **Region.** Only set on the builder when `fineract.content.s3.region`
+   is non-empty. When blank, the SDK uses its own default region
+   provider chain (`AWS_REGION` / profile / IMDS).
+3. **Endpoint override.** When `fineract.content.s3.endpoint` is
+   non-empty, the builder calls `endpointOverride(...)` *and*
+   `forcePathStyle(fineract.content.s3.path-style-addressing-enabled)`.
+   This is how Fineract talks to Localstack, MinIO or any other
+   S3-compatible store. There is no `S3ClientCustomizer` SPI on the
+   content-store path — the customizer mechanism only applies to
+   `AmazonS3Config` (report-export).
 
-## `S3ClientCustomizer` and Localstack
+## Localstack for tests
 
-`S3ClientCustomizer` is a tiny SPI:
+The report-export `AmazonS3Config` and its `LocalstackS3ClientCustomizer`
+(both in `fineract-provider/.../infrastructure/s3/`) do not affect the
+content-store S3 client. For the content store, the same redirection is
+expressed through plain properties:
 
-```java
-public interface S3ClientCustomizer {
-    void customize(S3ClientBuilder builder);
-}
+```properties
+fineract.content.s3.enabled=true
+fineract.content.s3.endpoint=http://localhost:4566
+fineract.content.s3.path-style-addressing-enabled=true
+fineract.content.s3.region=us-east-1
+fineract.content.s3.accessKey=test
+fineract.content.s3.secretKey=test
+fineract.content.s3.bucketName=fineract-content
 ```
 
-The platform ships one implementation
+For reference, the report-export side uses a customizer
 (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/s3/LocalstackS3ClientCustomizer.java`):
 
 ```java
@@ -125,20 +154,10 @@ public class LocalstackS3ClientCustomizer implements S3ClientCustomizer {
 }
 ```
 
-What this gives you:
-
-- The `@Profile(FineractProfiles.TEST)` guard keeps the customizer out
-  of production deployments.
-- When `AWS_ENDPOINT_URL` is set (the Localstack convention), every
-  call goes there instead of the public AWS endpoint.
-- `forcePathStyle(true)` switches the URL pattern from
-  `<bucket>.s3.amazonaws.com/...` to `<endpoint>/<bucket>/...`, which
-  is what Localstack actually expects.
-
-So integration tests can simply set `AWS_ENDPOINT_URL=http://localhost:4566`
-plus the usual access-key env vars (Localstack accepts anything), and
-the same `S3ContentStoreService` exercised in production runs against
-the local stub.
+`AWS_ENDPOINT_URL` is the Localstack convention. The `@Profile(TEST)`
+guard keeps the customizer out of production deployments. Again: this
+hook does **not** alter the content-store client — for that you set the
+`fineract.content.s3.endpoint` property directly.
 
 ## `S3ContentStoreService`
 
@@ -201,56 +220,61 @@ flowchart LR
 
 ## Boot-time activation
 
-A node activates the S3 backend when both of the following are true:
+A node activates the S3 content store when `fineract.content.s3.enabled=true`
+is set. That single flag drives two `@ConditionalOnProperty` guards:
 
-- `AmazonS3ConfigCondition` (driven by the surrounding Fineract S3
-  property block) reports that the AWS configuration is present —
-  `AmazonS3Config` then builds an `S3Client` bean.
-- `fineract.content.s3.enabled=true` is set, which triggers the
-  `@ConditionalOnProperty` on `S3ContentStoreService` so the bean is
-  registered as the implementation of `ContentStoreService`.
+- `ContentS3Config.contentS3Client(...)` registers the `S3Client` bean.
+- `S3ContentStoreService` is instantiated as the `ContentStoreService`
+  implementation.
 
-If the flag is on but the AWS config is missing, Spring fails fast
-with an unsatisfied `S3Client` dependency — which is the desired
-behaviour, because the alternative is silent fall-back to the
-filesystem store.
+To avoid two `ContentStoreService` beans, set
+`fineract.content.filesystem.enabled=false` at the same time — the
+default is `true`.
+
+If the AWS credentials/region cannot be resolved at runtime
+(no static credentials, no env vars, no instance profile), the failure
+surfaces on the first S3 call rather than at boot, because both the
+default credentials provider and the default region provider are lazy.
 
 ## Configuration reference
 
-The full set of properties consumed under `fineract.content.s3`:
+The full set of properties consumed under `fineract.content.s3`, as
+declared on `FineractProperties.FineractContentS3Properties`:
 
 <ResponseField name="enabled" type="boolean">
-Toggle the entire S3 backend. Maps to `FineractContentS3Properties.enabled`
-and to the `@ConditionalOnProperty` on `S3ContentStoreService`.
+Toggle the entire S3 backend. Drives the `@ConditionalOnProperty`
+guards on both `ContentS3Config#contentS3Client` and
+`S3ContentStoreService`. Defaults to `false`.
 </ResponseField>
 
-<ResponseField name="bucket-name" type="string">
-Target bucket. Used directly in `GetObjectRequest` / `PutObjectRequest`
-keys.
+<ResponseField name="bucketName" type="string">
+Target bucket. Used as `.bucket(...)` in every `GetObjectRequest` /
+`PutObjectRequest` / `DeleteObjectRequest`. No `ListBucket` calls are
+made at runtime.
 </ResponseField>
 
-<ResponseField name="access-key / secret-key" type="string">
-Surfaced on the properties type for custom builds that want to bypass
-the default chain. The stock `AmazonS3Config` ignores them — for
-production deployments leave both blank and use IRSA, instance-profile
-or env-var credentials.
+<ResponseField name="accessKey / secretKey" type="string">
+When *both* are non-empty, a `StaticCredentialsProvider` backed by
+`AwsBasicCredentials` is built. When either is empty,
+`DefaultCredentialsProvider.create()` is used (env vars, IRSA,
+instance profile, profile file). Leave both blank in production and
+rely on the default chain.
 </ResponseField>
 
 <ResponseField name="region" type="string">
-Surfaced on the properties type. The stock `AmazonS3Config` defers to
-the AWS default region chain.
+When non-empty, sets `Region.of(region)` on the builder. When blank,
+the SDK default region chain (`AWS_REGION` / profile / IMDS) is used.
 </ResponseField>
 
 <ResponseField name="endpoint" type="string">
-For custom builds that need to point at S3-compatible storage from
-production (MinIO, Wasabi). The bundled `LocalstackS3ClientCustomizer`
-uses the dedicated `AWS_ENDPOINT_URL` env var instead so it can stay
-test-only.
+When non-empty, calls `endpointOverride(URI.create(endpoint))` on the
+`S3ClientBuilder`. Use for Localstack, MinIO, Wasabi or any other
+S3-compatible store.
 </ResponseField>
 
-<ResponseField name="path-style-addressing-enabled" type="boolean">
-For non-AWS / on-prem object stores that don't support virtual-hosted
-URLs. Localstack flips this on automatically inside the customizer.
+<ResponseField name="pathStyleAddressingEnabled" type="boolean">
+Only consulted when `endpoint` is also set. Passed straight to
+`forcePathStyle(...)` on the builder. Defaults to `false`.
 </ResponseField>
 
 ## Worked example — Localstack integration test
@@ -262,28 +286,37 @@ docker run --rm -p 4566:4566 -e SERVICES=s3 localstack/localstack
 # Create the bucket once
 aws --endpoint-url=http://localhost:4566 s3 mb s3://fineract-content
 
-# Run Fineract with the TEST profile + the S3 store
-export SPRING_PROFILES_ACTIVE=test
-export AWS_ENDPOINT_URL=http://localhost:4566
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_REGION=us-east-1
+# Point the content store at Localstack
+export FINERACT_CONTENT_FILESYSTEM_ENABLED=false
 export FINERACT_CONTENT_S3_ENABLED=true
 export FINERACT_CONTENT_S3_BUCKET_NAME=fineract-content
+export FINERACT_CONTENT_S3_ENDPOINT=http://localhost:4566
+export FINERACT_CONTENT_S3_PATH_STYLE_ADDRESSING_ENABLED=true
+export FINERACT_CONTENT_S3_REGION=us-east-1
+export FINERACT_CONTENT_S3_ACCESS_KEY=test
+export FINERACT_CONTENT_S3_SECRET_KEY=test
 ./gradlew :fineract-provider:bootRun
 ```
 
+These env vars correspond one-to-one with the placeholders in
+`fineract-provider/src/main/resources/application.properties` (e.g.
+`fineract.content.s3.bucketName=${FINERACT_CONTENT_S3_BUCKET_NAME:}`).
+
 What happens on boot:
 
-1. `AmazonS3Config` is activated by `AmazonS3ConfigCondition`.
-2. `LocalstackS3ClientCustomizer` is picked up (TEST profile).
-3. `LocalstackS3ClientCustomizer.customize(builder)` calls
+1. `fineract.content.s3.enabled=true` triggers
+   `ContentS3Config.contentS3Client(...)`, which sees the static
+   `accessKey` / `secretKey`, builds a `StaticCredentialsProvider`,
+   sets `Region.of("us-east-1")`, calls
    `endpointOverride(URI.create("http://localhost:4566"))` and
    `forcePathStyle(true)`.
-4. `S3ContentStoreService` is registered because
-   `fineract.content.s3.enabled=true`, and `ContentStoreService`
-   becomes the S3 backed implementation.
-5. The Document API uploads land as keys in the
+2. The same flag triggers `@ConditionalOnProperty` on
+   `S3ContentStoreService`, which is registered as the
+   `ContentStoreService` bean.
+3. `fineract.content.filesystem.enabled=false` keeps
+   `FileContentStoreService` out of the context so there is no
+   `NoUniqueBeanDefinitionException`.
+4. Document and Image API uploads land as keys in the
    `fineract-content` bucket.
 
 ## Production checklist
@@ -292,8 +325,10 @@ What happens on boot:
 <Accordion title="Credentials">
 Use IRSA on EKS, instance-profile on EC2, or workload identity on
 GKE — never put the bucket's access key in `application.properties`.
-The default credentials chain is the only thing the bundled config
-relies on.
+`ContentS3Config.getCredentialProvider(...)` only falls back to
+static credentials when **both** `fineract.content.s3.accessKey` and
+`fineract.content.s3.secretKey` are non-empty, so leaving them blank
+in production automatically selects `DefaultCredentialsProvider`.
 </Accordion>
 
 <Accordion title="Bucket policy">

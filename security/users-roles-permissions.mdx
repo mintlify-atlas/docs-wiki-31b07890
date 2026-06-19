@@ -112,7 +112,7 @@ public class Role extends AbstractPersistableCustom<Long> implements Serializabl
 }
 ```
 
-Roles can be disabled (`is_disabled = true`); a disabled role's permissions are not flattened into the authority list at login.
+Roles can be disabled via `POST /v1/roles/{roleId}?command=disable` (sets `is_disabled = true`). `AppUser.populateGrantedAuthorities()` does **not** filter by `is_disabled` and the role-assignment path in `RoleWritePlatformServiceJpaRepositoryImpl` does not currently reject disabled roles (the check is present but commented out at line ~230). To make a disable take effect for active users, also detach the role from them via `PUT /v1/users/{userId}`.
 
 ### `Permission`
 
@@ -195,15 +195,16 @@ public void validateHasUpdatePermission(final String resourceType){ validateHasP
 public void validateHasDeletePermission(final String resourceType){ validateHasPermission("DELETE",resourceType); }
 
 private void validateHasPermission(final String prefix, final String resourceType) {
+    final String authorizationMessage = "User has no authority to " + prefix + " " + resourceType.toLowerCase(Locale.ROOT) + "s";
     final String matchPermission = prefix + "_" + resourceType.toUpperCase(Locale.ROOT);
     if (!hasNotPermissionForAnyOf("ALL_FUNCTIONS", "ALL_FUNCTIONS_READ", matchPermission)) {
         return;
     }
-    throw new NoAuthorizationException("User has no authority to " + prefix + " " + resourceType.toLowerCase(Locale.ROOT) + "s");
+    throw new NoAuthorizationException(authorizationMessage);
 }
 ```
 
-Notice the `ALL_FUNCTIONS_READ` shortcut: read-only super-users can satisfy `validateHasUpdatePermission` only via `ALL_FUNCTIONS` (full super-user), but reads satisfy both wildcards.
+The same `hasNotPermissionForAnyOf("ALL_FUNCTIONS", "ALL_FUNCTIONS_READ", matchPermission)` check is used for every action — so at the resource layer both wildcards satisfy reads and writes. The narrower `ALL_FUNCTIONS_WRITE` / `ALL_FUNCTIONS_READ` split is only enforced by the URL-level `hasAnyAuthority(...)` rules in `SecurityConfig` (e.g. `READ_*` routes accept `ALL_FUNCTIONS_READ`, `CREATE_*`/`UPDATE_*`/`DELETE_*` routes accept `ALL_FUNCTIONS_WRITE`).
 
 ## Maker-checker integration
 
@@ -357,7 +358,7 @@ Every mutation arrives through Fineract's `CommandWrapper` pipeline. The `@Comma
 | `ChangeUserPasswordCommandHandler` | `USER` / `UPDATE` | `AppUserWritePlatformService.updateUser` (password sub-path) |
 | `CreateRoleCommandHandler` / `UpdateRoleCommandHandler` / `DeleteRoleCommandHandler` | `ROLE` | Role lifecycle |
 | `EnableRoleCommandHandler` / `DisableRoleCommandHandler` | `ROLE` | Toggle `is_disabled` |
-| `UpdateRolePermissionsCommandHandler` | `ROLE` / `UPDATEPERMISSIONS` | Bulk add/remove permissions on a role |
+| `UpdateRolePermissionsCommandHandler` | `ROLE` / `PERMISSIONS` | Bulk add/remove permissions on a role |
 | `UpdateMakerCheckerPermissionsCommandHandler` | `PERMISSION` / `UPDATE` | Toggle `can_maker_checker` |
 | `UpdatePasswordPreferencesCommandHandler` | `PASSWORD_PREFERENCES` / `UPDATE` | See [Password Preferences](/security/password-preferences) |
 
@@ -469,7 +470,7 @@ sequenceDiagram
 @Column(name = "is_login_retries_enabled", nullable = false) private boolean loginRetryLimitEnabled;
 ```
 
-`LoginAttemptEventListener` (`fineract-provider/.../infrastructure/security/service/LoginAttemptEventListener.java`) listens on Spring Security's `AuthenticationFailureBadCredentialsEvent` and increments the counter; when the configured threshold is reached it sets `nonlocked = false`. The Basic-auth `BasicAuthenticationEntryPoint` is the surface that prompts again on 401.
+`LoginAttemptEventListener` (`fineract-provider/.../infrastructure/security/service/LoginAttemptEventListener.java`) listens on Spring Security's `AbstractAuthenticationFailureEvent` and calls `AppUser.registerFailedLoginAttempt(maxRetries)`; when the counter reaches the configured `maxLoginRetries` from `ConfigurationDomainService`, `nonlocked` is set to false. Successful authentication resets the counter via the matching `AuthenticationSuccessEvent` handler. The lockout threshold and the `is_login_retries_enabled` per-user opt-in must both be true for tracking to occur.
 
 ## Exceptions
 

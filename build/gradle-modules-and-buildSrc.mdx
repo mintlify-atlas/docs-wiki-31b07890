@@ -194,21 +194,21 @@ fineractJavaProjects = subprojects.findAll{
 
 ## Conventions applied to every module
 
-The `allprojects { ... }` block in `build.gradle` is where Fineract's "build convention plugin" effectively lives. There is no separate `convention-plugin/` directory under `buildSrc/`; instead, the conventions are baked into the root build script and applied to every subproject. The most important ones:
+Conventions are baked into the root `build.gradle` (there is no separate `convention-plugin/` directory). They are applied in three layers — `subprojects { ... }`, `allprojects { ... }`, and `configure(project.fineractJavaProjects) { ... }` — each layer narrower than the previous:
 
 ```groovy
+// build.gradle (excerpts)
+
+// Layer 1: every subproject, including custom ones — picks up static weaving
+subprojects { subproject ->
+    apply from: rootProject.file('static-weaving.gradle')
+}
+
+// Layer 2: every project, root + sub — group, repos, and the style/quality
+//          plugins that don't need the `java` plugin to be present
 allprojects {
     group = 'org.apache.fineract'
     repositories { mavenCentral() }
-
-    apply plugin: 'java'
-    apply plugin: 'idea'
-
-    java {
-        toolchain { languageVersion = JavaLanguageVersion.of(21) }
-        withSourcesJar()
-        withJavadocJar()
-    }
 
     apply plugin: 'com.adarshr.test-logger'
     apply plugin: 'com.diffplug.spotless'
@@ -216,19 +216,29 @@ allprojects {
     apply plugin: 'net.ltgt.errorprone'
     apply plugin: 'org.nosphere.apache.rat'
     apply plugin: 'com.github.jk1.dependency-license-report'
+}
+
+// Layer 3: only the modules listed in `fineractJavaProjects` — the JVM stack
+configure(project.fineractJavaProjects) {
+    apply plugin: 'java'
+    apply plugin: 'idea'
     apply plugin: 'eclipse'
     apply plugin: 'checkstyle'
     apply plugin: 'jacoco'
     apply plugin: 'com.github.spotbugs'
     apply plugin: 'com.github.andygoossens.modernizer'
-    apply from: "${rootDir}/buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle"
 
-    // …and the static-weaving wiring:
-    apply from: rootProject.file('static-weaving.gradle')
+    java {
+        toolchain { languageVersion = JavaLanguageVersion.of(21) }
+        withSourcesJar()
+        withJavadocJar()
+    }
 
     check { dependsOn(rat, licenseMain, licenseTest) }
 }
 ```
+
+The root build also imports the BOM file once at the top through `apply from: "${rootDir}/buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle"`, which is how every module gets the same Spring Boot / Jackson / OkHttp / OpenTelemetry versions.
 
 The build also globally tightens error-prone with a list of `error(...)` rules (`DefaultCharset`, `StringSplitter`, `MutablePublicArray`, `EqualsGetClass`, `FutureReturnValueIgnored`) and disables a small set of checks that conflict with Lombok or generated code.
 

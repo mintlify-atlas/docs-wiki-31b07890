@@ -350,8 +350,9 @@ The underlying HTTP machinery lives in
 [`WebHookService`](https://github.com/apache/fineract/blob/develop/fineract-provider/src/main/java/org/apache/fineract/infrastructure/hooks/processor/WebHookService.java)
 (a Retrofit interface) and
 [`ProcessorHelper`](https://github.com/apache/fineract/blob/develop/fineract-provider/src/main/java/org/apache/fineract/infrastructure/hooks/processor/ProcessorHelper.java)
-(which builds a Retrofit client). `ProcessorHelper` opt-in trusts self-signed certs based on a
-hook configuration field, which is convenient for staging but should not be used in production.
+(which builds a Retrofit client). `ProcessorHelper` can opt into trusting self-signed certs via
+the system property `fineract.insecureHttpClient=true`, which is convenient for staging but
+should never be enabled in production.
 
 ### `TwilioHookProcessor` — outbound SMS via the legacy gateway
 

@@ -195,11 +195,14 @@ If `LoanTransferabilityService.isTransferable(loan, transfer)` returns false —
 ```java
 // LoanTransferabilityServiceImpl
 public ExternalTransferSubStatus getDeclinedSubStatus(Loan loan) {
-    boolean overpaid = LoanStatus.OVERPAID.equals(loan.getStatus());
-    return overpaid ? ExternalTransferSubStatus.BALANCE_NEGATIVE
-                    : ExternalTransferSubStatus.BALANCE_ZERO;
+    if (MathUtil.nullToDefault(loan.getTotalOverpaid(), BigDecimal.ZERO).compareTo(BigDecimal.ZERO) > 0) {
+        return ExternalTransferSubStatus.BALANCE_NEGATIVE;
+    }
+    return ExternalTransferSubStatus.BALANCE_ZERO;
 }
 ```
+
+And `isTransferable` compares `loan.getSummary().getTotalOutstanding()` strictly against zero — only when validation applies (delayed settlement off, or the `PENDING_INTERMEDIATE` first leg). For the second leg of a delayed-settlement sale (intermediate → final investor), the check is skipped entirely.
 
 No journal entries are posted, the loan stays bank-owned, no `m_external_asset_owner_transfer_loan_mapping` is created. A single `LoanOwnershipTransferBusinessEvent` is emitted (without a `LoanAccountSnapshotBusinessEvent` — there's no new snapshot to publish because nothing economic changed).
 

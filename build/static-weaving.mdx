@@ -158,37 +158,35 @@ The descriptor's only job at build time is to enumerate the entity classes Eclip
 
 ## Which modules apply it
 
-Because `static-weaving.gradle` is applied to every subproject and acts only when the descriptor is present, the "list of modules that opt in" is effectively "every Java subproject that owns JPA entities". In Fineract that is the domain layer:
+Because `static-weaving.gradle` is applied to every subproject and acts only when the descriptor is present, the "list of modules that opt in" is whichever Java subprojects ship a `persistence.xml` at the well-known path. At the time of writing, a `git ls-files '**/jpa/static-weaving/module/**/persistence.xml'` returns 15 descriptors covering the domain layer plus the Spring Boot runtime:
 
 - `fineract-core`
-- `fineract-security`
 - `fineract-accounting`
 - `fineract-branch`
-- `fineract-document`
-- `fineract-investor`
-- `fineract-rates`
 - `fineract-charge`
-- `fineract-tax`
+- `fineract-cob`
+- `fineract-investor`
 - `fineract-loan-origination`
 - `fineract-loan`
-- `fineract-savings`
-- `fineract-report`
-- `fineract-mix`
-- `fineract-cob`
 - `fineract-progressive-loan`
+- `fineract-rates`
+- `fineract-report`
+- `fineract-savings`
+- `fineract-tax`
 - `fineract-working-capital-loan`
-- `fineract-command-jdbc` / `fineract-command-audit` (command-bus persistence)
+- `fineract-provider` — owns its own descriptor because it carries a handful of provider-specific entities (jobs, scheduler, tenant, audit) on top of the entities pulled in transitively from the domain JARs.
 
 Modules that contain **no JPA entities** see only the `ℹ No JPA entities found in <module>, skipping static weaving configuration` log line and incur no cost. Examples are:
 
-- `fineract-validation`, `fineract-command`, `fineract-command-async`, `fineract-command-disruptor`, `fineract-command-test` — pure logic / utility modules.
+- `fineract-security`, `fineract-validation`, `fineract-document`, `fineract-mix` — modules that ship logic / utilities but no `@Entity` types of their own (their entities live in `fineract-core` or `fineract-provider`).
+- `fineract-command`, `fineract-command-async`, `fineract-command-disruptor`, `fineract-command-test`, `fineract-command-jdbc`, `fineract-command-audit` — the command-bus modules.
 - `fineract-client`, `fineract-client-feign` — generated client SDKs.
 - `fineract-avro-schemas`, `fineract-doc` — schema and documentation only.
 - `integration-tests`, `oauth2-tests`, `twofactor-tests`, `fineract-e2e-tests-core`, `fineract-e2e-tests-runner` — test harnesses that talk to a deployed server.
 - `fineract-progressive-loan-embeddable-schedule-generator` — a calculator JAR with no entities.
 - `fineract-war` — repackaging only.
 
-`fineract-provider` itself does not need a `persistence.xml` for the weaver because all the woven entities arrive via the domain JARs it depends on; it owns its own runtime persistence-unit descriptor for Spring Boot.
+The runtime persistence unit used by Spring Boot at startup is a separate descriptor; the build-time descriptors are only ever read by `StaticWeave`.
 
 ## What weaving actually changes
 

@@ -10,8 +10,12 @@ The package splits cleanly into four pieces:
 
 - **Workbook populators** generate the downloadable template — they pre-fill office, staff, currency, and product dropdowns so the operator picks from valid values.
 - **Import handlers** consume an uploaded workbook, parse the rows back into command objects, and replay them via `PortfolioCommandSourceWritePlatformService`.
-- The **`BulkImportApiResource`** REST resource exposes `GET /v1/imports?entityType=<code>` to list previous imports and a download endpoint for the rendered template.
+- The **`BulkImportApiResource`** REST resource exposes `GET /v1/imports?entityType=<code>` to list previous imports and a download endpoint for the annotated output workbook of a previous import.
 - An **import document** is tracked in the database (`ImportDocument` + `ImportDocumentRepository`) so each upload has an audit row with success / error counts.
+
+<Note>
+Two query-string spellings exist side-by-side and matter when reading the code. `GET /v1/imports?entityType=...` expects the **lowercase code** (e.g. `loans`, `clients.person`) because `BulkImportApiResource` resolves it through `GlobalEntityType.fromCode(...)`. The download- and upload-template endpoints on the entity resources (e.g. `LoansApiResource`) pass `GlobalEntityType.LOANS.toString()`, which returns the **enum name** (e.g. `LOANS`, `CLIENTS_PERSON`) — `GlobalEntityType.toString()` is overridden to return `name()`. The dispatch chain inside `BulkImportWorkbookServiceImpl` and `BulkImportWorkbookPopulatorServiceImpl` therefore compares against the uppercase enum name, not the lowercase code.
+</Note>
 
 ## Package layout
 
@@ -102,7 +106,7 @@ public enum GlobalEntityType {
 }
 ```
 
-The codes used over the wire are exactly the string column above. Not every value has a populator and handler — `CALENDAR`, `MEETINGS`, `NOTES`, `FUNDS`, `CURRENCY`, `CODE`, `CODE_VALUE`, `DOCUMENTS`, `COLLATERALS`, `LOAN_PRODUCTS`, and `SMS` are reserved slots that may or may not be wired in a given Fineract distribution. The entity types that **do** have a sheet populator and an import handler today are:
+The codes used over the wire are exactly the string column above. Not every value has a populator and handler — `CALENDAR`, `MEETINGS`, `NOTES`, `FUNDS`, `CURRENCY`, `CODE`, `CODE_VALUE`, `DOCUMENTS`, `COLLATERALS`, `LOAN_PRODUCTS`, `SAVINGS_CHARGES`, `SAVINGS_PRODUCTS`, `TEMPLATES`, and `SMS` are reserved slots that have no populator / handler wired today. Note also that `NOTES(11, "templates")` and `TEMPLATES(10, "templates")` share the same code string, so `fromCode("templates")` returns whichever value ended up in the lookup map last. The entity types that **do** have a sheet populator and an import handler today are:
 
 <CardGroup cols={2}>
   <Card title="Organisation" icon="building">
@@ -119,7 +123,7 @@ The codes used over the wire are exactly the string column above. Not every valu
   </Card>
 </CardGroup>
 
-The dispatch matrix in `BulkImportWorkbookPopulatorServiceImpl.getTemplate(...)` and `BulkImportWorkbookServiceImpl.importWorkbook(...)` is a long `if (entityType.equalsIgnoreCase(GlobalEntityType.X.toString()))` chain — see [Import handlers](/bulkimport/import-handlers) and [Populators](/bulkimport/populators) for the per-entity classes.
+The download / upload dispatch in `BulkImportWorkbookPopulatorServiceImpl.getTemplate(...)` and `BulkImportWorkbookServiceImpl.importWorkbook(...)` is a long `if (entityType.equalsIgnoreCase(GlobalEntityType.X.toString()))` chain — `importWorkbook` only translates the entity-name string into a `GlobalEntityType` enum value and then publishes a `BulkImportEvent`. The actual handler selection happens in `BulkImportEventListener` via a `switch` expression on the enum. See [Import handlers](/bulkimport/import-handlers) and [Populators](/bulkimport/populators) for the per-entity classes.
 
 ## The REST resource
 
@@ -211,8 +215,7 @@ sequenceDiagram
     Operator->>Operator: fill rows in Excel
     Operator->>EntityResource: POST /uploadtemplate (multipart)
     EntityResource->>EntityResource: persist ImportDocument
-    EntityResource-->>Operator: 200 { importId }
-    EntityResource->>Listener: publish BulkImportEvent
+    EntityResource->>Listener: publishEvent(BulkImportEvent) (synchronous)
     Listener->>ImportHandler: process(workbook, locale, dateFormat)
     loop each row
         ImportHandler->>CommandService: logCommandSource(CREATE clients)
@@ -220,7 +223,9 @@ sequenceDiagram
         ImportHandler->>ImportHandler: write STATUS cell on row
     end
     ImportHandler-->>Listener: Count(success, errors)
-    Listener->>Listener: update ImportDocument totals
+    Listener->>Listener: update ImportDocument totals + persist output workbook
+    Listener-->>EntityResource: (listener returns)
+    EntityResource-->>Operator: 200 { importDocumentId }
     Operator->>BulkImportApiResource: GET /v1/imports?entityType=clients.person
     BulkImportApiResource-->>Operator: [{ importId, completed, success, error }]
     Operator->>BulkImportApiResource: GET /v1/imports/downloadOutputTemplate?importDocumentId=...
@@ -264,7 +269,7 @@ public enum ImportFormatType {
 }
 ```
 
-The populator service today always writes `HSSFWorkbook` (`.xls`), but the upload side accepts all three formats via `ImportFormatType.of(...)`.
+The populator service always writes `HSSFWorkbook` (`.xls`), and the upload side currently restricts itself to the same format too. `BulkImportWorkbookServiceImpl.importWorkbook(...)` uses Apache Tika to detect the file type and rejects anything whose detected type does not contain `msoffice` or `application/vnd.ms-excel`, then constructs an `HSSFWorkbook` from the bytes. `ImportFormatType` is declared but not currently referenced from the upload pipeline, so XLSX / ODS uploads are not accepted today — re-save the template back to `.xls` before uploading.
 
 ## Sheet naming convention
 
@@ -317,12 +322,16 @@ When a row fails — bad office name, missing currency, validation rejection fro
 
 The platform-level error for an unknown entity type is `ImportTypeNotFoundException` in `bulkimport/exceptions/`, which is mapped to HTTP 400.
 
-## Asynchronous processing
+## Event-driven processing
 
-Uploads do not block the calling HTTP thread for long-running imports. `BulkImportEventListener` is annotated `@EventListener` and listens for `BulkImportEvent` (in `data/BulkImportEvent.java`); the entity resource publishes the event after persisting the workbook bytes and immediately returns the new `importDocumentId`. The listener resolves the right `ImportHandler` by `GlobalEntityType` and invokes `process(workbook, locale, dateFormat)`.
+`BulkImportEventListener` implements `ApplicationListener<BulkImportEvent>` (in `service/BulkImportEventListener.java`); the entity resource calls `BulkImportWorkbookServiceImpl.publishEvent(...)` after persisting the workbook bytes, which fires a `BulkImportEvent` through `ApplicationContext.publishEvent(...)`. The listener resolves the right `ImportHandler` bean by `GlobalEntityType` via a `switch` expression — for example `case LOANS -> applicationContext.getBean("loanImportHandler", ImportHandler.class)` — and invokes `process(workbook, locale, dateFormat)`. Once the handler returns its `Count`, the listener updates the `ImportDocument` totals and persists the annotated output workbook through `DocumentWritePlatformService`.
+
+<Note>
+Spring's default `ApplicationEventMulticaster` dispatches events **synchronously** on the publishing thread, and the bulk-import package does not configure `@Async` or a custom multicaster. As a result, `POST /v1/<entity>/uploadtemplate` blocks the HTTP thread until every row has been processed and the output workbook has been written. Tune client / proxy timeouts accordingly for very large uploads — there is no background queue here.
+</Note>
 
 <Tip>
-Because the import runs in a Spring listener and not in the original HTTP transaction, every row that ends up calling `PortfolioCommandSourceWritePlatformService.logCommandSource(...)` gets its own command audit trail in `m_portfolio_command_source`. Bulk import is therefore fully reproducible — replaying the same command stream from the audit table produces the same end state.
+Because every row goes through `PortfolioCommandSourceWritePlatformService.logCommandSource(...)`, each imported row gets its own command audit trail in `m_portfolio_command_source`. Bulk import is therefore fully reproducible — replaying the same command stream from the audit table produces the same end state.
 </Tip>
 
 ## Where to go next

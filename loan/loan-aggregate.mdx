@@ -27,7 +27,7 @@ public class Loan extends AbstractAuditableWithUTCDateTimeCustom<Long> {
 
 ## Field groups
 
-The class is large (>4 000 lines) but its state can be grouped into a handful of clusters. Each group lives in well-defined columns inside `m_loan`.
+The class is large (~1 855 lines and 100+ fields) but its state can be grouped into a handful of clusters. Each group lives in well-defined columns inside `m_loan`.
 
 <CardGroup cols={2}>
   <Card title="Identification" icon="fingerprint">
@@ -49,7 +49,7 @@ The class is large (>4 000 lines) but its state can be grouped into a handful of
     `Set<LoanCharge> charges` (loan-level), plus `LoanTrancheCharge`/`LoanTrancheDisbursementCharge` and `LoanOverdueInstallmentCharge` for special cases.
   </Card>
   <Card title="Collateral & guarantors" icon="shield">
-    `Set<LoanCollateral> collateral`, `Set<LoanCollateralManagement> loanCollateralManagements` and `Set<Guarantor> guarantors`.
+    `Set<LoanCollateral> collateral` and `Set<LoanCollateralManagement> loanCollateralManagements`. `Guarantor` rows live in their own table (`m_guarantor`) and reference `Loan` from the child side rather than as a collection on the aggregate root.
   </Card>
   <Card title="Totals" icon="calculator">
     `@Embedded LoanSummary summary` — derived totals updated by `LoanBalanceService`. See [LoanSummary](#loansummary-derived-totals).
@@ -60,7 +60,7 @@ Additional clusters worth noting:
 
 - **Disbursement tranches** — `Set<LoanDisbursementDetails> disbursementDetails` supports multi-tranche loans.
 - **Term variations** — `Set<LoanTermVariations> loanTermVariations` records rescheduling adjustments; the comparator [`LoanTermVariationsComparator`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/LoanTermVariationsComparator.java) orders them deterministically.
-- **Interest recalculation** — `LoanInterestRecalculationDetails interestRecalculationDetails` mirrors the per-loan settings copied from the product.
+- **Interest recalculation** — `LoanInterestRecalculationDetails loanInterestRecalculationDetails` mirrors the per-loan settings copied from the product.
 - **Topup / GLIM** — `LoanTopupDetails`, `GroupLoanIndividualMonitoringAccount` for top-up loans and GLIM accounts.
 - **Status change history** — `Set<LoanStatusChangeHistory>` and `Set<LoanOfficerAssignmentHistory>` keep an audit trail.
 

@@ -189,7 +189,9 @@ Mandatory fields per the resource's `@Operation` documentation:
 
 > `key, score, validFrom, validTo`
 
-(`validFrom`/`validTo` are not on the entity above — they only apply when the lookup is created alongside the parent survey, which carries those windows.)
+<Note>
+That swagger summary is misleading — `LookupTable` has no `validFrom` / `validTo` columns and `LookupTableData` has no such fields either. In practice the body the mapper actually reads is `{ key, description, entries[] }`, where each `entries[]` row carries `valueFrom`, `valueTo`, and `score`. The `validFrom`/`validTo` reference is documentation drift from the parent `Survey` schema; treat the practical mandatory set as `key` and a non-empty `entries[]` list with `valueFrom`, `valueTo`, `score` per entry.
+</Note>
 
 ## Lookup workflow
 

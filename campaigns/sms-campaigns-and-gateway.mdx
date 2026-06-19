@@ -145,10 +145,10 @@ From
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET    | `/v1/sms` | Page over messages |
+| GET    | `/v1/sms` | List all outbound messages (`List<SmsData>`) |
 | POST   | `/v1/sms` | Manually enqueue a message |
 | GET    | `/v1/sms/{resourceId}` | Retrieve one |
-| GET    | `/v1/sms/{campaignId}/messageByStatus` | Per-campaign status drill-down |
+| GET    | `/v1/sms/{campaignId}/messageByStatus` | Paginated per-campaign drill-down filtered by `status`, `fromDate`, `toDate` |
 | PUT    | `/v1/sms/{resourceId}` | Update (typically a re-target before send) |
 | DELETE | `/v1/sms/{resourceId}` | Remove a queued message |
 
@@ -252,7 +252,21 @@ sequenceDiagram
 (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/helper/SmsConfigUtils.java`)
 is the helper that turns an `apiEndPoint` into a URL and a set of
 headers, using the configuration stored under
-`c_external_service` (read by `ExternalServicesPropertiesReadPlatformService`):
+`c_external_service_properties` joined to the `c_external_service`
+row named `MESSAGE_GATEWAY` (read by
+`ExternalServicesPropertiesReadPlatformService.getSMSGateway()`).
+
+The property keys read out of
+`ExternalServicesConstants` are:
+
+| Property key | Field on `MessageGatewayConfigurationData` |
+| ------------ | ------------------------------------------ |
+| `host_name`     | `hostName()` — gateway host |
+| `port_number`   | `portNumber()` — gateway port |
+| `end_point`     | `endPoint()` — base path under host |
+| `tenant_app_key`| `tenantAppKey()` — sent as `Fineract-Tenant-App-Key` |
+
+`SmsConfigUtils` then builds the request:
 
 ```java
 HttpHeaders headers = new HttpHeaders();
@@ -283,8 +297,17 @@ tenants over one gateway.
 | 2     | `SCHEDULE` |
 | 3     | `TRIGGERED` |
 
-`SmsMessageStatusType` covers `PENDING`, `WAITING_FOR_REPORT`, `SENT`,
-`DELIVERED`, `FAILED`, `INVALID`.
+`SmsMessageStatusType`
+(`infrastructure/sms/domain/SmsMessageStatusType.java`):
+
+| Value | Constant |
+| ----- | -------- |
+| 0     | `INVALID` |
+| 100   | `PENDING` |
+| 150   | `WAITING_FOR_DELIVERY_REPORT` |
+| 200   | `SENT` |
+| 300   | `DELIVERED` |
+| 400   | `FAILED` |
 
 ## Common operations
 
@@ -296,8 +319,11 @@ enqueueing. Useful to sanity-check `{{...}}` placeholders.
 </Accordion>
 
 <Accordion title="Retry a failed send">
-Patch the row via `PUT /v1/sms/{id}` to set `status_enum` back to
-`PENDING`; the next tick of `SEND_MESSAGES_TO_SMS_GATEWAY` picks it up.
+`PUT /v1/sms/{id}` only updates the message body (`SmsUpdateRequest`
+carries just a `message` field). To re-attempt delivery, reset
+`status_enum` to `100` (`PENDING`) directly in
+`sms_messages_outbound` — the next tick of
+`SEND_MESSAGES_TO_SMS_GATEWAY` will pick it up.
 </Accordion>
 
 <Accordion title="Throttle the outbound rate">

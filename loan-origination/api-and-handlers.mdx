@@ -183,14 +183,16 @@ public LoanOriginatorMappingResponse attachOriginatorToLoan(@PathParam("loanId")
 }
 ```
 
-`attachLoanOriginator(loanId, originatorId)` builds a command where:
+`attachLoanOriginator(loanId, originatorId)` builds a command where (see `CommandWrapperBuilder.attachLoanOriginator`):
 
-- `entity = "LOAN_ORIGINATOR"`
-- `action = "ATTACH"`
-- `entityId = loanId` (via `withLoanId`)
+- `entityName = "LOAN_ORIGINATOR"`
+- `actionName = "ATTACH"`
+- `entityId = loanId`
+- `loanId = loanId` (the builder also sets the dedicated `loanId` slot)
 - `subentityId = originatorId`
+- `href = "/loans/" + loanId + "/originators/" + originatorId`
 
-The handler uses both ids — `command.getLoanId()` and `command.subentityId()`.
+The handler uses both id slots — `command.getLoanId()` and `command.subentityId()`.
 
 ### Detach (canonical shape)
 

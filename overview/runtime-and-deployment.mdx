@@ -12,11 +12,15 @@ explains the boot wiring, the toggles, the supported container topologies,
 and how to assemble them with Docker Compose or Kubernetes.
 
 <Note>
-The official supported runtime today is **Java 21**, **PostgreSQL ≥ 18**,
+The official supported runtime today is **Java 21**, **PostgreSQL ≥ 18.0**,
 and the **Spring Boot self-contained JAR**. Tomcat 10+ via the `fineract-war`
 module is also supported but explicitly described in `README.md` as
-optional: "we recommend the use of the self-contained JAR, which transparently
-embeds a servlet container using Spring Boot."
+optional: "Tomcat (min. v10) is only needed if you wish to deploy the
+Fineract WAR to a separate external servlet container. You do not need to
+install Tomcat to run Fineract. We recommend the use of the self-contained
+JAR, which transparently embeds a servlet container using Spring Boot."
+Per the same README, support for backend databases other than PostgreSQL is
+deprecated (FSIP-9).
 </Note>
 
 ## Boot entry point
@@ -29,9 +33,17 @@ package org.apache.fineract;
 
 public class ServerApplication extends SpringBootServletInitializer {
 
-    @Import({ FineractWebApplicationConfiguration.class,
-              FineractLiquibaseOnlyApplicationConfiguration.class })
+    @Import({ FineractWebApplicationConfiguration.class, FineractLiquibaseOnlyApplicationConfiguration.class })
     private static final class Configuration {}
+
+    @Override
+    protected SpringApplicationBuilder configure(SpringApplicationBuilder builder) {
+        return configureApplication(builder);
+    }
+
+    private static SpringApplicationBuilder configureApplication(SpringApplicationBuilder builder) {
+        return builder.sources(Configuration.class);
+    }
 
     public static void main(String[] args) throws IOException {
         configureApplication(new SpringApplicationBuilder(ServerApplication.class)).run(args);
@@ -40,7 +52,8 @@ public class ServerApplication extends SpringBootServletInitializer {
 ```
 
 Exactly one of those two configurations becomes active at runtime, gated by a
-`@Conditional`:
+`@Conditional` (the two condition classes live in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/core/condition/`):
 
 ```mermaid
 flowchart TB
@@ -59,17 +72,24 @@ Full server. Lives at
 
 ```java
 @Configuration
-@EnableAutoConfiguration(exclude = { DataSourceAutoConfiguration.class,
-    HibernateJpaAutoConfiguration.class, DataSourceTransactionManagerAutoConfiguration.class,
-    GsonAutoConfiguration.class, JdbcTemplateAutoConfiguration.class,
-    LiquibaseAutoConfiguration.class })
+@EnableAutoConfiguration(exclude = { DataSourceAutoConfiguration.class, HibernateJpaAutoConfiguration.class,
+        DataSourceTransactionManagerAutoConfiguration.class, GsonAutoConfiguration.class, JdbcTemplateAutoConfiguration.class,
+        LiquibaseAutoConfiguration.class })
 @EnableTransactionManagement
 @EnableWebSecurity
 @EnableConfigurationProperties({ FineractProperties.class, LiquibaseProperties.class })
 @ComponentScan(basePackages = "org.apache.fineract.**")
 @IntegrationComponentScan(basePackages = "org.apache.fineract.**")
 @Conditional(FineractWebApplicationCondition.class)
-public abstract class FineractWebApplicationConfiguration implements InitializingBean { /* … */ }
+@Slf4j
+// The class needs to be abstract for some reason, otherwise the tests start to fail...
+public abstract class FineractWebApplicationConfiguration implements InitializingBean {
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        log.warn("Fineract is running in web application mode");
+    }
+}
 ```
 
 Note the autoconfiguration exclusions — Fineract owns its own `DataSource`,
@@ -82,13 +102,18 @@ deployment, brings every tenant database up to the latest schema, then exits.
 
 ```java
 @Conditional(FineractLiquibaseOnlyApplicationCondition.class)
+@Slf4j
 @EnableConfigurationProperties({ FineractProperties.class, LiquibaseProperties.class })
 @Import({ HikariCpConfig.class, JdbcConfig.class })
-@ComponentScan(basePackages = {
-    "org.apache.fineract.infrastructure.core.service.migration",
-    "org.apache.fineract.infrastructure.core.service.database",
-    "org.apache.fineract.infrastructure.core.service.tenant" })
-public class FineractLiquibaseOnlyApplicationConfiguration implements InitializingBean { /* … */ }
+@ComponentScan(basePackages = { "org.apache.fineract.infrastructure.core.service.migration",
+        "org.apache.fineract.infrastructure.core.service.database", "org.apache.fineract.infrastructure.core.service.tenant" })
+public class FineractLiquibaseOnlyApplicationConfiguration implements InitializingBean {
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        log.warn("Fineract is running in Liquibase only mode");
+    }
+}
 ```
 
 The companion properties file is
@@ -107,8 +132,12 @@ fineract.mode.batch-worker-enabled=${FINERACT_MODE_BATCH_WORKER_ENABLED:true}
 fineract.mode.batch-manager-enabled=${FINERACT_MODE_BATCH_MANAGER_ENABLED:true}
 ```
 
-Wired up in `org.apache.fineract.infrastructure.instancemode` (in
-`fineract-provider`). The matrix:
+Wired up in `org.apache.fineract.infrastructure.instancemode` — the
+property-backed `FineractInstanceModeConfig` lives in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/instancemode/`
+and the JAX-RS request filter that short-circuits disallowed verbs lives in
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/instancemode/api/`.
+The matrix:
 
 | Mode | Read API | Write API (command pipeline) | Quartz scheduler | Spring Batch worker |
 |------|---------|------------------------------|------------------|---------------------|

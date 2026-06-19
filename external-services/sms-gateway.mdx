@@ -144,13 +144,35 @@ public class SmsApiResource {
 
 ### Creating a message
 
+The `SmsCreationRequest` record only carries the recipient *reference* and the body:
+
+```java
+public record SmsCreationRequest(Long groupId, Long clientId, Long staffId,
+                                 String message, Long campaignId) implements Serializable {}
+```
+
+Mobile number is derived from the linked client or staff record by `SmsMessageAssembler.assembleFromJson(...)` (`client.mobileNo()` / `staff.getMobileNo()`), and `is_notification` is inherited from `SmsCampaign.isNotification()` if a `campaignId` is supplied — both fields are off-limits from the request body:
+
+```java
+if (this.fromApiJsonHelper.parameterExists(SmsApiConstants.clientIdParamName, element)) {
+    final Long clientId = this.fromApiJsonHelper.extractLongNamed(SmsApiConstants.clientIdParamName, element);
+    client = this.clientRepository.findOneWithNotFoundDetection(clientId);
+    mobileNo = client.mobileNo();
+}
+// ...
+if (this.fromApiJsonHelper.parameterExists(SmsApiConstants.campaignIdParamName, element)) {
+    final Long campaignId = this.fromApiJsonHelper.extractLongNamed(SmsApiConstants.campaignIdParamName, element);
+    smsCampaign = this.smsCampaignRepository.findById(campaignId).orElseThrow(...);
+    isNotification = smsCampaign.isNotification();
+}
+```
+
 ```http
 POST /fineract-provider/api/v1/sms
 Content-Type: application/json
 
 {
   "clientId": 42,
-  "mobileNo": "+260971234567",
   "message":  "Reminder: your next instalment is due Friday."
 }
 ```

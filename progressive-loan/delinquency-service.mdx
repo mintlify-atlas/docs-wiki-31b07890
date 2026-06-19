@@ -200,22 +200,37 @@ flowchart LR
     A -->|isProgressiveSchedule? yes/no| Disc
     Disc[PossibleNextRepaymentCalculationServiceDiscovery]
     Disc -->|canAccept = true| ProgImpl
-    Disc -.->|fallback for cumulative| CumImpl[CumulativePossibleNextRepaymentCalculationServiceImpl]
+    Disc -.->|no match for cumulative loans| Null["null<br/>nextPaymentAmount stays unset"]
     subgraph fineract-loan
         Disc
         Abstract[AbstractPossibleNextRepaymentCalculationService]
-        CumImpl
     end
     subgraph fineract-progressive-loan
         ProgImpl[ProgressivePossibleNextRepaymentCalculationServiceImpl]
     end
     Abstract <|.. ProgImpl
-    Abstract <|.. CumImpl
     ProgImpl --> Repo[InterestScheduleModelRepositoryWrapper]
     Repo --> Snap[ProgressiveLoanModel snapshot]
     ProgImpl --> APSTP[AdvancedPaymentScheduleTransactionProcessor]
     APSTP --> EMI[ProgressiveEMICalculator]
 ```
+
+The discoverer's `getService(...)` returns `null` when no implementation accepts the loan, and
+`DelinquencyReadPlatformServiceImpl` is explicit about that — cumulative loans simply do not get a
+`nextPaymentAmount` populated on the collection data:
+
+```java
+// fineract-loan/.../delinquency/service/DelinquencyReadPlatformServiceImpl.java
+PossibleNextRepaymentCalculationService possibleNextRepaymentCalculationService = possibleNextRepaymentCalculationServiceDiscovery
+        .getService(loan);
+if (possibleNextRepaymentCalculationService != null) {
+    collectionData.setNextPaymentAmount(
+            possibleNextRepaymentCalculationService.possibleNextRepaymentAmount(loan, collectionData.getNextPaymentDueDate()));
+}
+```
+
+`ProgressivePossibleNextRepaymentCalculationServiceImpl` is therefore — at time of writing — the **only**
+production implementation of `PossibleNextRepaymentCalculationService` in the codebase.
 
 ## Trigger: `LOAN_DELINQUENCY_CLASSIFICATION`
 
@@ -332,20 +347,22 @@ sequenceDiagram
 
 | Concern                                          | `fineract-loan` (cumulative)                                   | `fineract-progressive-loan` (progressive)                     |
 |--------------------------------------------------|----------------------------------------------------------------|--------------------------------------------------------------|
-| Framework class                                  | `AbstractPossibleNextRepaymentCalculationService`              | Same — extended                                              |
-| Routing key                                      | Default — `canAccept` returns `true` when not progressive      | `loan.isProgressiveSchedule()`                                |
-| Future outstanding source                        | Re-runs cumulative interest accrual against the installments   | Loads the persisted `ProgressiveLoanModel` snapshot           |
+| Framework class                                  | `AbstractPossibleNextRepaymentCalculationService` (unused)     | Same — extended                                              |
+| `PossibleNextRepaymentCalculationService` impl   | None — discoverer returns `null`                               | `ProgressivePossibleNextRepaymentCalculationServiceImpl`      |
+| Routing key                                      | n/a                                                            | `loan.isProgressiveSchedule()`                                |
+| Future outstanding source                        | `nextPaymentAmount` stays unset on the collection data         | Loads the persisted `ProgressiveLoanModel` snapshot           |
 | Transaction processor                            | Standard `LoanRepaymentScheduleTransactionProcessor` family    | `AdvancedPaymentScheduleTransactionProcessor`                 |
 | Snapshot persistence                             | None                                                           | `m_loan_progressive_model.json_model`                         |
-| EMI recomputation per recalc                     | Time-bucketed accrual                                          | `recalculateModelOverdueAmountsTillDate(...)` + period read   |
-| Fees/penalties                                   | Same — read from `LoanRepaymentScheduleInstallment`            | Same                                                          |
+| EMI recomputation per recalc                     | n/a                                                            | `recalculateModelOverdueAmountsTillDate(...)` + period read   |
+| Fees/penalties                                   | n/a                                                            | Read from `LoanRepaymentScheduleInstallment`                  |
 
-The shared abstract class ensures both engines apply the **same five guard conditions** before they bother
-to recompute — interest recalculation must be enabled, rest frequency must not match the repayment
-frequency, the loan must not be charged off as of the date, the next due date must be strictly in the
-future, the next installment must not start today, and the loan must have a positive disbursed amount.
-Inside those guards, the progressive engine substitutes its snapshot-driven recomputation for the
-cumulative engine's accrual replay.
+When a progressive implementation **is** picked up, the shared `AbstractPossibleNextRepaymentCalculationService`
+applies a five-part guard before calling out to the subclass: interest recalculation must be enabled, the
+rest frequency must not match the repayment frequency, the loan must not be charged off as of the date,
+the next due date must be strictly in the future (and the installment must not start today), and the loan
+must have a positive disbursed amount. Inside those guards the progressive subclass runs the
+snapshot-driven recomputation described above; outside them, the abstract base just returns the persisted
+`nextInstallment.getTotalOutstanding(...)`.
 
 ## Why a snapshot?
 

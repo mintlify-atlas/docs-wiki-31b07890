@@ -38,24 +38,24 @@ flowchart LR
         Serializer[ApiRequestJsonSerializationSettings<br/>GoogleGsonSerializerHelper]
     end
 
-    subgraph App[Application / fineract-command]
-        CSS[CommandSourceService]
-        Wrapper[PortfolioCommandSourceWritePlatformService]
+    subgraph App[Application / fineract-core commands]
+        CSS[SynchronousCommandProcessingService]
+        Wrapper[PortfolioCommandSourceWritePlatformServiceImpl]
         Handler[NewCommandSourceHandler<br/>+ CommandWrapper]
         MakerChecker[Maker / Checker<br/>CommandSourceRepository]
     end
 
     subgraph Domain[Domain modules]
-        LoanSvc[fineract-loan<br/>LoanWritePlatformService]
-        SavSvc[fineract-savings<br/>SavingsAccountWritePlatformService]
-        AcctSvc[fineract-accounting<br/>JournalEntryWritePlatformService]
+        LoanSvc[fineract-loan + provider<br/>LoanWritePlatformService]
+        SavSvc[fineract-savings + provider<br/>SavingsAccountWritePlatformService]
+        AcctSvc[fineract-accounting + provider<br/>JournalEntryWritePlatformService]
         ChargeSvc[fineract-charge / -tax / -rates]
     end
 
     subgraph Infra[Infrastructure / fineract-core]
         JPA[Spring Data JPA<br/>EclipseLink + static weaving]
-        Tenant[Tenant routing<br/>DataSourcePerTenantService]
-        Events[BusinessEventNotifier]
+        Tenant[Tenant routing<br/>RoutingDataSource +<br/>TomcatJdbcDataSourcePerTenantService]
+        Events[BusinessEventNotifierService]
     end
 
     DB[(PostgreSQL<br/>fineract_default<br/>fineract_tenants)]
@@ -121,11 +121,15 @@ from `org.apache.fineract.**.api` packages.
 
 Boundary classes:
 
-- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/jersey/` —
-  Jersey `ResourceConfig`, filters, exception mappers.
-- `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoansApiResource.java`
-- `fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsAccountsApiResource.java`
-- `fineract-accounting/src/main/java/org/apache/fineract/accounting/journalentry/api/JournalEntriesApiResource.java`
+- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/jersey/` —
+  Jersey `ResourceConfig`, filters, exception mappers (also `fineract-core/.../infrastructure/core/jersey/` and `.../infrastructure/core/api/jersey/`).
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoansApiResource.java`
+  (the `Loan` aggregate lives in `fineract-loan`, but the API entry resources
+  for loans, savings, and journal entries are assembled in `fineract-provider`).
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsAccountsApiResource.java`
+- `fineract-provider/src/main/java/org/apache/fineract/accounting/journalentry/api/JournalEntriesApiResource.java`
+- Domain-side resources such as
+  `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanScheduleApiResource.java`.
 
 A resource method does only three things: (1) authorise the *action*, not the
 *data*, via `PlatformSecurityContext`; (2) construct a `CommandWrapper`
@@ -153,40 +157,52 @@ asynchronous execution.
 ```mermaid
 sequenceDiagram
     participant R as *ApiResource
-    participant W as PortfolioCommandSourceWritePlatformService
-    participant CS as CommandSourceService
-    participant H as NewCommandSourceHandler
+    participant W as PortfolioCommandSourceWritePlatformServiceImpl
+    participant CS as SynchronousCommandProcessingService
+    participant SS as CommandSourceService
+    participant H as NewCommandSourceHandler impl
     participant D as Domain Service (e.g. LoanWritePlatformService)
     participant DB as PostgreSQL
 
     R->>W: logCommandSource(CommandWrapper)
-    W->>CS: processAndLogCommand
-    CS->>CS: persist CommandSource (pending)
-    CS->>H: processCommand
+    W->>CS: executeCommand(wrapper, command, isApprovedByChecker)
+    CS->>SS: saveInitialNewCommand (pending)
+    CS->>H: findCommandHandler + processCommand
     H->>D: invoke specific write platform service
     D->>DB: JPA / JDBC writes
     D-->>H: CommandProcessingResult
     H-->>CS: result
-    CS->>CS: update CommandSource (processed)
+    CS->>SS: saveResultNewCommand (processed)
     CS-->>W: result
     W-->>R: result
 ```
 
-Boundary classes:
+Boundary classes — all in `fineract-core` (the legacy command-source pipeline):
 
-- `fineract-command/src/main/java/org/apache/fineract/commands/service/CommandSourceService.java`
-- `fineract-command/src/main/java/org/apache/fineract/commands/service/PortfolioCommandSourceWritePlatformService.java`
-- `fineract-command/src/main/java/org/apache/fineract/commands/handler/NewCommandSourceHandler.java`
-- `fineract-command/src/main/java/org/apache/fineract/commands/domain/CommandSource.java`
-- `fineract-command/src/main/java/org/apache/fineract/commands/domain/CommandWrapper.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/service/SynchronousCommandProcessingService.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/service/CommandSourceService.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/service/PortfolioCommandSourceWritePlatformServiceImpl.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/service/CommandWrapperBuilder.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/service/IdempotencyKeyResolver.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/handler/NewCommandSourceHandler.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/domain/CommandSource.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/domain/CommandWrapper.java`
+- `fineract-core/src/main/java/org/apache/fineract/commands/domain/CommandSourceRepository.java`
 
 `CommandSource` is the persistent audit record (`m_portfolio_command_source`
 table); it stores the JSON payload, the acting user, the resource id and the
-outcome. The companion module `fineract-command-audit` extends this with
-periodic audit reporting; `fineract-command-jdbc` provides JDBC-backed
-projections; `fineract-command-async` adds asynchronous (worker) execution; and
-`fineract-command-disruptor` plugs in an LMAX Disruptor for very high-throughput
-write paths.
+outcome.
+
+The separate `fineract-command*` family of modules (with package prefix
+`org.apache.fineract.command.*`) is a parallel, next-generation command
+processing infrastructure introduced under FINERACT-2169: `fineract-command`
+defines `CommandDispatcher`, `CommandHandlerManager`, and
+`SynchronousCommandDispatcher`; `fineract-command-jdbc` ships a `CommandStore`
+backed by Spring Data JDBC; `fineract-command-audit` adds before/after/error
+hooks for audit; `fineract-command-async` provides `AsyncCommandDispatcher`;
+and `fineract-command-disruptor` plugs in an LMAX Disruptor for very
+high-throughput write paths. These modules run independently next to the
+legacy pipeline and are not yet wired into every domain service.
 
 ### 3. Domain layer
 
@@ -212,18 +228,31 @@ write services delegate to aggregate roots like
 
 ### 4. Infrastructure layer (`fineract-core`)
 
-`fineract-core` is the only module every other module depends on. It contains:
+`fineract-core` is the foundation almost every domain module depends on
+(`fineract-core` itself depends on `fineract-command`, `fineract-validation`
+and `fineract-avro-schemas`). It contains:
 
-- Multi-tenancy: `infrastructure/core/service/tenant/` — `DataSourcePerTenantService`,
-  `TenantDetailsService`, `ThreadLocalContextUtil`.
-- JPA / Hibernate / EclipseLink config: `infrastructure/core/config/`. Note
-  that entities are **statically woven** at build time (see
-  `STATIC_WEAVING.md`).
-- Liquibase migration runner: `infrastructure/core/service/migration/`.
-- Business event bus: `infrastructure/event/business/`.
-- Job scheduler bindings: `infrastructure/jobs/` (Quartz + Spring Batch).
+- Multi-tenancy: `infrastructure/core/service/tenant/` —
+  `JdbcTenantDetailsService`, `TenantDetailsService`, `TenantMapper`; the
+  actual routing data source lives in
+  `infrastructure/core/service/database/` —
+  `RoutingDataSource`, `RoutingDataSourceService`,
+  `TomcatJdbcDataSourcePerTenantService`,
+  `DataSourcePerTenantServiceFactory`, plus
+  `infrastructure/core/service/ThreadLocalContextUtil.java`.
+- JPA / EclipseLink config: `infrastructure/core/config/`. Note that entities
+  are **statically woven** at build time (see `STATIC_WEAVING.md`).
+- Liquibase migration runner: `infrastructure/core/service/migration/`
+  (`TenantDataSourceFactory`).
+- Business event bus: `infrastructure/event/business/` —
+  `BusinessEventNotifierService` (impl in `BusinessEventNotifierServiceImpl`).
+- External-event producer SPI: `infrastructure/event/external/producer/ExternalEventProducer.java`
+  (Kafka / JMS producers live in `fineract-provider/.../infrastructure/event/external/producer/{kafka,jms}/`).
+- Job scheduler bindings: `infrastructure/jobs/` (Quartz + Spring Batch) and
+  `infrastructure/jobs/service/JobName.java` enum.
 - Security primitives shared with `fineract-security`:
-  `PlatformSecurityContext`, `AppUser`, `Role`, `Permission`.
+  `infrastructure/security/service/PlatformSecurityContext`,
+  `useradministration/domain/AppUser`, `Role`, `Permission`.
 
 ## Security path
 
@@ -300,10 +329,14 @@ fineract.mode.batch-manager-enabled=${FINERACT_MODE_BATCH_MANAGER_ENABLED:true}
 ### Quartz scheduler + Spring Batch jobs
 
 `fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/`
-contains the Quartz wiring (`SchedulerJobListener`, `JobExecuter`, etc.). Each
-job is registered in the `job` table and triggers a Spring Batch job whose
-`Step` beans live in the relevant domain module (e.g.
-`fineract-loan` defines step `applyChargeForOverdueLoans`).
+contains the Quartz wiring
+(`service/SchedulerJobListener.java`, `ScheduledJobRunnerConfig.java`, etc.),
+backed by the `JobName` enum in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java`.
+Each job is registered in the `m_job` table and triggers a Spring Batch job
+whose `Step` beans live in the relevant domain module (e.g. `fineract-loan`
+defines `ApplyChargeToOverdueLoansBusinessStep` under
+`src/main/java/org/apache/fineract/cob/loan/`).
 
 The `fineract.mode.batch-manager-enabled` / `batch-worker-enabled` properties
 select the Spring Batch role for the node — useful when running a cluster
@@ -318,10 +351,10 @@ in `m_batch_business_step` and ordered per business process.
 
 ```mermaid
 flowchart LR
-    Cron[Quartz cron] --> COBJob[LoanCOBJobConfig]
-    COBJob --> Partitioner[Loan partitioner<br/>by id range]
-    Partitioner --> Worker1[Worker step 1]
-    Partitioner --> Worker2[Worker step N]
+    Cron[Quartz cron] --> Mgr[LoanCOBManagerConfiguration]
+    Mgr --> Partitioner[LoanCOBPartitioner<br/>by id range]
+    Partitioner --> Worker1[LoanCOBWorkerConfiguration step 1]
+    Partitioner --> Worker2[LoanCOBWorkerConfiguration step N]
     Worker1 --> Steps[BusinessStep chain<br/>fineract-cob + fineract-loan]
     Worker2 --> Steps
     Steps --> JPA[JPA writes]
@@ -329,25 +362,38 @@ flowchart LR
 
 Boundary classes:
 
+- `fineract-cob/src/main/java/org/apache/fineract/cob/COBBusinessStep.java` (SPI)
 - `fineract-cob/src/main/java/org/apache/fineract/cob/COBBusinessStepService.java`
-- `fineract-cob/src/main/java/org/apache/fineract/cob/loan/LoanCOBBusinessStep.java`
-- `fineract-loan/src/main/java/org/apache/fineract/cob/loan/` — concrete steps
-  contributed by the loan module.
+  (impl: `COBBusinessStepServiceImpl.java`)
+- `fineract-loan/src/main/java/org/apache/fineract/cob/loan/LoanCOBBusinessStep.java`
+  (the loan-flavoured marker interface)
+- `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanCOBManagerConfiguration.java`
+  + `LoanCOBWorkerConfiguration.java` + `LoanCOBPartitioner.java` — Spring
+  Batch wiring for the COB job.
+- `fineract-loan/src/main/java/org/apache/fineract/cob/loan/` and
+  `fineract-provider/src/main/java/org/apache/fineract/cob/loan/` — concrete
+  business steps (e.g. `ApplyChargeToOverdueLoansBusinessStep`,
+  `AccrualActivityPostingBusinessStep`,
+  `CheckLoanRepaymentDueBusinessStep`).
 
 ### External events — Kafka / ActiveMQ
 
 Business changes raised by domain services are pushed through
-`BusinessEventNotifier` in `fineract-core`. The `fineract-avro-schemas` module
-defines the Avro contract for the public event payload, and connector beans in
-`fineract-provider/src/main/java/org/apache/fineract/infrastructure/event/external/`
-serialise them to Kafka or JMS. The compose files
+`BusinessEventNotifierService` in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/event/business/service/`.
+The `fineract-avro-schemas` module defines the Avro contract for the public
+event payload, the `ExternalEventProducer` SPI lives in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/producer/`,
+and the concrete Kafka and JMS implementations live under
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/event/external/producer/{kafka,jms}/`.
+The compose files
 `docker-compose-postgresql-kafka.yml` and
 `docker-compose-postgresql-activemq.yml` show the two officially tested
 brokers.
 
 ```mermaid
 flowchart LR
-    Domain[Domain service] --> Notifier[BusinessEventNotifier]
+    Domain[Domain service] --> Notifier[BusinessEventNotifierService]
     Notifier --> Outbox[m_external_event<br/>outbox table]
     Outbox --> Producer[ExternalEventProducer]
     Producer -->|Avro| Kafka[(Kafka topic)]
@@ -365,18 +411,21 @@ executing it; a checker user later invokes
 `PortfolioCommandSourceWritePlatformService#approveEntry`, which re-runs the
 same handler under their identity.
 
-Idempotency on writes is provided by `fineract-command-jdbc`'s
-`IdempotencyKeyResolver` — the inbound `Idempotency-Key` header is hashed into
-the `CommandSource` row so duplicate retries return the original
-`CommandProcessingResult` rather than executing twice.
+Idempotency on writes is provided by
+`fineract-core/src/main/java/org/apache/fineract/commands/service/IdempotencyKeyResolver.java`
+(generator: `IdempotencyKeyGenerator.java`). The inbound `Idempotency-Key`
+header is hashed and stored on the `CommandSource` row;
+`IdempotencyStoreFilter` (in
+`fineract-core/.../infrastructure/core/filters/`) makes duplicate retries
+return the original `CommandProcessingResult` rather than executing twice.
 
 ## Multi-tenancy in one picture
 
 ```mermaid
 flowchart LR
-    H[HTTP header<br/>Fineract-Platform-TenantId] --> Resolver[TenantDetailsService]
+    H[HTTP header<br/>Fineract-Platform-TenantId] --> Resolver[JdbcTenantDetailsService]
     Resolver --> Tenants[(fineract_tenants DB)]
-    Tenants -->|tenant row| Router[DataSourcePerTenantService]
+    Tenants -->|tenant row| Router[RoutingDataSource +<br/>TomcatJdbcDataSourcePerTenantService]
     Router --> Pool1[(HikariCP pool — tenant A<br/>fineract_default)]
     Router --> Pool2[(HikariCP pool — tenant B)]
     Pool1 --> Domain[Domain JPA work]
@@ -384,27 +433,35 @@ flowchart LR
 ```
 
 `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/service/tenant/`
-owns this routing. `ThreadLocalContextUtil` stores the resolved tenant for the
-duration of the request, so all repositories transparently see the correct
-database.
+(`JdbcTenantDetailsService`, `TenantDetailsService`, `TenantMapper`) resolves
+the inbound tenant identifier, and
+`infrastructure/core/service/database/` owns the routing primitives
+(`RoutingDataSource`, `RoutingDataSourceService`,
+`TomcatJdbcDataSourcePerTenantService`, `DataSourcePerTenantServiceFactory`,
+`HikariDataSourceFactory`). `ThreadLocalContextUtil`
+(`infrastructure/core/service/ThreadLocalContextUtil.java`) stores the
+resolved tenant for the duration of the request, so all repositories
+transparently see the correct database.
 
 ## Where each layer lives — quick file map
 
 | Layer | Module | Representative path |
 |------|--------|---------------------|
-| HTTP edge | `fineract-security` | `src/main/java/org/apache/fineract/infrastructure/security/filter/` |
+| HTTP edge | `fineract-security` | `src/main/java/org/apache/fineract/infrastructure/security/filter/TenantAwareBasicAuthenticationFilter.java` |
 | Servlet container | `fineract-provider` | `src/main/java/org/apache/fineract/ServerApplication.java` |
-| JAX-RS resources | `fineract-loan`, `fineract-savings`, … | `**/portfolio/*/api/*ApiResource.java` |
-| Serialisation | `fineract-core` | `infrastructure/core/serialization/` |
-| Command pipeline | `fineract-command` | `commands/service/CommandSourceService.java` |
-| Audit | `fineract-command-audit` | `commands/audit/` |
-| Async exec | `fineract-command-async`, `fineract-command-disruptor` | — |
-| Domain write services | `fineract-loan`, `fineract-savings`, … | `**/service/*WritePlatformServiceJpaRepositoryImpl.java` |
+| JAX-RS resources | `fineract-provider` (most) + several domain modules | `**/portfolio/**/api/*ApiResource.java` |
+| Serialisation | `fineract-core` | `infrastructure/core/serialization/` (`GoogleGsonSerializerHelper`, `ApiRequestJsonSerializationSettings`) |
+| Command pipeline (legacy, in production use) | `fineract-core` | `commands/service/SynchronousCommandProcessingService.java` |
+| Command pipeline (new, FINERACT-2169) | `fineract-command` | `command/core/CommandDispatcher.java`, `command/implementation/SynchronousCommandDispatcher.java` |
+| Audit hooks (new pipeline) | `fineract-command-audit` | `command/audit/hook/` |
+| Async / Disruptor (new pipeline) | `fineract-command-async`, `fineract-command-disruptor` | `command/async/implementation/AsyncCommandDispatcher.java`, `command/disruptor/implementation/DisruptorCommandDispatcher.java` |
+| JDBC command store (new pipeline) | `fineract-command-jdbc` | `command/jdbc/store/JdbcCommandStore.java` |
+| Domain write services | `fineract-loan` (interface) + `fineract-provider` (impl), `fineract-savings`, … | `**/service/*WritePlatformService.java`, `**/service/*WritePlatformServiceJpaRepositoryImpl.java` |
 | JPA entities | each domain module | `**/domain/*.java` |
-| Multi-tenancy | `fineract-core` | `infrastructure/core/service/tenant/` |
+| Multi-tenancy | `fineract-core` | `infrastructure/core/service/tenant/` + `infrastructure/core/service/database/` |
 | Scheduler | `fineract-provider` + `fineract-cob` | `infrastructure/jobs/`, `cob/` |
-| Events | `fineract-core` + `fineract-avro-schemas` | `infrastructure/event/` |
-| Migrations | `fineract-core` + `fineract-db` | `infrastructure/core/service/migration/`, `fineract-db/` |
+| Events | `fineract-core` + `fineract-avro-schemas` | `infrastructure/event/business/` (in-process), `infrastructure/event/external/producer/` (Kafka/JMS) |
+| Migrations | `fineract-core` + `fineract-provider` | `infrastructure/core/service/migration/`, `fineract-provider/src/main/resources/db/changelog/{tenant,tenant-store}/` |
 
 <Tip>
 The cleanest way to understand a single feature is to follow one

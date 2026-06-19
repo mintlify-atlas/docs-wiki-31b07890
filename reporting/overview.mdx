@@ -1,22 +1,25 @@
 ---
 title: "Reporting Overview"
-description: "Tour the four reporting engines in Apache Fineract: stretchy SQL/Pentaho reports, MIX taxonomy XBRL, scheduled report mailing jobs, and ad-hoc query reports."
-keywords: ["Apache Fineract", "reporting", "Pentaho", "stretchy report", "MIX taxonomy", "XBRL", "report mailing job", "ad-hoc query"]
+description: "Tour the reporting engines in Apache Fineract: stretchy SQL/Chart/SMS reports, MIX taxonomy XBRL, scheduled report mailing jobs, and ad-hoc query snapshots."
+keywords: ["Apache Fineract", "reporting", "stretchy report", "MIX taxonomy", "XBRL", "report mailing job", "ad-hoc query"]
 ---
 
 Apache Fineract ships with four loosely coupled reporting engines. Together they cover everything from interactive operational dashboards (a branch manager browsing a client list in HTML) to regulatory submissions (a country office uploading an XBRL file to MIX Market) and unattended back-office automation (a CSV emailed to the finance team every Monday at 06:00). This page is a map of those engines so the rest of the wiki has a single place to point at.
 
 The engines are intentionally pluggable. The core abstraction lives in the `fineract-report` module and consists of a small SPI (`ReportingProcessService`) plus an annotation-based registry (`ReportingProcessServiceProvider`). Concrete engines register themselves by annotating their service bean with `@ReportService(type = { ... })`, and a single REST endpoint, `/v1/runreports/{reportName}`, picks the right engine at runtime based on the persisted `report_type` column of the report definition.
 
-## The four engines at a glance
+## The engines at a glance
 
 | Engine | Module | Catalogue table | Primary REST resource | Main use case |
 | ------ | ------ | --------------- | --------------------- | ------------- |
-| Stretchy SQL / Chart / SMS reports | `fineract-provider` `dataqueries` | `stretchy_report` | `/v1/reports`, `/v1/runreports/{name}` | Parameterised SQL exported as JSON/CSV/Excel/PDF |
-| Pentaho `.prpt` reports | `fineract-provider` (optional bundle) | `stretchy_report` (`report_type='Pentaho'`) | `/v1/runreports/{name}` | Banded, pixel-perfect statements and statutory reports |
+| Stretchy SQL / Chart / SMS reports | `fineract-provider` `dataqueries` | `stretchy_report` | `/v1/reports`, `/v1/runreports/{name}` | Parameterised SQL exported as JSON/CSV/PDF/S3 |
 | MIX taxonomy / XBRL | `fineract-mix` | `mix_taxonomy`, `mix_taxonomy_mapping`, `mix_xbrl_namespace` | `/v1/mixtaxonomy`, `/v1/mixmapping`, `/v1/mixreport` | XBRL submission to [themix.org](https://www.themix.org/) |
-| Report mailing jobs | `fineract-provider` `reportmailingjob` | `m_report_mailing_job`, `m_report_mailing_job_run_history` | `/v1/reportmailingjobs`, `/v1/reportmailingjobrunhistory` | Scheduled email of a stretchy/Pentaho report as XLS/PDF/CSV |
-| Ad-hoc query | `fineract-provider` `adhocquery` | `m_adhoc` | `/v1/adhocquery` | One-off SQL that **writes** aggregated rows into a target table on a schedule |
+| Report mailing jobs | `fineract-provider` `reportmailingjob` | `m_report_mailing_job`, `m_report_mailing_job_run_history` | `/v1/reportmailingjobs`, `/v1/reportmailingjobrunhistory` | Scheduled email of a stretchy report as XLS/PDF/CSV |
+| Ad-hoc query | `fineract-provider` `adhocquery` | `m_adhoc` | `/v1/adhocquery` | Recurring SQL that **writes** aggregated rows into a target table on a schedule |
+
+<Note>
+The seed migrations also create rows with `report_type = 'Pentaho'` (Balance Sheet, Income Statement, Trial Balance, Loan Account Schedule, Branch Expected Cash Flow, Expected Payments By Date - Formatted). The Pentaho engine itself was removed from the codebase — the body of `ReadReportingServiceImpl.generatePentahoReportAsOutputStream` is commented out and the method returns `null`, and no bean is registered under `@ReportService(type = "Pentaho")`. Calling `/v1/runreports/Balance Sheet` therefore fails with a `503 err.msg.report.service.implementation.missing` from the registry until an external module supplies the engine.
+</Note>
 
 The diagram below summarises how a single HTTP request flows through the registry to the engine that owns the report type:
 
@@ -25,13 +28,12 @@ flowchart LR
     A[Client] -->|GET /v1/runreports/Client Listing| B[RunreportsApiResource]
     B --> C{ReadReportingService.getReportType}
     C -->|"Table" / "Chart" / "SMS"| D[DatatableReportingProcessService]
-    C -->|"Pentaho"| E[Pentaho engine bundle]
+    C -->|"Pentaho"| E[no bean registered &rarr;<br/>503 service missing]
     D --> F[DatatableReportExportService]
     F -->|CSV| G1[CsvDatatableReportExportServiceImpl]
     F -->|PDF| G2[PdfDatatableReportExportService]
     F -->|JSON| G3[JsonDatatableReportExportService]
     F -->|S3| G4[S3DatatableReportExportServiceImpl]
-    E --> H[ByteArrayOutputStream PDF/XLS/HTML]
 ```
 
 The registry itself is a one-page Spring component — every bean implementing `ReportingProcessService` is autowired into a list, then indexed by the `type()` values of its `@ReportService` annotation. The relevant snippet from `fineract-report/src/main/java/org/apache/fineract/infrastructure/report/provider/ReportingProcessServiceProvider.java`:
@@ -64,11 +66,11 @@ public class ReportingProcessServiceProvider {
 }
 ```
 
-If the registry returns `null`, the runner throws `PlatformServiceUnavailableException` with the `err.msg.report.service.implementation.missing` key, which is how Fineract degrades gracefully when, for example, the Pentaho jar is not on the classpath.
+If the registry returns `null`, the runner throws `PlatformServiceUnavailableException` with the `err.msg.report.service.implementation.missing` key — this is how Fineract degrades gracefully when no bean is registered for the requested `report_type` (the seeded `Pentaho` rows fall into exactly this bucket).
 
 ## Engine 1 — Stretchy SQL / Chart / SMS reports
 
-A "stretchy" report is a parameterised SQL statement stored in the `stretchy_report` table and addressed by its **name** (not its ID) at runtime. The reference implementation, `DatatableReportingProcessService`, is annotated with:
+A "stretchy" report is a parameterised SQL statement stored in the `stretchy_report` table and addressed by its **name** (not its ID) at runtime. The only `ReportingProcessService` bean shipped in-tree, `DatatableReportingProcessService`, is annotated with:
 
 ```java
 @Service
@@ -76,7 +78,7 @@ A "stretchy" report is a parameterised SQL statement stored in the `stretchy_rep
 public class DatatableReportingProcessService extends AbstractReportingProcessService { ... }
 ```
 
-So three of the four built-in `report_type` strings are handled by the same engine; what differentiates them is the SQL the report carries and the export pipeline chosen by the request (`exportCSV=true`, `exportPDF=true`, `exportJSON=true`, `exportS3=true`, or default JSON/HTML). The export pipeline lives under `fineract-provider/src/main/java/org/apache/fineract/infrastructure/dataqueries/service/export/` and includes:
+So all three handled `report_type` strings flow through the same engine; what differentiates them is the SQL the report carries and the export pipeline chosen by the request (`exportCSV=true`, `exportPDF=true`, `exportJSON=true`, `exportS3=true`, or the default JSON). The export pipeline lives under `fineract-provider/src/main/java/org/apache/fineract/infrastructure/dataqueries/service/export/` and includes:
 
 - `CsvDatatableReportExportServiceImpl`
 - `PdfDatatableReportExportService`
@@ -102,19 +104,25 @@ public Map<String, String> getReportParams(final MultivaluedMap<String, String> 
 
 The dedicated page [`reporting/reports-api-and-runner`](/reporting/reports-api-and-runner) covers the `Report` JPA entity, the CRUD resource (`ReportsApiResource`), and the runner resource (`RunreportsApiResource`).
 
-## Engine 2 — Pentaho reports
+## Engine 2 — Pentaho rows (legacy, currently unimplemented)
 
-Pentaho is a separate bundle that contributes its own `ReportingProcessService` implementation registered for `report_type = "Pentaho"`. The shared catalogue (`stretchy_report`) keeps the metadata, but the `report_sql` column is left null; instead a `.prpt` file is shipped on the classpath. The `ReadReportingService` interface defined in `fineract-provider/src/main/java/org/apache/fineract/infrastructure/dataqueries/service/ReadReportingService.java` exposes the Pentaho-specific entry points:
+The Liquibase seed file `fineract-db/old-schema-files/0004-mifosx-core-reports-utf8.sql` inserts six rows whose `report_type` is `Pentaho` and whose `report_sql` is `NULL` — **Balance Sheet** (id 48), **Income Statement** (id 49), **Trial Balance** (id 50), **Loan Account Schedule** (id 91), **Branch Expected Cash Flow** (id 92) and **Expected Payments By Date - Formatted** (id 94). They appear in `/v1/reports` and `/v1/reports/template` listings.
+
+There is, however, **no Pentaho `ReportingProcessService` bean** in the current source tree — `ReadReportingServiceImpl.generatePentahoReportAsOutputStream` returns `null` and its body is entirely commented out:
 
 ```java
-ByteArrayOutputStream generatePentahoReportAsOutputStream(
-        String reportName,
-        String outputTypeParam,
-        Map<String, String> queryParams,
-        ...);
+@Override
+public ByteArrayOutputStream generatePentahoReportAsOutputStream(final String reportName, final String outputTypeParam,
+        final Map<String, String> queryParams, final Locale locale, final AppUser runReportAsUser, final StringBuilder errorLog) {
+    // This complete implementation should be moved to Pentaho Report Service
+    /*
+     * ...original Classic Engine + JFreeReport implementation...
+     */
+    return null;
+}
 ```
 
-Built-in Pentaho reports include **Balance Sheet** (id 48), **Income Statement** (id 49), **Trial Balance** (id 50), **Loan Account Schedule** (id 91), **Branch Expected Cash Flow** (id 92) and **Expected Payments By Date – Formatted** (id 94). They are listed alongside the SQL ones in `stretchy_report` and surface through the same `/v1/reports` and `/v1/runreports` resources — the runner simply delegates to whichever engine the registry returns for the row's `report_type`.
+Calling `/v1/runreports/Balance Sheet` therefore reaches `ReportingProcessServiceProvider.findReportingProcessService("Pentaho")`, gets `null` back, and the runner responds with `503 PlatformServiceUnavailableException("err.msg.report.service.implementation.missing", ...)`. To make these rows functional, supply an out-of-tree bean annotated with `@ReportService(type = "Pentaho")` and (re-)implement `processRequest`.
 
 ## Engine 3 — MIX taxonomy and XBRL
 
@@ -145,9 +153,9 @@ The `mix_taxonomy` table is read-only — it holds the official MIX taxonomy con
 
 Report mailing jobs glue the runner to email. The job:
 
-1. Reads every active row of `m_report_mailing_job` whose `next_run_datetime` is in the past.
-2. Re-runs the linked stretchy report through `ReportingProcessServiceProvider` with the persisted parameter map.
-3. Attaches the resulting XLS/PDF/CSV to a Gmail/SMTP message and sends it.
+1. Reads every active row of `m_report_mailing_job` (`is_active = true AND is_deleted = false`).
+2. Skips rows whose `next_run_datetime` is still in the future; for the rest, re-runs the linked stretchy report through `ReportingProcessServiceProvider` with the persisted parameter map.
+3. Attaches the resulting XLS/PDF/CSV to an SMTP message (Gmail relay by default) and sends it.
 4. Recomputes `next_run_datetime` from the iCalendar `recurrence` string and writes a row to `m_report_mailing_job_run_history`.
 
 The work happens in a Spring Batch job called **`EXECUTE_REPORT_MAILING_JOBS`**, defined in `fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/jobs/executereportmailingjobs/ExecuteReportMailingJobsConfig.java`:
@@ -173,8 +181,7 @@ A short decision tree:
 
 ```mermaid
 flowchart TD
-    Q1{Output format?} -->|Tabular JSON / CSV / XLS / PDF / HTML| Q2
-    Q1 -->|Banded PDF / XLS, statutory layout| P[Pentaho stretchy report<br/>report_type='Pentaho']
+    Q1{Output format?} -->|Tabular JSON / CSV / PDF| Q2
     Q1 -->|XBRL XML to MIX Market| M[MIX taxonomy report<br/>/v1/mixreport]
     Q2{Delivery channel?} -->|Synchronous HTTP response| S[Stretchy SQL report<br/>report_type='Table']
     Q2 -->|Scheduled email attachment| E[Report mailing job<br/>linked to a stretchy report]
@@ -183,7 +190,7 @@ flowchart TD
     Q1 -->|JS chart data feed| CH[Stretchy SQL report<br/>report_type='Chart']
 ```
 
-In practice, **stretchy SQL** is the everyday workhorse, **Pentaho** is reserved for documents that the user prints, **MIX** is regulatory only, **report mailing jobs** are how you give finance/management a recurring inbox digest, and **ad-hoc query** is for derived snapshot tables.
+In practice, **stretchy SQL** is the everyday workhorse, **MIX** is regulatory only, **report mailing jobs** are how you give finance/management a recurring inbox digest, and **ad-hoc query** is for derived snapshot tables. The seeded `Pentaho` rows currently have no engine wired in (see the note at the top of this page).
 
 ## File map
 
@@ -260,7 +267,7 @@ The reporting subsystem owns a small but stable set of tables. Liquibase migrati
 
 | Table | Owner | Seeded by migrations? | Notes |
 | ----- | ----- | --------------------- | ----- |
-| `stretchy_report` | `dataqueries.domain.Report` | Yes — dozens of built-in SQL/Pentaho rows | `core_report = true` is immutable except for `description` / `useReport`. |
+| `stretchy_report` | `dataqueries.domain.Report` | Yes — dozens of built-in `Table` rows plus six `Pentaho` rows | `core_report = true` is immutable except for `description` / `useReport`. |
 | `stretchy_parameter` | `dataqueries.domain.ReportParameter` | Yes — `officeId`, `currencyId`, `loanProductId`, … | Each row carries a `parameter_sql` for its dropdown values. |
 | `stretchy_report_parameter` | `dataqueries.domain.ReportParameterUsage` | Yes | Many-to-many; defines the parameter screen for a report. |
 | `m_report_mailing_job` | `reportmailingjob.domain.ReportMailingJob` | No — purely tenant data | Soft-deleted via `is_deleted`. |

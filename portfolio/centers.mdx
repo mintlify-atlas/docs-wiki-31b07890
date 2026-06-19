@@ -165,6 +165,7 @@ sequenceDiagram
   participant LO as Loan officer
   participant API as CentersApiResource
   participant CS as CollectionSheetReadPlatformServiceImpl
+  participant H as SaveCenterCollectionSheetCommandHandler
   participant DB as DB
   LO->>API: POST /v1/centers/{id}?command=generateCollectionSheet { "transactionDate": "...", "calendarId": ... }
   API->>CS: generateCollectionSheet(centerId, JsonCommand)
@@ -173,9 +174,9 @@ sequenceDiagram
   CS->>DB: query m_savings_account dues
   CS-->>API: JLGCollectionSheetData
   API-->>LO: JSON preview
-  LO->>API: POST /v1/centers/{id}?command=saveCollectionSheet (with adjusted amounts)
-  API->>SaveCenter as SaveCenterCollectionSheetCommandHandler
-  SaveCenter-->>API: CommandProcessingResult (loan repayments + savings deposits booked)
+  LO->>API: POST /v1/centers/{id}?command=saveCollectionSheet (adjusted amounts)
+  API->>H: processCommand(JsonCommand)
+  H-->>API: CommandProcessingResult (loan repayments + savings deposits booked)
 ```
 
 See [Collection sheet](/portfolio/collection-sheet) for the SQL shape of `JLGCollectionSheetData` and the save flow.

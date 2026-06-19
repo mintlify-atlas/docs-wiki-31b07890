@@ -37,7 +37,7 @@ All six follow exactly the same skeleton:
 ```mermaid
 flowchart LR
   Event[Loan domain event] --> Avro[Build LoanXxxV1]
-  Avro --> Dispatch{For each DataEnricher&lt;T&gt;}
+  Avro --> Dispatch{"For each DataEnricher of T"}
   Dispatch --> EnA[LoanAccountDataV1OriginatorEnricher]
   Dispatch --> EnT[LoanTransactionDataV1OriginatorEnricher]
   Dispatch --> EnC[LoanChargeDataV1OriginatorEnricher]
@@ -364,7 +364,7 @@ Each element in the application's `originators[]` can carry either an `id` (exis
 | `id` | existing internal originator id |
 | `externalId` | existing or new external originator id |
 | `name` | optional new originator name |
-| `originatorTypeId` | `CodeValue` id for type |
+| `typeId` | `CodeValue` id for originator type (note: field is `typeId`, not `originatorTypeId`, on the inline DTO) |
 | `channelTypeId` | `CodeValue` id for channel |
 
 Why a separate validator? Because the inline shape is a *subset* of the standalone create shape, with different defaults and a different code-value resolution: missing types are accepted on a *create-on-loan-application* but the standalone create requires them resolvable from a fixed code list.
@@ -397,7 +397,7 @@ flowchart TB
     Kafka[Kafka / outbox]
   end
   subgraph ReadAPI
-    R[GET /v1/loan-originators... and GET /v1/loans/{id}/originators]
+    R["GET /v1/loan-originators... and GET /v1/loans/{id}/originators"]
     Mapper[LoanOriginatorMapper - MapStruct]
     DTO[LoanOriginatorData]
   end

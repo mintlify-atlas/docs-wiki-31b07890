@@ -151,14 +151,12 @@ public enum PartitionedJob {
 
 ## How to find a job's bean
 
-Given an enum-style name like `UPDATE_NPA`, the bean is registered by a `@Bean` method whose `name` attribute matches. For example:
+Given an enum-style name like `UPDATE_NPA`, the bean is registered as a Spring Batch `Job` whose **job name** (the first argument to `JobBuilder`) matches `JobName.UPDATE_NPA.name()`. For example:
 
 ```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/updatenpa/UpdateNpaConfig.java
-@Bean(name = JobName.UPDATE_NPA + JOB_NAME_SUFFIX)
-protected Job updateNpaJob() {
-    return new JobBuilder(JobName.UPDATE_NPA.name(), jobRepository)
-        .start(updateNpaStep())
-        .build();
+@Bean
+public Job updateNpaJob() {
+    return new JobBuilder(JobName.UPDATE_NPA.name(), jobRepository).start(updateNpaStep()).incrementer(new RunIdIncrementer()).build();
 }
 ```
 
@@ -235,15 +233,16 @@ A new constant in `JobName.java` is **not enough** to make a job runnable. The e
 
 1. **Add the enum constant** to `fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java`. Pick a stable display name — it is what operators will see and what the `job` table will store.
 
-2. **Register a Spring Batch `@Bean Job`** whose name matches the **enum-style** name (`JobName.MY_NEW_JOB.name()`). The bean must live in a `@Configuration` that is `@ConditionalOnProperty` or `@Conditional` so it can be disabled with a flag if it is not safe to ship to all deployments. Example shape:
+2. **Register a Spring Batch `@Bean Job`** whose **Spring Batch job name** (the first argument to `JobBuilder`) matches `JobName.MY_NEW_JOB.name()`. The bean can live in a `@Configuration` that is `@ConditionalOnProperty` or `@Conditional` if it needs to be disable-able with a flag. Example shape:
 
    ```java
    @Configuration
    public class MyNewJobConfig {
-       @Bean(name = JobName.MY_NEW_JOB.name() + JOB_NAME_SUFFIX)
+       @Bean
        public Job myNewJob(JobRepository jobRepository, ...) {
            return new JobBuilder(JobName.MY_NEW_JOB.name(), jobRepository)
                    .start(myStep())
+                   .incrementer(new RunIdIncrementer())
                    .build();
        }
    }

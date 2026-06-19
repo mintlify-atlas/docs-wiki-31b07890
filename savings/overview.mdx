@@ -169,7 +169,9 @@ erDiagram
   M_SHARE_PRODUCT ||--o{ M_SHARE_ACCOUNT : "product_id"
   M_SHARE_ACCOUNT ||--o{ M_SHARE_ACCOUNT_TRANSACTIONS : "share_account_id"
   M_SHARE_PRODUCT_DIVIDEND_PAY_OUT ||--o{ M_SHARE_ACCOUNT_DIVIDEND_DETAILS : "dividend_pay_out_id"
-  M_SHARE_ACCOUNT_DIVIDEND_DETAILS }o--|| M_SAVINGS_ACCOUNT : "savings_account_id"
+  M_SHARE_ACCOUNT_DIVIDEND_DETAILS }o--|| M_SHARE_ACCOUNT : "account_id"
+  M_SHARE_ACCOUNT_DIVIDEND_DETAILS }o--o| M_SAVINGS_ACCOUNT_TRANSACTION : "savings_transaction_id"
+  M_SHARE_ACCOUNT }o--|| M_SAVINGS_ACCOUNT : "savings_account_id"
 ```
 
 A few things to notice from this picture:

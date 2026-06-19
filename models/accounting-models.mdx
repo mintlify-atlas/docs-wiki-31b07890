@@ -158,8 +158,9 @@ erDiagram
 ### `TrialBalance` (reporting projection)
 
 - **File:** `fineract-accounting/src/main/java/org/apache/fineract/accounting/glaccount/domain/TrialBalance.java`
-- **Table:** `acc_gl_journal_entry` view (populated by a scheduled job)
+- **Table:** `m_trial_balance` (populated by a scheduled job that aggregates `acc_gl_journal_entry`)
 - **Primary key:** `Long id`
+- **Base class:** `AbstractPersistableCustom<Long>`
 - **Important fields:** `Office office`, `GLAccount account`, `BigDecimal amount`, `LocalDate entryDate`, `LocalDate createdDate`, `BigDecimal closingBalance`.
 - **Key relationships:** Read-only projection over journal entries used by the trial balance report.
 

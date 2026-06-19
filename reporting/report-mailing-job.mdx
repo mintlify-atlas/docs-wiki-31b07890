@@ -1,10 +1,14 @@
 ---
 title: "Report Mailing Job"
-description: "Schedule stretchy and Pentaho reports as recurring email attachments in Apache Fineract. Covers the ReportMailingJob entity, the EXECUTE_REPORT_MAILING_JOBS Spring Batch job, the SMTP helper, and the run-history API."
-keywords: ["Apache Fineract", "report mailing job", "EXECUTE_REPORT_MAILING_JOBS", "stretchy report", "Pentaho", "iCalendar recurrence", "Gmail SMTP", "report scheduling"]
+description: "Schedule stretchy reports as recurring email attachments in Apache Fineract. Covers the ReportMailingJob entity, the EXECUTE_REPORT_MAILING_JOBS Spring Batch job, the SMTP helper, and the run-history API."
+keywords: ["Apache Fineract", "report mailing job", "EXECUTE_REPORT_MAILING_JOBS", "stretchy report", "iCalendar recurrence", "Gmail SMTP", "report scheduling"]
 ---
 
-A **report mailing job** is Apache Fineract's way to automate report delivery: pick a stretchy or Pentaho report, freeze its parameters, pick a file format (XLS/PDF/CSV), an iCalendar recurrence string (`FREQ=DAILY;INTERVAL=1` …), a list of email recipients, and the platform's Spring Batch scheduler will run it on time, attach the output, and post a row to history. This page documents the entity, the scheduling math, the SMTP plumbing, and the two REST resources that surface it all.
+A **report mailing job** is Apache Fineract's way to automate report delivery: pick a stretchy report, freeze its parameters, pick a file format (XLS/PDF/CSV), an iCalendar recurrence string (`FREQ=DAILY;INTERVAL=1` …), a list of email recipients, and the platform's Spring Batch scheduler will run it on time, attach the output, and post a row to history. This page documents the entity, the scheduling math, the SMTP plumbing, and the two REST resources that surface it all.
+
+<Note>
+The tasklet dispatches each linked report through `ReportingProcessServiceProvider`. In the current source tree that registry only has a `DatatableReportingProcessService` bean (handling `report_type` values `Table`, `Chart`, `SMS`), so only stretchy SQL reports can actually be mailed. Linking a row whose `report_type` is `Pentaho` causes every run to fail with `err.msg.report.service.implementation.missing` (the engine is not registered) and the failure is recorded on the job and in run history.
+</Note>
 
 ## The `ReportMailingJob` entity
 
@@ -36,7 +40,7 @@ public class ReportMailingJob extends AbstractAuditableCustom {
 
     @Column(name = "previous_run_datetime")                  private LocalDateTime previousRunDateTime;
     @Column(name = "next_run_datetime")                      private LocalDateTime nextRunDateTime;
-    @Column(name = "previous_run_status")                    private String previousRunStatus;        // SUCCESS | ERROR
+    @Column(name = "previous_run_status")                    private String previousRunStatus;        // "Success" | "Error"
     @Column(name = "previous_run_error_log")                 private String previousRunErrorLog;
     @Column(name = "previous_run_error_message")             private String previousRunErrorMessage;
     @Column(name = "number_of_runs", nullable = false)       private Integer numberOfRuns;
@@ -58,7 +62,7 @@ The two enums backing the file format and the symbolic date values live alongsid
 ```java
 // data/ReportMailingJobEmailAttachmentFileFormat.java
 public enum ReportMailingJobEmailAttachmentFileFormat {
-    INVALID(0, "ReportMailingJobEmailAttachmentFileFormat.INVALID", "INVALID"),
+    INVALID(0, "ReportMailingJobEmailAttachmentFileFormat.INVALID", "Invalid"),
     XLS    (1, "ReportMailingJobEmailAttachmentFileFormat.XLS",     "XLS"),
     PDF    (2, "ReportMailingJobEmailAttachmentFileFormat.PDF",     "PDF"),
     CSV    (3, "ReportMailingJobEmailAttachmentFileFormat.CSV",     "CSV");
@@ -73,7 +77,7 @@ public enum ReportMailingJobStretchyReportParamDateOption {
 }
 ```
 
-`ReportMailingJobPreviousRunStatus` (`SUCCESS` / `ERROR`) carries the run-history flag.
+`ReportMailingJobPreviousRunStatus` (`SUCCESS(1, …, "Success")` / `ERROR(0, …, "Error")`) carries the run-history flag — the stored string value is `Success` / `Error`.
 
 ### Run history
 
@@ -300,14 +304,16 @@ sequenceDiagram
 
 ### Failure handling
 
-If anything inside `generateReportOutputStream` throws — engine missing, SQL injection rejected, S3 unreachable, SMTP timeout — the exception is captured in a `StringBuilder errorLog` and persisted on the job (`previous_run_status = "ERROR"`, `previous_run_error_log = ...`) and as a history row. The batch step always returns `RepeatStatus.FINISHED`, so a bad job does not poison the rest of the tasklet's pass.
+If anything inside `generateReportOutputStream` throws — engine missing, SQL injection rejected, S3 unreachable, SMTP timeout — the exception is captured in a `StringBuilder errorLog`. The error log text is persisted on the job (`previous_run_error_log`), the `previous_run_status` column is set to `Error` (the string value of `ReportMailingJobPreviousRunStatus.ERROR`), and a row is appended to `m_report_mailing_job_run_history`. The batch step always returns `RepeatStatus.FINISHED`, so a bad job does not poison the rest of the tasklet's pass.
 
 ## Permissions and `runAsUser`
 
-A report mailing job persists a `run_as_userid` foreign key. When the batch tasklet calls the reporting engine, the security context is set to that user — which means the per-report permission check in `RunreportsApiResource.checkUserPermissionForReport` is evaluated against `runAsUser.hasNotPermissionForReport(reportName)`. Two consequences:
+A report mailing job persists a `run_as_userid` foreign key (`@ManyToOne @JoinColumn(name = "run_as_userid", nullable = false) private AppUser runAsUser`) that records which user the job is conceptually executed on behalf of. Two things to know about how it is actually used at execution time:
 
-- The `runAsUser` must hold `READ_<reportName>` (and the implicit `READ_REPORT`); otherwise every run is recorded as `ERROR: NoAuthorizationException`.
-- The user's office scope is also honoured — `${currentUserHierarchy}` substitution inside the SQL respects the run-as user, so a job scheduled by an HQ admin to send a branch manager their own report can be configured to run as that branch manager.
+- `ExecuteReportMailingJobsTasklet.generateReportOutputStream` calls `reportingProcessService.processRequest(reportName, reportParams)` **directly** — it bypasses `RunreportsApiResource.checkUserPermissionForReport`. There is no per-report permission check performed by the tasklet itself, and the security context is not switched to `runAsUser`.
+- Substitution of `${currentUserHierarchy}` inside the report SQL is therefore evaluated against whatever Spring Security context the tenant scheduler runs the batch step under (typically the technical user used by the scheduler), not against `run_as_userid`. If you need office-scoped output, either pre-filter via an explicit `R_officeId`/parameter or rework the SQL to take the hierarchy as an explicit parameter rather than relying on the implicit `currentUserHierarchy` token.
+
+The `run_as_userid` column is still useful as audit metadata (who is the human responsible for this job) and as an extension point for downstream implementations that wish to wrap the tasklet in `ThreadLocalContextUtil` to enforce that identity.
 
 ## End-to-end examples
 
@@ -362,7 +368,7 @@ GET /fineract-provider/api/v1/reportmailingjobrunhistory?mailingJobId=42&limit=5
       "reportMailingJobId": 42,
       "startDateTime": "2024-04-01T06:30:00",
       "endDateTime":   "2024-04-01T06:30:21",
-      "status": "SUCCESS",
+      "status": "Success",
       "errorMessage": null,
       "errorLog": null
     },

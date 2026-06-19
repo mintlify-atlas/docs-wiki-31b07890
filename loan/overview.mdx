@@ -4,7 +4,7 @@ sidebarTitle: "Overview"
 description: "Map of the fineract-loan Gradle module — the original cumulative-interest loan engine that models LoanProduct, Loan, repayment schedule installments, transactions and charges, and how it relates to the newer fineract-progressive-loan module."
 ---
 
-The [`fineract-loan`](https://github.com/apache/fineract/tree/develop/fineract-loan) Gradle module is Apache Fineract's **original, cumulative-interest loan engine**. It owns every JPA entity that represents a loan in the database — `LoanProduct`, `Loan`, `LoanRepaymentScheduleInstallment`, `LoanTransaction`, `LoanCharge` — together with the cumulative schedule generators (flat and declining-balance), the seven legacy transaction-processing strategies, the rescheduling pipeline, the guarantor sub-module and a large family of read-side data objects. A newer sibling module, [`fineract-progressive-loan`](https://github.com/apache/fineract/tree/develop/fineract-progressive-loan), shares the same persistent entities but layers a *progressive* (period-by-period) interest engine on top with its own schedule generator, payment-allocation rules and emit/capitalized-income/buy-down-fee APIs.
+The [`fineract-loan`](https://github.com/apache/fineract/tree/develop/fineract-loan) Gradle module is Apache Fineract's **original, cumulative-interest loan engine**. It owns every JPA entity that represents a loan in the database — `LoanProduct`, `Loan`, `LoanRepaymentScheduleInstallment`, `LoanTransaction`, `LoanCharge` — together with the cumulative schedule generators (flat and declining-balance), the nine cumulative transaction-processing strategies, the rescheduling pipeline, the guarantor sub-module and a large family of read-side data objects. A newer sibling module, [`fineract-progressive-loan`](https://github.com/apache/fineract/tree/develop/fineract-progressive-loan), shares the same persistent entities but layers a *progressive* (period-by-period) interest engine on top with its own schedule generator, payment-allocation rules and emit/capitalized-income/buy-down-fee APIs.
 
 Both modules read and write the same `m_loan*` tables. The split is *behavioural*: which `LoanScheduleGenerator` runs, which `LoanRepaymentScheduleTransactionProcessor` posts the money, and which calculation engine handles re-amortization, interest pauses and capitalized income. The `LoanScheduleType` column on `m_loan` (values `CUMULATIVE` and `PROGRESSIVE`, see `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanScheduleType.java`) decides which engine handles a given account at runtime.
 
@@ -43,7 +43,7 @@ The cumulative engine is the historic Mifos-derived approach: it pre-computes th
 
 <CardGroup cols={2}>
   <Card title="fineract-loan" icon="circle-1">
-    Cumulative engine. `CumulativeFlatInterestLoanScheduleGenerator`, `CumulativeDecliningBalanceInterestLoanScheduleGenerator`. Seven legacy `LoanRepaymentScheduleTransactionProcessor` implementations under `domain/transactionprocessor/impl/`.
+    Cumulative engine. `CumulativeFlatInterestLoanScheduleGenerator`, `CumulativeDecliningBalanceInterestLoanScheduleGenerator`. Nine `LoanRepaymentScheduleTransactionProcessor` implementations under `domain/transactionprocessor/impl/`.
   </Card>
   <Card title="fineract-progressive-loan" icon="circle-2">
     Progressive engine. `LoanScheduleProcessingType.HORIZONTAL`/`VERTICAL`. Payment-allocation and credit-allocation rule lists; capitalized income, buy-down fee and re-amortization endpoints.
@@ -64,11 +64,11 @@ The module is organised under `fineract-loan/src/main/java/org/apache/fineract/p
 | `command/` | Command DTOs that the JSON deserializers materialise before handing off to write platform services. |
 | `data/` | Read-side data projections: `LoanAccountData`, `LoanChargeData`, `LoanTransactionData`, `HolidayDetailDTO`, `OutstandingAmountsDTO`. |
 | `domain/` | The full JPA model: `Loan`, `LoanTransaction`, `LoanCharge`, `LoanRepaymentScheduleInstallment`, `LoanSummary`, plus 70+ supporting entities and enums. |
-| `domain/transactionprocessor/` | `LoanRepaymentScheduleTransactionProcessor` interface and seven `impl/` strategies (Fineract-style, RBI, Creocore, Heavens Family, Early Payment, two due-then-in-advance orderings). |
-| `domain/arrears/` | Arrears aging snapshot entity. |
+| `domain/transactionprocessor/` | `LoanRepaymentScheduleTransactionProcessor` interface and nine `impl/` strategies (Fineract-style, RBI, Creocore, Heavens Family, Early Payment, two due-then-in-advance orderings, plus `InterestPrincipalPenaltyFeesOrder` and `PrincipalInterestPenaltyFeesOrder`). |
+| `domain/arrears/` | `LoanArrearsData` value object. The `m_loan_arrears_aging` snapshot table is rebuilt by `LoanArrearsAgeingUpdateHandler` (the scheduled job) via direct JDBC rather than a JPA entity. |
 | `domain/reaging/` & `domain/reamortization/` | `LoanReAgeParameter`, `LoanReAmortizationParameter` — transaction sub-types that carry the parameters of those operations. |
 | `exception/` | `LoanNotFoundException`, `LoanChargeNotFoundException`, etc. |
-| `guarantor/` | Guarantor sub-aggregate: `Guarantor`, `GuarantorFundingDetails`, on-hold/release lifecycle. |
+| `guarantor/` | Guarantor sub-aggregate command/handler/service layer (`GuarantorWritePlatformService`, command handlers, JSON deserializer); the `Guarantor` and `GuarantorFundingDetails` JPA entities themselves live in `fineract-provider`. |
 | `handler/` | `CommandSourceHandler` Spring beans for every `LOAN_*` command code. |
 | `jobs/` | Scheduled job step implementations (`addAccrualEntries`, `applyChargeForOverdueLoans`, `applyHolidaysToLoans`, `recalculateInterestForLoan`). |
 | `loanschedule/` | The cumulative schedule generator family (see [Loan Schedule Generation](/loan/loan-schedule-generation)). |
@@ -118,8 +118,8 @@ Five entities account for most of the module's lines of code. Every page in this
 | `Loan` | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/Loan.java` | ~1855 |
 | `LoanRepaymentScheduleInstallment` | `fineract-loan/.../domain/LoanRepaymentScheduleInstallment.java` | ~1303 |
 | `LoanTransaction` | `fineract-loan/.../domain/LoanTransaction.java` | ~1045 |
+| `LoanProduct` | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanproduct/domain/LoanProduct.java` | ~770 |
 | `LoanCharge` | `fineract-loan/.../domain/LoanCharge.java` | ~750 |
-| `LoanProduct` | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanproduct/domain/LoanProduct.java` | ~1700 |
 
 The schedule generators add another ~3000 lines under `loanaccount/loanschedule/domain/`, and the transaction-processor implementations another ~2000 under `loanaccount/domain/transactionprocessor/impl/`.
 

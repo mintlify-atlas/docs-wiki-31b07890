@@ -67,8 +67,11 @@ parent's own primary key. The same mechanism drives `m_image` for
 profile pictures.
 
 The repository (`DocumentRepository`) lives next door and exposes the
-standard Spring Data CRUD plus the `findByParentEntityTypeAndParentEntityId`
-look-up that the read service uses to list documents per parent.
+standard Spring Data CRUD plus two derived queries used by the read
+service: `findAllByParentEntityTypeAndParentEntityId(String, Long)`
+backs the `GET .../documents` listing, and
+`findByIdAndParentEntityTypeAndParentEntityId(Long, String, Long)`
+backs the single-document lookup.
 
 ## REST surface — `DocumentApiResource`
 
@@ -108,12 +111,20 @@ parameters and in the multipart form (`entityType`, `entityId`,
 
 ### Supported parent entity types
 
-The same controller accepts any of the following as `{entityType}`:
-
+The `{entityType}` path segment is a free-form string. Fineract's
+historical convention uses the plural collection names —
 `clients`, `loans`, `client_identifiers`, `staff`, `savings`,
-`groups`, `offices`, `image`, `imports`. The server-side validator in
-`FileUploadValidator` rejects unknown values with a
-`PlatformApiDataValidationException`.
+`groups`, `offices`, `imports`, etc. — and `DocumentWritePlatformServiceImpl`
+joins it into the storage key as `documents/{entityType}/{entityId}/{fileName}`.
+
+There is **no allow-list validation** in `FileUploadValidator`; it only
+asserts that `Content-Length`, the multipart input stream, the
+`FormDataContentDisposition` and the `FormDataBodyPart` are present and
+non-blank. The polymorphism is by convention, which is what lets the
+same resource serve every Fineract aggregate without compile-time
+coupling. The trade-off is that there is no foreign-key enforcement
+between `m_document.parent_entity_type` and the underlying tables, and
+no API-side check that the parent row actually exists.
 
 ### Multipart create
 
@@ -153,10 +164,14 @@ flowchart LR
 
 ## The `Image` aggregate
 
-`Image` is the avatar-style cousin of `Document`. Same polymorphic
-parent fields, but only one row per parent (a `PUT` replaces it), and
-the URL of the binary is the *only* metadata stored — there is no
-description or display name.
+`Image` is the avatar-style cousin of `Document`. It is stored in
+`m_image`, but unlike `Document` the entity only carries
+`id`, `location` and `storage_type_enum` — there is **no
+`parent_entity_type` / `parent_entity_id` on the row itself**. The
+link back to the parent (client, staff, …) is held by a column on the
+parent table (for example `m_client.image_id`) which is updated by an
+`EntityImageIdAdapter` for each supported aggregate. At most one image
+is associated per parent: a `POST` replaces whatever was there.
 
 `ImagesApiResource`
 (`fineract-document/src/main/java/org/apache/fineract/infrastructure/documentmanagement/api/ImagesApiResource.java`)
@@ -198,18 +213,33 @@ stateDiagram-v2
   Removed --> [*]
 ```
 
-- **Create.** `DocumentCreateCommandHandler` sanitises the path,
-  invokes `ContentDetectorManager` to identify the MIME type, calls
-  `ContentStoreService.upload(...)`, then persists the row with
-  `storage_type_enum` set to whichever store handled the write.
-- **Update.** When the PUT carries a file, the handler uploads the
-  replacement object first, then updates `location` on the row, then
-  asynchronously deletes the previous object.
-- **Download.** `GET /attachment` calls `ContentStoreService.download(location)`
-  and streams the result with `Content-Disposition: attachment`.
-- **Delete.** Removes the database row and the underlying blob — with
-  the configured `DefaultDeleteContentPolicy` providing the safety
-  checks (no traversal outside the bucket / directory, etc.).
+- **Create.** `DocumentCreateCommandHandler` (with
+  `@Retry(name = "commandDocumentCreate")`) routes to
+  `DocumentWritePlatformServiceImpl.createDocument`. That service
+  builds the path
+  `documents/{entityType}/{entityId}/{fileName}`, calls
+  `ContentStoreService.upload(...)` (which runs the pre-upload policy,
+  sanitises the path, writes the bytes and runs the post-upload
+  policy), persists the `Document` row with `storage_type_enum =
+  store.getType().getValue()`, and emits a
+  `DocumentCreatedBusinessEvent` via `BusinessEventNotifierService`.
+- **Update.** `DocumentUpdateCommandHandler` is wrapped in
+  `@Retry(name = "commandDocumentUpdate")`. When the PUT carries a new
+  `fileName`, the handler computes the new key, **deletes the previous
+  object first** (`storeService.delete(doc.getLocation())`), uploads
+  the replacement, then updates the row. When the PUT carries only a
+  stream (no filename change), it overwrites the existing key in
+  place. No `DocumentUpdatedBusinessEvent` is emitted today —
+  there is an explicit `TODO` in the source.
+- **Download.** `GET /attachment` calls
+  `DocumentReadPlatformService.retrieveDocumentContent(...)` which in
+  turn calls `ContentStoreService.download(location)` and streams the
+  result with `Content-Disposition: attachment`.
+- **Delete.** `DocumentDeleteCommandHandler` (with
+  `@Retry(name = "commandDocumentDelete")`) calls
+  `storeService.delete(doc.getLocation())` (running
+  `DefaultDeleteContentPolicy` → `TraversalContentPolicy`), removes
+  the row and emits `DocumentDeletedBusinessEvent`.
 
 ## Storage location
 
@@ -219,7 +249,9 @@ location is decided by the configured `ContentStoreService` bean:
 
 - `FileContentStoreService`
   (`fineract-document/.../contentstore/service/FileContentStoreService.java`)
-  writes under `${fineract.content.filesystem.root}/<tenant>/<sanitized-path>`.
+  writes under `${fineract.content.filesystem.rootFolder}/<tenantName>/<sanitized-path>`
+  (the property defaults to `${user.home}/.fineract`; spaces in the
+  tenant name are stripped).
 - `S3ContentStoreService`
   (`fineract-document/.../contentstore/service/S3ContentStoreService.java`)
   writes the same key into the configured S3 bucket.
@@ -232,18 +264,21 @@ in the policy and detector components.
 
 `FileUploadValidator`
 (`fineract-document/.../documentmanagement/api/FileUploadValidator.java`)
-runs before the command is dispatched. It checks:
+runs before the command is dispatched. It is intentionally tiny — its
+single `validate(Long contentLength, InputStream, FormDataContentDisposition, FormDataBodyPart)`
+method asserts via `DataValidatorBuilder` that:
 
-- The `entityType` is one of the supported values.
-- The reported `Content-Length` matches the multipart payload length
-  (anti-spoofing — `Long fileSize` is read from the `Content-Length`
-  HTTP header in the resource).
-- The `name` and `file` parts are present.
+- `Content-Length` is present and `> 0` (read from the
+  `Content-Length` HTTP header by the resource).
+- The multipart `InputStream`, `FormDataContentDisposition` and
+  `FormDataBodyPart` references are all non-null.
 
-Once validation passes, the actual MIME-type sniff happens later in the
-content-store pipeline through `ContentDetectorManager` (Tika), which
-ensures the *content* matches the *declared* type and that the type is
-on the whitelist.
+The validator does **not** check the entity type, the file name, the
+description or the MIME type. The MIME sniff happens later in the
+content-store pipeline through `TikaContentDetector`
+(via `DefaultContentDetectorManager`), and `WhitelistContentPolicy`
+ensures the detected MIME and the file name are on the configured
+`fineract.content.regex-whitelist` and `fineract.content.mime-whitelist`.
 
 ## Image endpoints in practice
 
@@ -256,12 +291,19 @@ curl -X POST \
   https://fineract.example.com/fineract-provider/api/v1/clients/12/images
 ```
 
-```bash Fetch resized as data URL
+```bash Fetch resized as inline octet-stream
 curl -G \
   --data-urlencode "maxWidth=128" \
   --data-urlencode "maxHeight=128" \
   --data-urlencode "output=inline_octet" \
-  --data-urlencode "encoding=base64" \
+  -H "Accept: application/octet-stream" \
+  https://fineract.example.com/fineract-provider/api/v1/clients/12/images
+```
+
+```bash Fetch resized as base64 data URL (default text/plain response)
+curl -G \
+  --data-urlencode "maxWidth=128" \
+  --data-urlencode "maxHeight=128" \
   -H "Accept: text/plain" \
   https://fineract.example.com/fineract-provider/api/v1/clients/12/images
 ```
@@ -294,9 +336,12 @@ the same.
 
 <Accordion title="Bulk delete documents for a closed client">
 Cascade is intentionally **not** at the DB level — the polymorphic FK
-isn't enforceable. The client close handler explicitly queries
-`m_document` by `(parent_entity_type='clients', parent_entity_id=?)`
-and dispatches a `DocumentDeleteCommand` for each row.
+isn't enforceable, and there is no automatic cleanup when a parent row
+is removed. To purge attachments for a closed entity, list them via
+`GET /v1/{entityType}/{entityId}/documents` and issue a
+`DELETE /v1/{entityType}/{entityId}/documents/{documentId}` per row;
+the handler invokes `ContentStoreService.delete(...)` and removes the
+`m_document` row inside one transaction.
 </Accordion>
 
 <Accordion title="Hot-swap a profile picture without breaking the URL">

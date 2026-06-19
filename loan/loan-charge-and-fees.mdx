@@ -4,7 +4,7 @@ sidebarTitle: "Charges & Fees"
 description: "Inside Apache Fineract LoanCharge — flat vs percentage calculation, waive/pay/refund operations and the resources for charges, interest pauses and buy-down fees."
 ---
 
-`LoanCharge` is the join entity that attaches a [`Charge`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/portfolio/charge/domain/Charge.java) — a row from the global charge catalogue — to one specific [`Loan`](/loan/loan-aggregate). The same fee row in `m_charge` can be reused across many products and many loans; `m_loan_charge` is where it gets a *loan-specific* amount, due date, paid / waived / written-off balance and per-installment distribution.
+`LoanCharge` is the join entity that attaches a [`Charge`](https://github.com/apache/fineract/blob/develop/fineract-charge/src/main/java/org/apache/fineract/portfolio/charge/domain/Charge.java) — a row from the global charge catalogue — to one specific [`Loan`](/loan/loan-aggregate). The same fee row in `m_charge` can be reused across many products and many loans; `m_loan_charge` is where it gets a *loan-specific* amount, due date, paid / waived / written-off balance and per-installment distribution.
 
 This page is the field-and-API tour for the four resources Apache Fineract ships around loan-level money events that are *not* repayments: regular `LoanCharge` records via `LoanChargesApiResource`, interest pauses via `LoanInterestPauseApiResource`, and the two newer progressive-loan-only resources `LoanBuyDownFeeApiResource` and `LoanCapitalizedIncomeApiResource`.
 
@@ -36,8 +36,8 @@ public class LoanCharge extends AbstractAuditableWithUTCDateTimeCustom<Long> {
 
 | Field                      | Column                              | Meaning                                                         |
 | -------------------------- | ----------------------------------- | --------------------------------------------------------------- |
-| `chargeCalculation`        | `charge_calculation_enum`           | [`ChargeCalculationType`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/portfolio/charge/domain/ChargeCalculationType.java) — flat vs percentage-of-X |
-| `chargePaymentMode`        | `charge_payment_mode_enum`          | [`ChargePaymentMode`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/portfolio/charge/domain/ChargePaymentMode.java) — regular vs account-transfer |
+| `chargeCalculation`        | `charge_calculation_enum`           | [`ChargeCalculationType`](https://github.com/apache/fineract/blob/develop/fineract-charge/src/main/java/org/apache/fineract/portfolio/charge/domain/ChargeCalculationType.java) — flat vs percentage-of-X |
+| `chargePaymentMode`        | `charge_payment_mode_enum`          | [`ChargePaymentMode`](https://github.com/apache/fineract/blob/develop/fineract-charge/src/main/java/org/apache/fineract/portfolio/charge/domain/ChargePaymentMode.java) — regular vs account-transfer |
 | `amountOrPercentage`       | `charge_amount_or_percentage`       | Configured input value                                          |
 | `percentage`               | `calculation_percentage`            | Percentage (when calculation is %)                              |
 | `amountPercentageAppliedTo`| `calculation_on_amount`             | Base amount the percentage was applied against                  |

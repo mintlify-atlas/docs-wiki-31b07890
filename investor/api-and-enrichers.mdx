@@ -43,7 +43,7 @@ If the flag is `false`, the JAX-RS scanner never picks up `/v1/external-asset-ow
 
 ## ExternalAssetOwnersApiResource
 
-This is the workhorse resource. It exposes the *entire transfer lifecycle*, the *owner directory*, and a *search* endpoint. There are nine routes, grouped into five concerns.
+This is the workhorse resource. It exposes the *entire transfer lifecycle*, the *owner directory*, and a *search* endpoint. There are eleven routes, grouped into five concerns.
 
 ### Endpoint table
 
@@ -182,7 +182,7 @@ public class ExternalAssetOwnersSearchApiDelegate implements ExternalAssetOwners
 }
 ```
 
-`ExternalAssetOwnerSearchRequest` (under `service/search/domain/`) supports free-text matching plus date-range filters on `settlementDate` and `effectiveFrom` / `effectiveTo`. The actual SQL lives in `SearchingExternalAssetOwnerRepositoryImpl`.
+`ExternalAssetOwnerSearchRequest` (under `service/search/domain/`) carries a free-text `text` field plus two date-range pairs — `submittedFromDate`/`submittedToDate` (the request creation window) and `effectiveFromDate`/`effectiveToDate` (the validity window). The actual SQL lives in `SearchingExternalAssetOwnerRepositoryImpl`.
 
 ## ExternalAssetOwnerLoanProductAttributesApiResource
 

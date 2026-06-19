@@ -277,7 +277,19 @@ public class AcmeLoanAutoConfiguration {
 }
 ```
 
-This replaces the upstream `LoanRepaymentScheduleTransactionProcessorFactory` bean with one that uses `AcmeLoanRepaymentScheduleTransactionProcessor` as the default. See the override-patterns section below for the rules governing this.
+This replaces the upstream `LoanRepaymentScheduleTransactionProcessorFactory` bean with one that uses `AcmeLoanRepaymentScheduleTransactionProcessor` as the default. The override works because upstream's definition in `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/starter/LoanAccountAutoStarter.java` is itself guarded with `@ConditionalOnMissingBean(LoanRepaymentScheduleTransactionProcessorFactory.class)`:
+
+```java
+@Bean
+@ConditionalOnMissingBean(LoanRepaymentScheduleTransactionProcessorFactory.class)
+public LoanRepaymentScheduleTransactionProcessorFactory loanRepaymentScheduleTransactionProcessorFactory(
+        PrincipalInterestPenaltyFeesOrderLoanRepaymentScheduleTransactionProcessor defaultLoanRepaymentScheduleTransactionProcessor,
+        List<LoanRepaymentScheduleTransactionProcessor> processors) {
+    return new LoanRepaymentScheduleTransactionProcessorFactory(defaultLoanRepaymentScheduleTransactionProcessor, processors);
+}
+```
+
+When `acme.loan.enabled=true`, the ACME bean wins automatically — no `@Primary`, no explicit ordering, no `spring.main.allow-bean-definition-overriding` flag. See the override-patterns section below for the general rules.
 
 ## Bean naming conflicts and override patterns
 
@@ -289,7 +301,7 @@ Spring Boot 3.x disables bean definition overriding by default. If two `@Configu
 
 ### Pattern A: replace upstream with `@Primary` plus a distinct bean name
 
-The most surgical approach is to keep the upstream bean alive but mark your own implementation as `@Primary`:
+The most surgical approach when upstream does not opt out is to keep the upstream bean alive but mark your own implementation as `@Primary`. The reference ACME note service does **not** use this pattern (because upstream already supplies a `@ConditionalOnMissingBean` guard — see Pattern C), but the shape is:
 
 ```java
 @Component
@@ -302,15 +314,16 @@ public class AcmeNoteReadPlatformService implements NoteReadPlatformService {
 
 Because the new bean carries a different bean name (`acmeNoteReadPlatformService`), there is no collision. Spring's autowiring resolves the `NoteReadPlatformService` type to the `@Primary` candidate. This is what you want when you need the upstream implementation to remain on the context (for, say, a comparison job) but want every other caller to bind to yours.
 
-### Pattern B: replace upstream via the same factory method
+### Pattern B: replace upstream via `@ConditionalOnMissingBean`
 
-This is what `AcmeLoanAutoConfiguration` does: it declares a `@Bean` method whose name matches the upstream method name (`loanRepaymentScheduleTransactionProcessorFactory`). Because Spring's component scanning processes `@AutoConfiguration` classes via Spring Boot's auto-configuration ordering, you can use `@AutoConfiguration(before = ...)` or `@AutoConfiguration(after = ...)` to deterministically position yourself, then use `@ConditionalOnMissingBean` on upstream's definition or override its `@Bean` directly through configuration ordering.
+This is what `AcmeLoanAutoConfiguration` does: it declares a `@Bean` method of the same return type as upstream's `loanRepaymentScheduleTransactionProcessorFactory`. The upstream definition in `LoanAccountAutoStarter` carries `@ConditionalOnMissingBean(LoanRepaymentScheduleTransactionProcessorFactory.class)`, so as soon as the ACME bean is registered, upstream's bean is skipped.
 
 To make this work safely:
 
-- Use a meaningful `@AutoConfiguration` ordering hook so Spring Boot evaluates your config before upstream's.
-- Keep the `@Bean` method signature byte-compatible with the one you are replacing.
-- Guard with `@ConditionalOnProperty` so the override only activates when explicitly enabled.
+- Match the return type (not just the method name) — `@ConditionalOnMissingBean` keys on type by default.
+- Keep the `@Bean` method's parameter signature compatible with what upstream callers expect.
+- Guard with `@ConditionalOnProperty` (as the ACME starter does with `acme.loan.enabled`) so the override stays opt-in.
+- If upstream's bean is **not** wrapped in `@ConditionalOnMissingBean`, use Pattern A (`@Primary`) instead — or contribute an upstream patch that adds the guard.
 
 ### Pattern C: shadow a specific `@Service`
 
@@ -333,10 +346,20 @@ Two key choices:
 - The bean name is different from upstream's (Spring derives `acmeNoteReadPlatformService` from the class name). No name collision.
 - The `@ConditionalOnProperty` is mirrored on both the auto-configuration class and the individual `@Service`. If a downstream consumer disables only the property, both layers stay dormant — defense in depth.
 
-To make this approach a true override of an upstream `@Service`, upstream must use `@ConditionalOnMissingBean(NoteReadPlatformService.class)` on its own definition. When upstream does not yet support that pattern, you can:
+For a `@Service` shadow to be a true override, upstream must use `@ConditionalOnMissingBean` on its own definition. The note service is wired this way in `fineract-provider/src/main/java/org/apache/fineract/portfolio/note/service/NoteReadPlatformServiceImpl.java`:
+
+```java
+@Service
+@ConditionalOnMissingBean(value = NoteReadPlatformService.class, ignored = NoteReadPlatformServiceImpl.class)
+public class NoteReadPlatformServiceImpl implements NoteReadPlatformService {
+    // ...
+}
+```
+
+The `ignored = NoteReadPlatformServiceImpl.class` clause means upstream's own bean does not block itself; any other `NoteReadPlatformService` bean (like `AcmeNoteReadPlatformService`) is enough to keep upstream's bean off the context. When the upstream component you want to replace does **not** yet carry that guard, you can:
 
 - Use `@Primary` on your bean and let both live (Pattern A).
-- File an upstream contribution that adds `@ConditionalOnMissingBean` to the relevant `@Configuration`.
+- File an upstream contribution that adds `@ConditionalOnMissingBean` to the relevant `@Service` or `@Bean`.
 
 ### Pattern D: extend the upstream type
 

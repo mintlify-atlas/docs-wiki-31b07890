@@ -247,7 +247,7 @@ flowchart LR
 Validation is also baked into the cells themselves — `DataValidationConstraint`s reject free-text, dates outside the workbook's `dateFormat`, and numeric values outside product-specific bounds. This means an operator catches most errors while typing, before they upload. The remaining row-level rejections happen on the way back through the import handlers, with messages written into the `FAILURE_REPORT_COL` column of the output workbook.
 
 <Tip>
-The populator service stamps `application/vnd.ms-excel` (`.xls`) headers because it uses `HSSFWorkbook`. The import side, however, accepts XLS, XLSX, and ODS via `ImportFormatType.of(...)` — so an operator can re-save the template in newer Excel formats without breaking the round trip.
+The populator service stamps `application/vnd.ms-excel` (`.xls`) headers because it uses `HSSFWorkbook`. The upload side currently restricts itself to the same format — `BulkImportWorkbookServiceImpl.importWorkbook(...)` runs Apache Tika on the byte stream and rejects anything whose detected type does not contain `msoffice` or `application/vnd.ms-excel`. The `ImportFormatType` enum lists XLSX and ODS as future targets but is not yet referenced from the upload pipeline, so re-save the template back to `.xls` before uploading.
 </Tip>
 
 ## Per-entity flow at a glance

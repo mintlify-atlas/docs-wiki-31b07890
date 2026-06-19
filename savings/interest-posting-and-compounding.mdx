@@ -22,7 +22,7 @@ SavingsInterestCalculationDaysInYearType  360 / 365
 - **Compounding period** is how often interest *accrued so far* is rolled into the principal that the next slice of interest accrues on. Short compounding (e.g. daily) approximates continuous compounding.
 - **Posting period** is how often the accrued interest is actually written to the ledger as an `INTEREST_POSTING` transaction (and, if `withHoldTax = true`, a paired `WITHHOLD_TAX` debit).
 
-You can compound daily but post quarterly. You cannot post more often than you compound — `SavingsProduct.validateInterestPostingAndCompoundingPeriodTypes(...)` enforces this. The actual enums:
+You can compound daily but post quarterly. You cannot post more often than you compound — `FixedDepositProduct.validateInterestPostingAndCompoundingPeriodTypes(...)` (and the matching method on `SavingsAccount`) enforces this. The actual enums:
 
 ```java
 // fineract-core/.../portfolio/savings/SavingsCompoundingInterestPeriodType.java
@@ -338,7 +338,7 @@ The job is registered as `TRANSFER_INTEREST_TO_SAVINGS("Transfer Interest To Sav
 
 ## Validation invariants
 
-Two semantic invariants are enforced inside `SavingsProduct.validateInterestPostingAndCompoundingPeriodTypes(...)` and reused by FD/RD:
+Two semantic invariants are enforced inside `FixedDepositProduct.validateInterestPostingAndCompoundingPeriodTypes(...)` (mirrored on `SavingsAccount`) and reused by FD/RD:
 
 1. **Compounding period ≤ posting period.** You can compound daily and post monthly, but not the reverse.
 2. **`DAILY_BALANCE` is the canonical mode.** `AVERAGE_DAILY_BALANCE` is supported for compatibility but most real-world deployments use daily-balance, which is what the unit tests in `fineract-provider/src/test/java/org/apache/fineract/portfolio/savings/` are built around.

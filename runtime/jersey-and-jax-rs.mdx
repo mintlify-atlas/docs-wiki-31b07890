@@ -400,7 +400,7 @@ This is the only directory under `static/` in the repo; modern API doc generatio
 
 ```mermaid
 flowchart TB
-    subgraph fineract-provider/.../infrastructure/core/jersey
+    subgraph JerseyPkg["fineract-provider .../jersey package"]
       JC[JerseyConfig.java]
       JJC[JerseyJacksonConverterConfig.java]
       JJO[JerseyJacksonObjectArgumentHandler.java]
@@ -418,10 +418,10 @@ flowchart TB
         leg[legacy/JacksonLocalDateArrayModule]
       end
     end
-    subgraph fineract-core/.../exceptionmapper
+    subgraph ExMap["fineract-core .../exceptionmapper package"]
       EM[30+ ExceptionMappers]
     end
-    subgraph 163 *ApiResource classes
+    subgraph Resources["163 ApiResource classes"]
       L[LoansApiResource]
       C[ClientsApiResource]
       S[SavingsAccountsApiResource]

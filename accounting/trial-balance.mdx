@@ -93,7 +93,7 @@ roll-forward.
 
 ```mermaid
 flowchart TB
-  subgraph Job UPDATE_TRIAL_BALANCE_DETAILS
+  subgraph job ["Job UPDATE_TRIAL_BALANCE_DETAILS"]
     A[Find max created_date in m_trial_balance] --> B[Ask JournalEntryRepository for transaction dates after that date]
     B --> C{For each missing date}
     C -->|fetch aggregated rows| D[INSERT into m_trial_balance]

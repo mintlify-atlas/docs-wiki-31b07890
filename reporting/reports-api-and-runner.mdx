@@ -1,7 +1,7 @@
 ---
 title: "Reports API and Runner"
-description: "How Apache Fineract stores stretchy SQL and Pentaho report definitions in stretchy_report, exposes them through ReportsApiResource, and executes them via RunreportsApiResource and the ReportingProcessService SPI."
-keywords: ["Apache Fineract", "stretchy report", "Pentaho", "SQL report", "ReportsApiResource", "RunreportsApiResource", "ReportingProcessService"]
+description: "How Apache Fineract stores stretchy SQL report definitions in stretchy_report, exposes them through ReportsApiResource, and executes them via RunreportsApiResource and the ReportingProcessService SPI."
+keywords: ["Apache Fineract", "stretchy report", "SQL report", "ReportsApiResource", "RunreportsApiResource", "ReportingProcessService"]
 ---
 
 The Reports API is the single hub through which every interactive report in Apache Fineract is defined, listed, executed, and exported. It sits on top of two database tables (`stretchy_report` and `stretchy_parameter`), one runtime SPI (`ReportingProcessService`), and two JAX-RS resources: `/v1/reports` for CRUD over report metadata and `/v1/runreports/{reportName}` for execution. This page walks through each layer with pointers to source.
@@ -21,7 +21,7 @@ public final class Report extends AbstractPersistableCustom<Long> {
     private String reportName;
 
     @Column(name = "report_type", nullable = false)
-    private String reportType;          // "Table" | "Chart" | "SMS" | "Pentaho"
+    private String reportType;          // "Table" | "Chart" | "SMS" | "Pentaho" (seeded but currently unhandled)
 
     @Column(name = "report_subtype")
     private String reportSubType;
@@ -36,17 +36,17 @@ public final class Report extends AbstractPersistableCustom<Long> {
     private boolean coreReport;         // true for migrations-shipped reports
 
     @Column(name = "use_report", nullable = false)
-    private boolean useReport;          // shown in the UI list
+    private boolean useReport;          // only shown in the UI list when true
 
     @Column(name = "report_sql")
-    private String reportSql;           // null for Pentaho
+    private String reportSql;           // null for Pentaho rows
 }
 ```
 
 Key invariants enforced by the entity and the `ReportWritePlatformServiceImpl`:
 
 - `reportName` is **globally unique** because it is the lookup key used by the runner. The runner consults `ReadReportingService.getReportType(reportName, …)` to figure out which engine to dispatch to.
-- `reportType` must be one of the values registered with `ReportingProcessServiceProvider`. Out of the box that is `Table`, `Chart`, `SMS` (all handled by `DatatableReportingProcessService`) plus `Pentaho` (when the Pentaho bundle is present). New types can be added by registering a new `@ReportService`-annotated bean — no schema change needed.
+- `reportType` must be one of the values registered with `ReportingProcessServiceProvider`. The only bean shipped in the source tree is `DatatableReportingProcessService`, annotated `@ReportService(type = { "Table", "Chart", "SMS" })`. The Liquibase seed also inserts six rows with `report_type = "Pentaho"` (Balance Sheet, Income Statement, Trial Balance, Loan Account Schedule, Branch Expected Cash Flow, Expected Payments By Date - Formatted); since no bean is registered under that key, running them returns `503 err.msg.report.service.implementation.missing`. New types are added by dropping a new `@ReportService`-annotated bean into the Spring context — no schema change needed.
 - `coreReport=true` rows are immutable except for their `description`/`useReport` flags, and **cannot** be deleted via `DELETE /v1/reports/{id}`. The CRUD endpoint enforces that explicitly with the API doc note `Only non-core reports can be deleted.`
 
 Two related tables flesh out the parameter model:
@@ -63,7 +63,7 @@ Two related tables flesh out the parameter model:
 | `GET` | `/v1/reports` | `retrieveAllReports` | Lists every row of `stretchy_report` together with its parameters. |
 | `GET` | `/v1/reports/{id}` | `retrieveOneReport` | Single row. Add `?template=true` to get the available report types + parameter catalogue. |
 | `GET` | `/v1/reports/template` | `retrieveTemplateReport` | Returns metadata for the "Create Report" UI: allowed types, parameter list. |
-| `POST` | `/v1/reports` | `createReport` | Body validated by `ReportCommandFromApiJsonDeserializer`; `reportType` must come from `ReportingProcessServiceProvider.findAllReportingTypes()`. |
+| `POST` | `/v1/reports` | `createReport` | Body validated when constructing `Report` from JSON; `reportType` is checked against the collection returned by `ReportingProcessServiceProvider.findAllReportingTypes()` (used by the `template` endpoint), then persisted as-is. |
 | `PUT` | `/v1/reports/{id}` | `updateReport` | Core reports only allow `description`/`useReport` to change. |
 | `DELETE` | `/v1/reports/{id}` | `deleteReport` | Refuses to delete `core_report = true` rows. |
 
@@ -75,7 +75,7 @@ All write operations flow through the standard CQRS command machinery — they r
 public String createReport(final String apiRequestBodyAsJson) { ... }
 ```
 
-There is no separate "stretchy report" resource — Pentaho rows are created and edited through the same endpoint with `"reportType": "Pentaho"` and a null `reportSql`. The Pentaho engine then locates the `.prpt` file on the classpath by report name.
+There is no separate "stretchy report" resource — `Table`, `Chart`, `SMS`, and `Pentaho` rows are all created and edited through the same endpoint by varying `reportType` (and `reportSql`, which is null for Pentaho rows).
 
 ## The runner: `RunreportsApiResource`
 
@@ -93,7 +93,17 @@ public List<ReportExportType> retrieveAllAvailableExports(
         @PathParam("reportName") final String reportName) { ... }
 ```
 
-The runner asks the engine for its `getAvailableExportTargets()`. For the SQL/Chart/SMS engine that returns CSV, PDF, JSON, S3, etc., depending on which `DatatableReportExportService` beans are wired in.
+The runner asks the engine for its `getAvailableExportTargets()`. `DatatableReportingProcessService` implements that by streaming every `DatatableExportTargetParameter` (`CSV`, `PDF`, `S3`, `JSON`, `PRETTY_JSON`) and keeping only the ones for which a `DatatableReportExportService` bean is wired in:
+
+```java
+@Override
+public List<ReportExportType> getAvailableExportTargets() {
+    return Arrays.stream(DatatableExportTargetParameter.values())
+            .filter(target -> findReportExportService(target).isPresent())
+            .map(target -> new ReportExportType(target.name(), target.getValue()))
+            .toList();
+}
+```
 
 ### 2. Run the report
 
@@ -178,9 +188,12 @@ Two side channels deserve attention:
   ```java
   CSV("exportCSV"),
   PDF("exportPDF"),
+  S3("exportS3"),
   JSON("exportJSON"),
   PRETTY_JSON("pretty");
   ```
+
+  `DatatableExportTargetParameter.resolverExportTarget(queryParams)` walks that list and returns the first match whose query value equals `"true"`; if none match, it falls back to `JSON`.
 
 ### Authorisation
 
@@ -241,9 +254,11 @@ public Map<String, String> getReportParams(final MultivaluedMap<String, String> 
 
 `SqlValidator` rejects any value that contains an unquoted semicolon, multiline comments, or common SQL keywords outside of allowed contexts. It is the primary defence against injection — the engine does not use prepared statements for the substituted `${…}` tokens (because the same syntax is used for table/column names, not just literals), so the validator is the safety net.
 
-## Pentaho reports
+## Pentaho rows (currently unhandled)
 
-For `report_type = "Pentaho"`, the `report_sql` column stays null. The Pentaho engine, registered through its own `@ReportService(type = "Pentaho")` bean, looks up a `.prpt` (Pentaho Reporting Project) file on the classpath whose filename matches the report's `report_name`, then drives it through `ReadReportingService.generatePentahoReportAsOutputStream`:
+For `report_type = "Pentaho"`, the `report_sql` column stays null. The migration ships six such rows — `Balance Sheet` (id 48), `Income Statement` (id 49), `Trial Balance` (id 50), `Loan Account Schedule` (id 91), `Branch Expected Cash Flow` (id 92), and `Expected Payments By Date - Formatted` (id 94) — which are the statements a finance team is most likely to print or attach.
+
+However, **no bean in the current source tree is annotated `@ReportService(type = "Pentaho")`.** The `ReadReportingService` interface still declares a slot for the engine:
 
 ```java
 ByteArrayOutputStream generatePentahoReportAsOutputStream(
@@ -251,12 +266,13 @@ ByteArrayOutputStream generatePentahoReportAsOutputStream(
         String outputTypeParam,
         Map<String, String> queryParams,
         Locale locale,
-        ...);
+        AppUser runReportAsUser,
+        StringBuilder errorLog);
 ```
 
-`outputTypeParam` is read from the `?output-type=` query parameter and must be one of `HTML`, `PDF`, `XLS`, `CSV`. The runner does not need to know the difference — `processRequest` returns whatever the engine produces.
+…but `ReadReportingServiceImpl.generatePentahoReportAsOutputStream` returns `null` and its body is fully commented out (the leading `/* … */` block preserves the original Classic Engine implementation for reference). With no Pentaho `ReportingProcessService` bean registered, calling `/v1/runreports/Balance Sheet` reaches the registry, gets `null`, and the runner throws `PlatformServiceUnavailableException` with `err.msg.report.service.implementation.missing`.
 
-The migration ships a small but high-value Pentaho catalogue: `Balance Sheet` (id 48), `Income Statement` (id 49), `Trial Balance` (id 50), `Loan Account Schedule` (id 91), `Branch Expected Cash Flow` (id 92), and `Expected Payments By Date - Formatted` (id 94). These are the statements a finance team is most likely to print or attach.
+To restore Pentaho rendering, drop an out-of-tree module containing a bean annotated `@ReportService(type = "Pentaho")` that implements `processRequest` (typically by loading a `.prpt` from the classpath and exporting through PDF/XLS/CSV/HTML based on `?output-type=`).
 
 ## The SPI: `ReportingProcessService`
 
@@ -294,13 +310,29 @@ Registration is annotation-driven:
 public class DatatableReportingProcessService extends AbstractReportingProcessService { ... }
 ```
 
+`ReportingProcessServiceProvider` collects every `ReportingProcessService` bean at startup, reads the `type()` array of each `@ReportService` annotation, and builds an `ImmutableMap<String, ReportingProcessService>`:
+
+```java
+@Autowired
+public ReportingProcessServiceProvider(List<ReportingProcessService> reportingProcessServices) {
+    var mapBuilder = ImmutableMap.<String, ReportingProcessService>builder();
+    for (ReportingProcessService s : reportingProcessServices) {
+        String[] reportTypes = s.getClass().getAnnotation(ReportService.class).type();
+        for (String type : reportTypes) {
+            mapBuilder.put(type, s);
+        }
+    }
+    this.reportingProcessServices = mapBuilder.build();
+}
+```
+
 To plug in a new engine — e.g. a JasperReports adapter — the recipe is simply:
 
 1. Drop a bean implementing `ReportingProcessService` (or extending `AbstractReportingProcessService`) into the Spring context.
 2. Annotate it with `@ReportService(type = { "Jasper" })`.
 3. Insert a row into `stretchy_report` with `report_type = 'Jasper'`.
 
-`ReportingProcessServiceProvider` rebuilds its `ImmutableMap<String, ReportingProcessService>` at startup and the runner finds the new bean by `report_type` automatically.
+The runner then finds the new bean by `report_type` automatically; no schema migration is required.
 
 ## Export pipeline
 
@@ -334,8 +366,7 @@ Each `ResponseHolder` carries the HTTP status, content type, filename, optional 
 | *(none)* | JSON resultset | `application/json` | — |
 | `exportCSV=true` | CSV file | `text/csv` | `<reportName>.csv` |
 | `exportPDF=true` | PDF document | `application/pdf` | `<reportName>.pdf` |
-| `output-type=XLS` | Excel (Pentaho only) | `application/vnd.ms-excel` | `<reportName>.xls` |
-| `exportS3=true` | Upload to S3 | `application/json` | — (JSON returns the URL) |
+| `exportS3=true` | Upload to S3 | depends on `ResponseHolder.contentType` | — (response carries the object URL) |
 | `parameterType=true` | Parameter dropdown data | `application/json` | — |
 
 ## Hook into report mailing jobs
@@ -399,13 +430,6 @@ Content-Type: text/csv
 Content-Disposition: attachment; filename=Client Listing.csv
 ```
 
-### Run a Pentaho report as PDF
-
-```http
-GET /fineract-provider/api/v1/runreports/Balance Sheet
-    ?R_officeId=1&R_currencyId=USD&output-type=PDF HTTP/1.1
-```
-
 ### Look up a report's parameter dropdowns
 
 ```http
@@ -419,7 +443,7 @@ The runner skips the per-report permission and returns the populated dropdowns t
 | Symptom | Cause | Where |
 | ------- | ----- | ----- |
 | `404 ReportNotFoundException` | `report_name` does not exist | `ReadReportingServiceImpl.getReportType` |
-| `503 err.msg.report.service.implementation.missing` | `report_type` has no registered engine (e.g. Pentaho jar absent) | `RunreportsApiResource.processReportRequest` |
+| `503 err.msg.report.service.implementation.missing` | `report_type` has no registered engine — always the case today for seeded `Pentaho` rows | `RunreportsApiResource.processReportRequest` |
 | `401 NoAuthorizationException` | User lacks `READ_<reportName>` permission | `RunreportsApiResource.checkUserPermissionForReport` |
 | `400 GeneralPlatformDomainRuleException("error.msg.report.export.mode.unavailable")` | Requested export target has no `DatatableReportExportService` bean | `DatatableReportingProcessService.processRequest` |
 | `400 SqlInjectionException` | `R_*` value rejected by `SqlValidator` | `AbstractReportingProcessService.getReportParams` |

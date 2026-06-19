@@ -123,12 +123,14 @@ Content-Type: application/json
 
 {
   "loanProductId": 7,
-  "isCreditCheckMandatory": true,
-  "skipCreditCheckInFailure": false,
+  "isCreditcheckMandatory": true,
+  "skipCreditcheckInFailure": false,
   "stalePeriod": 30,
   "isActive": true
 }
 ```
+
+(Watch the case: the deserialiser keys are `isCreditcheckMandatory` and `skipCreditcheckInFailure` — lower‑case `c` in `check`. See `CreditBureauLoanProductCommandFromApiJsonDeserializer`.)
 
 After this, every loan submitted under product 7 will pull a report — falling back to a cached one in `m_creditreport` if a saved row for the same NRC is younger than 30 days.
 

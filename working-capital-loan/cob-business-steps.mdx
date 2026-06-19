@@ -104,7 +104,7 @@ When both checks pass, the step calls three service methods in order:
 
 The `businessDate.plusDays(1L)` argument is deliberate: COB is the close of *today*, so the evaluation horizon is tomorrow's opening. A breach detected at COB means the borrower has run out of road for the current period.
 
-The enum-styled name `WC_BREACH_SCHEDULE` and human-readable `WC Breach Schedule` are what the COB ordering configuration uses — they appear in `m_batch_business_step` and in the operator UI ordering view.
+The enum-styled name `WC_BREACH_SCHEDULE` and human-readable `WC Breach Schedule` are what the COB ordering configuration uses — they appear in `m_batch_business_steps` and in the operator UI ordering view.
 
 ## `DelinquencyRangeScheduleBusinessStep`
 
@@ -255,11 +255,11 @@ public class DummyBusinessStep extends WorkingCapitalLoanCOBBusinessStep {
 }
 ```
 
-In tenant configuration the step is typically disabled (left out of `m_batch_business_step`); enabling it adds a measurable log line per loan and is useful for verifying the pipeline is alive.
+In tenant configuration the step is typically disabled (left out of `m_batch_business_steps`); enabling it adds a measurable log line per loan and is useful for verifying the pipeline is alive.
 
 ## Recommended order
 
-Although the actual order is configured per-tenant via `m_batch_business_step`, the steps make most sense run in this sequence:
+Although the actual order is configured per-tenant via `m_batch_business_steps`, the steps make most sense run in this sequence:
 
 ```mermaid
 flowchart LR
@@ -476,9 +476,9 @@ A new step lives or dies by three things:
 
 1. **Inherits the base.** It must extend `WorkingCapitalLoanCOBBusinessStep` so the partitioner picks it up.
 2. **Is a `@Component`.** Standard Spring discovery.
-3. **Has a unique `getEnumStyledName()`.** That value lives in `m_batch_business_step` (the per-tenant ordering table) and is keyed unique per job.
+3. **Has a unique `getEnumStyledName()`.** That value lives in `m_batch_business_steps` (the per-tenant ordering table) and is keyed unique per job.
 
-Adding the row to `m_batch_business_step` activates the step in the chain. The COB pipeline will then execute it in the configured order — no other code change is needed.
+Adding the row to `m_batch_business_steps` activates the step in the chain. The COB pipeline will then execute it in the configured order — no other code change is needed.
 
 ## Where to read next
 

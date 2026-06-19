@@ -73,10 +73,10 @@ sequenceDiagram
 | 3 | Handler | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/handler/LoanRepaymentCommandHandler.java` | `@CommandType(entity = "LOAN", action = "REPAYMENT")`. |
 | 4 | Write service | `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanWritePlatformServiceJpaRepositoryImpl.java`, `makeLoanRepayment(...)` -> `makeLoanRepaymentWithChargeRefundChargeType(...)` | Validates, loads, builds payment detail. |
 | 5 | Domain orchestration | `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/LoanAccountDomainServiceJpa.java`, `makeRepayment(...)` | The real work. |
-| 6 | Strategy dispatch | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/transactionprocessor/LoanTransactionProcessingService.java` | Allocation across installments. |
+| 6 | Strategy dispatch | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanTransactionProcessingService.java` | Allocation across installments. |
 | 7 | Replay (non-latest txn) | `fineract-loan/.../service/ReprocessLoanTransactionsService.java` | Used when a back-dated repayment invalidates later allocations. |
 | 8 | Accruals | `fineract-loan/.../service/LoanAccrualsProcessingService.java` | For interest-recalculation-enabled products. |
-| 9 | GL posting | `fineract-provider/.../service/LoanJournalEntryPoster.java` | `postJournalEntriesForLoanTransaction(...)`. |
+| 9 | GL posting | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanJournalEntryPoster.java` (interface; impl `LoanJournalEntryPosterImpl` in `fineract-provider`) | `postJournalEntriesForLoanTransaction(...)`. |
 | 10 | Events | `fineract-core/.../event/business/service/BusinessEventNotifierService.java` | Drives [external event flow](/flows/external-event-flow). |
 
 ## The handler

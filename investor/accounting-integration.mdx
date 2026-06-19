@@ -17,7 +17,7 @@ The accounting layer in `fineract-investor` is split:
 
 ```mermaid
 flowchart LR
-    Step[LoanAccountOwnerTransferBusinessStep] --> Poster[LoanJournalEntryPoster<br/>fineract-portfolio]
+    Step[LoanAccountOwnerTransferBusinessStep] --> Poster[LoanJournalEntryPoster<br/>fineract-loan]
     Poster --> AS[AccountingServiceImpl<br/>fineract-investor]
     AS --> Helper[InvestorAccountingHelper]
     Helper --> Mapping[ProductToGLAccountMappingRepository]
@@ -28,7 +28,7 @@ flowchart LR
     AS --> Outstanding[ExternalAssetOwnerTransferOutstandingInterestCalculation]
 ```
 
-`LoanJournalEntryPoster.postJournalEntriesForExternalOwnerTransfer(loan, transfer, previousOwner)` is the entry point the COB step actually calls; it lives in `fineract-portfolio` and dispatches to `AccountingService` (the investor-module interface) based on the transfer's status — `ACTIVE` or `ACTIVE_INTERMEDIATE` → `createJournalEntriesForSaleAssetTransfer`; `BUYBACK` or `BUYBACK_INTERMEDIATE` → `createJournalEntriesForBuybackAssetTransfer`.
+`LoanJournalEntryPoster.postJournalEntriesForExternalOwnerTransfer(loan, transfer, previousOwner)` is the entry point the COB step actually calls; the interface lives in `fineract-loan` (so the COB step can depend on it without taking a hard dependency on `fineract-investor`), and dispatches to `AccountingService` (the investor-module interface) based on the transfer's status — `ACTIVE` or `ACTIVE_INTERMEDIATE` → `createJournalEntriesForSaleAssetTransfer`; `BUYBACK` or `BUYBACK_INTERMEDIATE` → `createJournalEntriesForBuybackAssetTransfer`.
 
 ## The accounts involved
 

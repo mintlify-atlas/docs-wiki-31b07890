@@ -208,14 +208,16 @@ Path: `fineract-provider/.../event/business/domain/loan/product/`
 | `LoanProductCreateBusinessEvent` | `LoanProduct` |
 
 The loan-product hierarchy in this folder covers *product* lifecycle. The much larger catalogue of
-**loan account** and **loan transaction** events (`LoanCreateBusinessEvent`,
-`LoanApprovedBusinessEvent`, `LoanDisbursalBusinessEvent`, `LoanRefundBusinessEvent`,
-`LoanChargeOffBusinessEvent`, `LoanChargeAddedBusinessEvent`,
-`LoanInstallmentLevelDelinquencyEvent`, the delinquency-range change events, and so on) lives in
-sibling modules and is wired up by the serializers in
-`event/external/service/serialization/serializer/loan/`. The presence of a
-`*BusinessEventSerializer` in that folder is the canonical way to discover the full set without
-walking every domain module.
+**loan account** and **loan transaction** events (`LoanCreatedBusinessEvent`,
+`LoanApprovedBusinessEvent`, `LoanDisbursalBusinessEvent`, `LoanRefundPreBusinessEvent` /
+`LoanRefundPostBusinessEvent`, `LoanChargeOffPreBusinessEvent` /
+`LoanChargeOffPostBusinessEvent`, `LoanAddChargeBusinessEvent`,
+`LoanDelinquencyRangeChangeBusinessEvent`, `LoanAccountDelinquencyPauseChangedBusinessEvent`,
+and so on) lives in the sibling `fineract-loan` Gradle module under
+`fineract-loan/src/main/java/org/apache/fineract/infrastructure/event/business/domain/loan/`
+(with `loan/transaction/` and `loan/charge/` sub-packages). The presence of a
+`*BusinessEventSerializer` in `event/external/service/serialization/serializer/loan/` is the
+canonical way to discover the full set without walking every domain module.
 
 ```java
 public class LoanProductCreateBusinessEvent extends LoanProductBusinessEvent {

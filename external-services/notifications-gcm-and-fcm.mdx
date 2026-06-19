@@ -255,20 +255,26 @@ After this, the next time the SMS scheduler picks up a row with `is_notification
 
 ## Producing a notification
 
-There is no `/v1/notifications` resource. To enqueue a push, insert a row into `sms_messages_outbound` with `is_notification = 1`. The two practical paths are:
+There is no `/v1/notifications` resource. To enqueue a push, insert a row into `sms_messages_outbound` with `is_notification = 1`. The request DTO `SmsCreationRequest` is intentionally narrow — it does **not** expose an `isNotification` flag:
 
-1. **Through the SMS API.** Set `isNotification: true` on the body of `POST /v1/sms` — many campaign templates already do this.
-2. **Directly through the campaign machinery.** A `SmsCampaign` with notification mode true emits `is_notification` rows when triggered.
+```java
+public record SmsCreationRequest(Long groupId, Long clientId, Long staffId,
+                                 String message, Long campaignId) implements Serializable {}
+```
+
+`SmsMessageAssembler.assembleFromJson(...)` only sets `isNotification = true` when the request carries a `campaignId` that resolves to a `SmsCampaign` with `isNotification()` true. In practice that gives you two ways to produce a push:
+
+1. **Reference an existing notification campaign.** Create a `SmsCampaign` with notification mode true, then `POST /v1/sms` referencing its `campaignId`. The flag propagates to the row.
+2. **Bypass the API.** Insert directly into `sms_messages_outbound` with `is_notification = 1` from a downstream service or migration script — the scheduler will pick it up the same way.
 
 ```http
 POST /fineract-provider/api/v1/sms
 Content-Type: application/json
 
 {
-  "clientId": 42,
-  "mobileNo": "+260971234567",
-  "message":  "New statement available",
-  "isNotification": true
+  "clientId":   42,
+  "campaignId": 7,
+  "message":    "New statement available"
 }
 ```
 

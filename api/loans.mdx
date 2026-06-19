@@ -17,7 +17,7 @@ Loan **transactions** (repayments, write-offs, waivers, adjustments) live on the
 | GET | `/v1/loans/{loanId}` | `LoansApiResource.java` | One loan with optional associations (`repaymentSchedule`, `transactions`, `charges`, `collateral`, `guarantors`, `multiDisburseDetails`, `notes`). |
 | GET | `/v1/loans/external-id/{loanExternalId}` | `LoansApiResource.java` | Same, addressed by `externalId`. |
 | POST | `/v1/loans` | `LoansApiResource.java` | Submit application (`?command=calculateLoanSchedule` for preview-only). |
-| POST | `/v1/loans/{loanId}?command=…` | `LoansApiResource.java` | State transitions: `approve`, `undoApproval`, `disburse`, `disburseToSavings`, `undoDisbursal`, `reject`, `withdrawnByApplicant`, `assignLoanOfficer`, `unassignLoanOfficer`, `recoverGuarantees`, `markAsFraud`, `forceClose`, `forceCloseFromDelinquency`. |
+| POST | `/v1/loans/{loanId}?command=…` | `LoansApiResource.java` | State transitions: `approve`, `undoapproval`, `disburse`, `disburseToSavings`, `disburseWithoutAutoDownPayment`, `undodisbursal`, `undolastdisbursal`, `reject`, `withdrawnByApplicant`, `assignloanofficer`, `unassignloanofficer`, `recoverGuarantees`, `assigndelinquency`, `contractTermination`, `undoContractTermination`. |
 | PUT | `/v1/loans/{loanId}` | `LoansApiResource.java` | Modify a pending or active loan. |
 | DELETE | `/v1/loans/{loanId}` | `LoansApiResource.java` | Delete a submitted-and-pending application. |
 | PUT | `/v1/loans/{loanId}/approved-amount` | `LoansApiResource.java` | Amend the approved amount. |
@@ -63,19 +63,25 @@ public String stateTransitions(@PathParam("loanId") final Long loanId,
         @Parameter(hidden = true) final String apiRequestBodyAsJson) {
     final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
     CommandWrapper commandRequest = null;
-    if (is(commandParam, "reject"))                commandRequest = builder.rejectLoanApplication(loanId).build();
-    else if (is(commandParam, "withdrawnByApplicant")) commandRequest = builder.withdrawLoanApplication(loanId).build();
-    else if (is(commandParam, "approve"))          commandRequest = builder.approveLoanApplication(loanId).build();
-    else if (is(commandParam, "disburse"))         commandRequest = builder.disburseLoanApplication(loanId).build();
-    else if (is(commandParam, "disburseToSavings"))commandRequest = builder.disburseLoanToSavingsApplication(loanId).build();
-    else if (is(commandParam, "undoApproval"))     commandRequest = builder.undoLoanApplicationApproval(loanId).build();
-    else if (is(commandParam, "undoDisbursal"))    commandRequest = builder.undoLoanApplicationDisbursal(loanId).build();
-    else if (is(commandParam, "assignLoanOfficer"))commandRequest = builder.assignLoanOfficer(loanId).build();
-    else if (is(commandParam, "unassignLoanOfficer")) commandRequest = builder.unassignLoanOfficer(loanId).build();
-    else if (is(commandParam, "recoverGuarantees")) commandRequest = builder.recoverFromGuarantor(loanId).build();
-    else if (is(commandParam, "markAsFraud"))      commandRequest = builder.markAsFraud(loanId).build();
-    else if (is(commandParam, "forceClose"))       commandRequest = builder.forceCloseLoan(loanId).build();
-    // …
+    if (CommandParameterUtil.is(commandParam, "reject"))                       commandRequest = builder.rejectLoanApplication(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "withdrawnByApplicant"))    commandRequest = builder.withdrawLoanApplication(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "approve"))                 commandRequest = builder.approveLoanApplication(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "disburse"))                commandRequest = builder.disburseLoanApplication(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "disburseToSavings"))       commandRequest = builder.disburseLoanToSavingsApplication(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "disburseWithoutAutoDownPayment"))
+                                                                               commandRequest = builder.disburseWithoutAutoDownPayment(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "undoapproval"))            commandRequest = builder.undoLoanApplicationApproval(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "undodisbursal"))           commandRequest = builder.undoLoanApplicationDisbursal(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "undolastdisbursal"))       commandRequest = builder.undoLastDisbursalLoanApplication(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "assignloanofficer"))       commandRequest = builder.assignLoanOfficer(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "unassignloanofficer"))     commandRequest = builder.unassignLoanOfficer(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "recoverGuarantees"))       commandRequest = builder.recoverFromGuarantor(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, "assigndelinquency"))       commandRequest = builder.assignDelinquency(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, LoanApiConstants.CONTRACT_TERMINATION_COMMAND))
+                                                                               commandRequest = builder.applyContractTermination(loanId).build();
+    else if (CommandParameterUtil.is(commandParam, LoanApiConstants.UNDO_CONTRACT_TERMINATION_COMMAND))
+                                                                               commandRequest = builder.undoContractTermination(loanId).build();
+    // markAsFraud is dispatched from the PUT /{loanId} handler (modify-application)
 }
 ```
 
@@ -232,8 +238,8 @@ Loan endpoints are gated by fine-grained permissions in `m_permission`. The most
 | `DISBURSE_LOAN` / `DISBURSALUNDO_LOAN` | `POST /v1/loans/{loanId}?command=disburse|disburseToSavings|undoDisbursal`. |
 | `REJECT_LOAN`, `WITHDRAW_LOAN` | Pre-activation termination. |
 | `UPDATELOANOFFICER_LOAN`, `REMOVELOANOFFICER_LOAN`, `BULKREASSIGN_LOAN` | Officer assignment. |
-| `FORECLOSURE_LOAN` | `?command=foreclosure`. |
-| `MARKASFRAUD_LOAN` | `?command=markAsFraud`. |
+| `FORECLOSURE_LOAN` | `?command=foreclosure` (dispatched from `LoanTransactionsApiResource`, documented under [Loan Transactions](/api/loan-transactions)). |
+| `MARKASFRAUD_LOAN` | `?command=markAsFraud` (dispatched from `PUT /v1/loans/{loanId}`, not from the state-transition POST). |
 | `CREATE_DELINQUENCY_BUCKET`, `UPDATE_DELINQUENCY_BUCKET`, `DELETE_DELINQUENCY_BUCKET` | `DelinquencyApiResource`. |
 | `CREATE_RESCHEDULELOAN`, `APPROVE_RESCHEDULELOAN`, `REJECT_RESCHEDULELOAN` | `RescheduleLoansApiResource`. |
 | `CREATE_GUARANTOR`, `UPDATE_GUARANTOR`, `DELETE_GUARANTOR` | `GuarantorsApiResource`. |

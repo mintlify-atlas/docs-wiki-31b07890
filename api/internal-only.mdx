@@ -25,7 +25,7 @@ All endpoints live under `/fineract-provider/api/v1` — see the [REST API Overv
 | GET | `/v1/internal/loan/maxTransactionDateOfActiveLoan` | `InternalLoanInformationApiResource.java` | Latest transaction date across all active loans. |
 | GET | `/v1/internal/savingsaccounts/status/{statusId}` | `InternalSavingsAccountInformationApiResource.java` | All savings account ids in a given status. |
 | GET | `/v1/internal/client/{clientId}/audit` | `InternalClientInformationApiResource.java` | Audit columns of a client. |
-| PUT | `/v1/internal/configurations/name/{configName}/value/{configValue}` | `InternalConfigurationsApiResource.java` | Set a global configuration to an exact value, bypassing validation. |
+| PUT | `/v1/internal/configurations/name/{configName}/value/{configValue}` | `InternalConfigurationsApiResource.java` | Set a global configuration's numeric `value` column to an exact `Long`, bypassing the public validator. |
 | GET | `/v1/internal/loan/progressive/{loanId}/model` | `InternalProgressiveLoanApiResource.java` | Inspect the progressive-loan emi calculation model. |
 | POST | `/v1/internal/loan/progressive/{loanId}/model` | `InternalProgressiveLoanApiResource.java` | Replace the progressive-loan model (test only). |
 | DELETE | `/v1/internal/loan/progressive/{loanId}/model` | `InternalProgressiveLoanApiResource.java` | Wipe the cached progressive model. |
@@ -119,13 +119,13 @@ Class path: `@Path("/v1/internal/client")`
 File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/api/InternalConfigurationsApiResource.java`
 Class path: `@Path("/v1/internal/configurations")`
 
-The public `GlobalConfigurationApiResource` validates writes against `c_configuration`'s definition (string vs number vs date vs boolean). This internal endpoint side-steps the validation — useful when a test needs a forbidden combination, or when an operator needs to set a value the validation logic incorrectly rejects.
+The public `GlobalConfigurationApiResource` validates writes against `c_configuration`'s definition (string vs number vs date vs boolean). This internal endpoint side-steps the validation — useful when a test needs a value the validation logic incorrectly rejects. Both path parameters are positional and the `configValue` is parsed as `Long`, so this endpoint only mutates the numeric `value` column of `c_configuration` — for string / date / boolean overrides use the regular `GlobalConfigurationApiResource`.
 
 | Method | Path | Handler |
 | --- | --- | --- |
 | PUT | `/v1/internal/configurations/name/{configName}/value/{configValue}` | `updateGlobalConfiguration` |
 
-The path parameters carry both the name and the value; there is no request body.
+There is no request body — both name and value travel in the path.
 
 ## `InternalProgressiveLoanApiResource`
 
@@ -175,23 +175,24 @@ Use cases include flipping a node read-only ahead of a deployment, or peeling a 
 
 ## Gating and safety
 
-Most internal resources include a runtime guard so they cannot accidentally serve production traffic. The pattern looks like this:
+Most internal resources are bound to the `test` Spring profile, so the Jersey bean is **never registered** outside of test / sandbox runs. The pattern is:
 
 ```java
 // fineract-provider/.../infrastructure/configuration/api/InternalConfigurationsApiResource.java
-@Path("/v1/internal/configurations")
+@Profile(FineractProfiles.TEST)
 @Component
-public class InternalConfigurationsApiResource {
+@Path("/v1/internal/configurations")
+public class InternalConfigurationsApiResource implements InitializingBean {
     // …
-    private void validateRequest() {
-        if (!fineractProperties.getMode().isWriteEnabled()) {
-            throw new ForbiddenException("Internal endpoints are not available in read-only mode");
-        }
+    @Override
+    public void afterPropertiesSet() {
+        log.warn("DO NOT USE THIS IN PRODUCTION!");
+        log.warn("Internal Config services mode is enabled");
     }
 }
 ```
 
-Operators should additionally restrict the `/v1/internal/*` URL space at the load-balancer level (firewall rule, mTLS-only, internal subnet) and require a dedicated permission grant rather than `ALL_FUNCTIONS`.
+The same `@Profile(FineractProfiles.TEST)` annotation gates `InstanceModeApiResource` and the other `Internal*ApiResource` beans. Operators should additionally restrict the `/v1/internal/*` URL space at the load-balancer level (firewall rule, mTLS-only, internal subnet) and require a dedicated permission grant rather than `ALL_FUNCTIONS`.
 
 ## Patterns to know
 
@@ -260,16 +261,20 @@ Comparing the output with what's actually being processed in `m_loan_account_loc
 
 ## Configuring the internal access profile
 
-The default Spring profile (`production`) **disables** every internal resource by failing the `validateRequest()` guard or by not registering the bean at all. To enable them in a dev sandbox set:
+The default Spring profile (`production`) **never instantiates** any `Internal*ApiResource` bean — the `@Profile(FineractProfiles.TEST)` annotation makes them invisible to Spring. To enable them in a dev sandbox set:
 
 ```properties
 # application.properties or environment
+spring.profiles.active=test
+```
+
+`FineractProfiles.TEST` is the constant string `test` declared in `fineract-core/.../infrastructure/core/boot/FineractProfiles.java`. Combine it with the instance-mode flags to choose what the node will accept:
+
+```properties
 fineract.mode.read-enabled=true
 fineract.mode.write-enabled=true
 fineract.mode.batch-worker-enabled=true
 fineract.mode.batch-manager-enabled=true
-
-spring.profiles.active=test
 ```
 
 The `test` profile also wires `MockBusinessDate` (`fineract-core/.../businessdate/`), letting the integration suite advance the platform's clock without sleeping.
@@ -279,7 +284,7 @@ The `test` profile also wires `MockBusinessDate` (`fineract-core/.../businessdat
 When adding a new internal endpoint, follow the existing pattern:
 
 1. Place it under `…/api/Internal*ApiResource.java` and prefix its class-level `@Path` with `/v1/internal/`.
-2. Make the bean conditional: `@ConditionalOnProperty(value = "fineract.mode.write-enabled", havingValue = "true")` (or read for read-only paths).
+2. Annotate the class with `@Profile(FineractProfiles.TEST)` so the bean only exists in test runs.
 3. Bypass the public command bus where appropriate — internal endpoints usually call write services directly so command-source rows do not pollute production tables.
 4. Document the endpoint in this page and in the test suite that consumes it.
 

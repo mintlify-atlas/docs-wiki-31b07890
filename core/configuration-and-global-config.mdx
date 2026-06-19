@@ -4,7 +4,7 @@ sidebarTitle: "Configuration"
 description: "Apache Fineract fineract-core configuration package — GlobalConfigurationProperty entity, ConfigurationDomainService flags and the runtime tunables that drive platform behaviour."
 ---
 
-Apache Fineract exposes around 90 named runtime flags and tunables that operators flip without redeploying — maker-checker, two-factor auth, business date enablement, S3 document storage, accrual behaviour, password rules, COB toggles and many more. The `infrastructure/configuration/` package in `fineract-core` defines the entity, repository, constants, and service interface for these flags. This page tours the model and enumerates the notable settings.
+Apache Fineract exposes a large set of named runtime flags and tunables (~68 string constants in `GlobalConfigurationConstants`) that operators flip without redeploying — maker-checker, business date enablement, S3 document storage, accrual behaviour, password rules, COB toggles and many more. The `infrastructure/configuration/` package in `fineract-core` defines the entity, repository, constants, and service interface for these flags. This page tours the model and enumerates the notable settings.
 
 Source root: `fineract-core/src/main/java/org/apache/fineract/infrastructure/configuration/`.
 
@@ -103,7 +103,7 @@ public static final String ENABLE_PAYMENT_HUB_INTEGRATION = "enable-payment-hub-
 // ... and many more
 ```
 
-The full list is in the file, ~90 constants long.
+The full list is in the file, ~68 constants long.
 
 ## Notable flag groups
 
@@ -207,7 +207,7 @@ public interface ConfigurationDomainService {
     Long retrievePasswordLiveTime();
     Long retrieveGraceOnPenaltyPostingPeriod();
     Long retrieveOpeningBalancesContraAccount();
-    // ... ~150 methods total
+    // ... ~70 typed methods total, one per flag
 }
 ```
 
@@ -217,8 +217,8 @@ Every flag listed in the constants file gets a typed getter (or setter, in the c
 
 The repository pair follows the standard Fineract pattern:
 
-- `GlobalConfigurationRepository` extends Spring Data `JpaRepository<GlobalConfigurationProperty, Long>` with a `findOneByNameIgnoreCase(String name)` finder.
-- `GlobalConfigurationRepositoryWrapper` decorates the repo with `findOneByNameWithNotFoundDetection(String name)` that throws `ConfigurationPropertyNotFoundException` when the row is absent. Application code typically depends on the wrapper.
+- `GlobalConfigurationRepository` extends Spring Data `JpaRepository<GlobalConfigurationProperty, Long>` with a `findOneByName(String name)` finder.
+- `GlobalConfigurationRepositoryWrapper` decorates the repo with `findOneByNameWithNotFoundDetection(String propertyName)` and `findOneWithNotFoundDetection(Long configId)` that throw `GlobalConfigurationPropertyNotFoundException` when the row is absent. Application code typically depends on the wrapper.
 
 ## Read service and DTO
 
@@ -378,7 +378,7 @@ If `isTrapDoor` is true and you try to flip `enabled` from `true` → `false`, t
     Typed getter / setter interface used across the codebase.
   </Card>
   <Card title="api/GlobalConfigurationConstants" icon="hashtag">
-    ~90 string constants — one per flag.
+    ~68 string constants — one per flag.
   </Card>
   <Card title="api/GlobalConfigurationApiConstant" icon="hashtag">
     JSON parameter name constants for the PUT body.
@@ -404,5 +404,5 @@ If `isTrapDoor` is true and you try to flip `enabled` from `true` → `false`, t
 </CardGroup>
 
 <Tip>
-Two failure modes are worth knowing about: if you add a new constant in `GlobalConfigurationConstants` but forget to seed it in a Liquibase migration, every call to the typed getter will throw `ConfigurationPropertyNotFoundException`. And if you set `isTrapDoor=true` in the migration without intending it, operators will be unable to turn the feature off — only a SQL hand-edit recovers from that.
+Two failure modes are worth knowing about: if you add a new constant in `GlobalConfigurationConstants` but forget to seed it in a Liquibase migration, every call to the typed getter will throw `GlobalConfigurationPropertyNotFoundException`. And if you set `isTrapDoor=true` in the migration without intending it, operators will be unable to turn the feature off — only a SQL hand-edit recovers from that.
 </Tip>

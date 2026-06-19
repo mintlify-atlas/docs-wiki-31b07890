@@ -64,7 +64,11 @@ dependencies {
     driver 'com.mysql:mysql-connector-j'
     testImplementation 'org.seleniumhq.selenium:selenium-java:4.21.0'
     testImplementation 'io.github.bonigarcia:webdrivermanager:6.3.3'
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+    // JUnit Jupiter is pulled in from oauth2-tests/dependencies.gradle without an
+    // explicit version — the version comes from the Spring Boot BOM imported in
+    // buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle.
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+    testRuntimeOnly    'org.junit.jupiter:junit-jupiter-engine'
 }
 
 cargo {

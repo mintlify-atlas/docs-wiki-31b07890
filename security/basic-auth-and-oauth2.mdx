@@ -145,7 +145,7 @@ OAuth2 is built on Spring Authorization Server (`spring-security-oauth2-authoriz
 
 ```mermaid
 flowchart LR
-    A[/api/**, /oauth2/**, /login, /swagger-ui, /actuator/**/] --> B{Order 1 publicEndpoints}
+    A[HTTP request] --> B{Order 1 publicEndpoints}
     B -->|matches /swagger-ui/** /fineract.json /actuator/** /legacy-docs/apiLive.htm| C[permitAll]
     B -->|else| D{Order 2 authorizationServer}
     D -->|matches OAuth2 endpoints /oauth2/authorize, /oauth2/token, /oauth2/jwks| E[Auth Server + form login]
@@ -431,7 +431,7 @@ Forgetting `Fineract-Platform-TenantId` on Basic-auth requests results in `Inval
 </Warning>
 
 <Warning>
-The OAuth2 chain disables CSRF (`csrf(AbstractHttpConfigurer::disable)`) and `setEraseCredentialsAfterAuthentication(false)`. Both are deliberate — CSRF protection is unnecessary for stateless JWT APIs and the credentials are retained so `TwoFactorAuthenticationFilter` can rebuild the authentication object with the extra authority.
+Both chains disable CSRF (`csrf(AbstractHttpConfigurer::disable)`). The Basic chain additionally configures its `ProviderManager` with `setEraseCredentialsAfterAuthentication(false)` so the credentials survive on the `Authentication` object — `TwoFactorAuthenticationFilter` needs them to rebuild the `UsernamePasswordAuthenticationToken` with the extra `TWOFACTOR_AUTHENTICATED` authority. CSRF protection is unnecessary on either chain because requests carry credentials/tokens explicitly (no ambient session cookie to forge).
 </Warning>
 
 <Warning>

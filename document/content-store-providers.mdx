@@ -77,18 +77,26 @@ public class FileContentStoreService implements ContentStoreService {
 
 Behaviour notes:
 
-- The **root directory** comes from `FineractProperties` — typically
-  `fineract.content.filesystem.root` (something like `/var/lib/fineract/content`).
-- Every key is **sanitised** (`ContentPathSanitizer` strips
-  `..`, leading slashes and shell-special characters) and **randomised**
-  (`ContentPathRandomizer` adds an entropy segment so two uploads with
-  the same filename don't collide).
-- Uploads land in `<root>/<tenant>/<sanitised+randomised path>` —
-  multi-tenancy is enforced at the path level using
-  `ThreadLocalContextUtil.getTenant()`.
-- All four policies (pre-upload, post-upload, download, delete) and
-  the Tika detector are injected through the constructor so the same
-  guarantees are honoured whether the bytes land on disk or in S3.
+- The **root directory** comes from `FineractProperties.FineractContentFilesystemProperties.rootFolder`,
+  configured via the `fineract.content.filesystem.rootFolder` property (defaults to
+  `${user.home}/.fineract` in `application.properties`).
+- Every key is **sanitised** through `ContentPathSanitizer`
+  (`DefaultContentPathSanitizer` calls `Path.of(path).normalize()`) before
+  any I/O. Path-traversal sequences are rejected upstream by
+  `TraversalContentPolicy`. New uploads also get an entropy segment from
+  `ContentPathRandomizer` injected into the path (a 16-character
+  directory between the parent path and the filename) so two uploads
+  with the same display name don't collide — but only when the target
+  file doesn't already exist; in-place overwrites reuse the existing
+  randomised path.
+- The effective root for a write is `<rootFolder>/<tenantName>` where
+  `tenantName` comes from `ThreadLocalContextUtil.getTenant().getName()`
+  with spaces stripped — multi-tenancy is enforced at the path level.
+- Pre-upload, post-upload, download and delete policies and the Tika
+  detector manager are constructor-injected so the same guarantees are
+  honoured whether the bytes land on disk or in S3.
+- Empty parent directories are removed after a successful delete (see
+  `hasFiles()` check in `delete()`).
 
 ## Implementation 2 — `S3ContentStoreService`
 
@@ -130,28 +138,34 @@ public class S3ContentStoreService implements ContentStoreService {
 
 Key points:
 
-- Uses the AWS SDK v2 `S3Client` injected from
-  `AmazonS3Config`
-  (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/s3/AmazonS3Config.java`).
+- Uses the AWS SDK v2 `S3Client` injected from `ContentS3Config`
+  (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/ContentS3Config.java`),
+  which is itself guarded by `@ConditionalOnProperty("fineract.content.s3.enabled")`.
+  A separate `AmazonS3Config` in `fineract-provider/.../infrastructure/s3/`
+  produces an `S3Client` bean named `s3Client` for the **report-export**
+  pipeline — they are two different concerns and Spring autowires
+  whichever bean is registered at boot.
 - The bucket name comes from `FineractProperties.getContent().getS3().getBucketName()`,
-  populated from `fineract.content.s3.bucket-name`.
-- Same policy / detector pipeline as the filesystem variant — no
-  branch in the documents API.
+  populated from the property `fineract.content.s3.bucketName` (camelCase).
+- Same policy / detector pipeline as the filesystem variant — no branch
+  in the documents API. Note that `S3ContentStoreService` does **not**
+  inject `ContentPathRandomizer`: keys are sanitised but not randomised,
+  so a second upload with the same logical path overwrites the previous
+  object.
 
 ## Selection matrix
 
-The two flags are mutually exclusive in production, but the same
-property names are independent so it is possible to have *neither*
-enabled (in which case the document APIs that consume
-`ContentStoreService` will fail to start with an unsatisfied bean
-dependency — exactly what we want).
+The two flags are independent — they are meant to be mutually exclusive
+in production, and `application.properties` ships with
+`fineract.content.filesystem.enabled=true` and
+`fineract.content.s3.enabled=false` as the defaults.
 
 | `fineract.content.filesystem.enabled` | `fineract.content.s3.enabled` | Active bean |
 | ------------------------------------- | ----------------------------- | ----------- |
-| `true`                                | unset / `false`               | `FileContentStoreService` |
-| unset / `false`                       | `true`                        | `S3ContentStoreService`   |
+| `true` (default)                      | `false` (default)             | `FileContentStoreService` |
+| `false`                               | `true`                        | `S3ContentStoreService` (plus `ContentS3Config#contentS3Client`) |
 | `true`                                | `true`                        | *startup error* — two beans implementing `ContentStoreService` |
-| unset / `false`                       | unset / `false`               | *startup error* — no `ContentStoreService` bean |
+| `false`                               | `false`                       | *startup error* — no `ContentStoreService` bean |
 
 ## Shared infrastructure
 
@@ -191,46 +205,82 @@ the per-backend service. Adding a new backend (Azure Blob, GCS, …) is
 mostly a matter of writing a new `ContentStoreService` impl that
 delegates to the same policy beans.
 
-## A note on a "factory"
+## No explicit factory
 
-Earlier Fineract releases shipped an explicit
-`ContentRepositoryFactory` that picked between
-`FileSystemContentRepository` and `S3ContentRepository` based on a
-configuration value at runtime. The current `fineract-document` design
-folds that role into Spring itself — `@ConditionalOnProperty` on the
-two implementations *is* the factory. Both classes implement the same
-`ContentStoreService` interface and only one of them ever gets
-registered as a bean. There is no separate factory class to maintain or
-test.
+There is no `ContentStoreServiceFactory` class. Spring's
+`@ConditionalOnProperty` on the two `@Service` implementations *is* the
+selection mechanism — whichever implementation Spring registers
+becomes the singleton autowired into the read/write platform services.
+Adding a third backend would mean writing a new
+`ContentStoreService` `@Service` guarded by its own
+`@ConditionalOnProperty`.
 
 ## Configuration properties
 
-The exact properties used by the two backends, as defined on
-`FineractProperties.FineractContent*`:
+The properties used by the two backends, as defined on
+`FineractProperties.FineractContentProperties` and its nested
+`FineractContentFilesystemProperties` / `FineractContentS3Properties`
+in `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/config/FineractProperties.java`:
 
 <ResponseField name="fineract.content.filesystem.enabled" type="boolean">
-Switch the filesystem implementation on. Defaults to `false` /
-unset.
+Switch the filesystem implementation on. Defaults to `true` in
+`application.properties`.
 </ResponseField>
 
-<ResponseField name="fineract.content.filesystem.root" type="string">
+<ResponseField name="fineract.content.filesystem.rootFolder" type="string">
 Root directory under which the filesystem store lays out
-`<tenant>/<key>` paths. Must be writable by the JVM user.
+`<tenantName>/<key>` paths. Defaults to `${user.home}/.fineract`. Must
+be writable by the JVM user.
 </ResponseField>
 
 <ResponseField name="fineract.content.s3.enabled" type="boolean">
-Switch the S3 implementation on.
+Switch the S3 implementation on. Defaults to `false`.
 </ResponseField>
 
-<ResponseField name="fineract.content.s3.bucket-name" type="string">
+<ResponseField name="fineract.content.s3.bucketName" type="string">
 Target bucket. Lives on `FineractContentS3Properties.bucketName`.
 </ResponseField>
 
-<ResponseField name="fineract.content.s3.access-key / secret-key / region / endpoint / path-style-addressing-enabled" type="string / boolean">
-Optional S3-specific tunables surfaced through `FineractContentS3Properties`
-in `fineract-core/.../infrastructure/core/config/FineractProperties.java`.
-Credentials normally come from the AWS default chain (see the S3 page),
-so leave the access key / secret blank in production.
+<ResponseField name="fineract.content.s3.accessKey / secretKey" type="string">
+Optional static AWS credentials. When both are non-empty,
+`ContentS3Config` builds a `StaticCredentialsProvider`; otherwise it
+falls back to `DefaultCredentialsProvider.create()` (env vars,
+instance profile, IRSA, etc.). Leave blank in production and use the
+default chain.
+</ResponseField>
+
+<ResponseField name="fineract.content.s3.region" type="string">
+Optional. When non-empty, sets `Region.of(region)` on the
+`S3ClientBuilder`. When blank, the SDK picks up the region from the
+default chain.
+</ResponseField>
+
+<ResponseField name="fineract.content.s3.endpoint" type="string">
+Optional. When non-empty, calls `endpointOverride(URI.create(endpoint))`
+on the `S3ClientBuilder` — useful for Localstack, MinIO and other
+S3-compatible stores.
+</ResponseField>
+
+<ResponseField name="fineract.content.s3.path-style-addressing-enabled" type="boolean">
+Combined with `endpoint`, calls `forcePathStyle(...)` on the
+`S3ClientBuilder`. Set `true` for path-style-only stacks like
+Localstack. Defaults to `false`.
+</ResponseField>
+
+<ResponseField name="fineract.content.regex-whitelist-enabled / regex-whitelist" type="boolean / list">
+Top-level content properties consumed by `WhitelistContentPolicy`
+during every pre-upload check. Not specific to either backend but
+required for uploads to succeed.
+</ResponseField>
+
+<ResponseField name="fineract.content.mime-whitelist-enabled / mime-whitelist" type="boolean / list">
+The Tika-detected MIME must appear in this list when the flag is on
+(default). See the policies page for the default values.
+</ResponseField>
+
+<ResponseField name="fineract.content.default-buffer-size" type="integer">
+Default `PipedInputStream` buffer size used by `ContentPipe` and the
+streaming processors. Defaults to `8192`.
 </ResponseField>
 
 ## Operational guidance

@@ -58,7 +58,7 @@ Each row represents *one instance* of a charge attached to one savings account. 
 | 7 | `MONTHLY_FEE` | Recurs every N months (`feeInterval`) on `feeOnDay`. |
 | 10 | `OVERDRAFT_FEE` | Penalty when the account goes negative. |
 | 11 | `WEEKLY_FEE` | Recurs every N weeks on `feeOnDay` (ISO day of week). |
-| 13 | `SAVINGS_NO_ACTIVITY_FEE` | Fires when the no-activity threshold is reached. |
+| 16 | `SAVINGS_NOACTIVITY_FEE` | Fires when the no-activity threshold is reached. |
 
 The entity exposes one boolean per type:
 
@@ -160,7 +160,7 @@ switch (ChargeCalculationType.fromInt(this.chargeCalculation)) {
 }
 ```
 
-So a `PERCENT_OF_AMOUNT` withdrawal fee is computed every time it fires — `populateDerivedFields(withdrawalAmount, percentage)` is called from `updateWithdrawalFeeAmount(...)` immediately before the fee is paid.
+So a `PERCENT_OF_AMOUNT` withdrawal fee is computed every time it fires — `populateDerivedFields(withdrawalAmount, percentage)` is called from `updateWithdralFeeAmount(...)` (sic — the typo is in the source method name) immediately before the fee is paid.
 
 ## Pay, waive, undo
 
@@ -258,7 +258,7 @@ sequenceDiagram
   participant Charge as SavingsAccountCharge
   API->>SA: withdraw(dto, applyWithdrawFee=true, ...)
   SA->>SA: payWithdrawalFee(...)
-  SA->>Charge: updateWithdrawalFeeAmount(withdrawalAmount)
+  SA->>Charge: updateWithdralFeeAmount(withdrawalAmount)
   Charge->>Charge: populateDerivedFields(withdrawalAmount, ...)
   SA->>SA: addTransaction(WITHDRAWAL_FEE)
   SA->>Charge: charge.pay(...)

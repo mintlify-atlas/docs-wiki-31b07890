@@ -33,7 +33,7 @@ public class LoanProduct extends AbstractPersistableCustom<Long> {
 }
 ```
 
-Three uniqueness constraints — `name`, `short_name` and `external_id` — make products lookup-friendly from both UIs and integrations. The `transactionProcessingStrategyCode` column is a string foreign-key into the list of strategies registered with [`LoanRepaymentScheduleTransactionProcessorFactory`](/loan/loan-transaction-and-charge#transaction-processors); see the seven shipped implementations under `domain/transactionprocessor/impl/`.
+Three uniqueness constraints — `name`, `short_name` and `external_id` — make products lookup-friendly from both UIs and integrations. The `transactionProcessingStrategyCode` column is a string foreign-key into the list of strategies registered with [`LoanRepaymentScheduleTransactionProcessorFactory`](/loan/loan-transaction-and-charge#transaction-processors); see the nine cumulative implementations under `domain/transactionprocessor/impl/` plus the `AdvancedPaymentScheduleTransactionProcessor` in `fineract-progressive-loan`.
 
 ## Embedded `LoanProductRelatedDetail`
 
@@ -218,7 +218,7 @@ Two API resources expose products: a feature-rich CRUD one in `fineract-provider
 
 ## Snapshot semantics
 
-When a [`Loan`](/loan/loan-aggregate) is submitted, Fineract copies the product's `LoanProductRelatedDetail` and `LoanProductInterestRecalculationDetails` onto the loan. Later product changes affect only **new** loans — already-disbursed loans keep their original schedule contract until you explicitly reschedule them. That snapshot semantics is what lets a microfinance institution reprice a product without scaring its existing book.
+When a [`Loan`](/loan/loan-aggregate) is submitted, Fineract copies the product's `LoanProductRelatedDetail` snapshot and translates the product's `LoanProductInterestRecalculationDetails` into a per-loan `LoanInterestRecalculationDetails`. Later product changes affect only **new** loans — already-disbursed loans keep their original schedule contract until you explicitly reschedule them. That snapshot semantics is what lets a microfinance institution reprice a product without scaring its existing book.
 
 ## Related pages
 

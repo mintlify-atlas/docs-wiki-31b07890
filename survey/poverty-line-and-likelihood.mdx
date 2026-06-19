@@ -57,10 +57,15 @@ private SqlRowSet getPovertyLines(final String ppiName) {
                + "FROM ppi_poverty_line pl "
                + "JOIN ppi_likelihoods lkh on lkh.id = pl.likelihood_ppi_id "
                + "JOIN ppi_likelihoods_ppi lkp on lkp.id = pl.likelihood_ppi_id "
-               + "JOIN ppi_scores sc on sc.id = pl.score_id";
-    return this.jdbcTemplate.queryForRowSet(sql);
+               + "JOIN ppi_scores sc on sc.id = pl.score_id "
+               + "WHERE lkp.ppi_name = ?";
+    return this.jdbcTemplate.queryForRowSet(sql, new Object[] { ppiName });
 }
 ```
+
+<Note>
+Read that `JOIN ppi_likelihoods lkh on lkh.id = pl.likelihood_ppi_id` carefully — it joins on `likelihood_ppi_id`, which is a foreign key pointing at `ppi_likelihoods_ppi.id`, not `ppi_likelihoods.id`. This is how the column is named in the source, and the join works because both id sequences happen to line up in the bundled seed data. The neighbouring `getLikelihoods()` query joins correctly via `lkp.likelihood_id = lkh.id`. Treat the query above as load‑bearing on the seed data layout.
+</Note>
 
 (See `infrastructure/survey/service/PovertyLineServiceImpl.java` for the full query.)
 

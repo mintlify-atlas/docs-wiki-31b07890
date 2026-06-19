@@ -147,7 +147,7 @@ Fixed-deposit accounts extend the savings model with a maturity date and an atta
 | `close` | Normal closure at maturity. |
 | `prematureClose` | Early withdrawal (uses `calculatePrematureAmount` preview to compute interest claw-back). |
 
-The `GET /v1/fixeddepositaccounts/calculate-fd-interest?productId=…&principal=…&depositPeriod=…` endpoint returns the maturity amount for any combination of product / principal / term — handy for UI calculators.
+The `GET /v1/fixeddepositaccounts/calculate-fd-interest?principalAmount=…&annualInterestRate=…&tenureInMonths=…&interestCompoundingPeriodInMonths=…&interestPostingPeriodInMonths=…` endpoint returns the maturity amount for any combination of principal, rate and term — handy for UI calculators.
 
 Bulk download/upload templates exist for both account creation and transactions.
 
@@ -307,7 +307,7 @@ curl -k -u admin:password -H "$TENANT" -H "$HDR" \
 ```bash
 # 1. Preview maturity amount
 curl -k -u admin:password -H "$TENANT" \
-  'https://localhost:8443/fineract-provider/api/v1/fixeddepositaccounts/calculate-fd-interest?productId=2&principal=10000&depositPeriod=12&depositPeriodFrequencyId=2&locale=en'
+  'https://localhost:8443/fineract-provider/api/v1/fixeddepositaccounts/calculate-fd-interest?principalAmount=10000&annualInterestRate=6.5&tenureInMonths=12&interestCompoundingPeriodInMonths=3&interestPostingPeriodInMonths=12'
 
 # 2. Submit the FD application
 curl -k -u admin:password -H "$TENANT" -H "$HDR" \

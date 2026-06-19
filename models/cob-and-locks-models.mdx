@@ -21,15 +21,12 @@ The shared infrastructure lives in `fineract-cob` under `org.apache.fineract.cob
 
 ```mermaid
 erDiagram
-    m_loan ||--o| m_loan_account_locks : "loan_id"
-    m_loan ||--o| m_wc_loan_account_locks : "loan_id (working-capital)"
-    m_savings_account ||--o| m_savings_account_locks : "savings_id"
-    m_batch_business_steps ||--o{ m_batch_business_steps : "job_name (grouping)"
-    m_business_date ||--|| m_loan_account_locks : "lock_placed_on_cob_business_date"
+    m_loan ||--o| m_loan_account_locks : "loan_id (soft FK)"
+    m_loan ||--o| m_wc_loan_account_locks : "loan_id (working-capital, soft FK)"
+    m_savings_account ||--o| m_savings_account_locks : "savings_id (soft FK)"
 
     m_loan_account_locks {
-        bigint id PK
-        bigint loan_id FK
+        bigint loan_id PK
         bigint version
         varchar lock_owner
         datetime lock_placed_on
@@ -38,8 +35,7 @@ erDiagram
         text stacktrace
     }
     m_savings_account_locks {
-        bigint id PK
-        bigint savings_id FK
+        bigint savings_id PK
         bigint version
         varchar lock_owner
         datetime lock_placed_on
@@ -48,8 +44,8 @@ erDiagram
         text stacktrace
     }
     m_wc_loan_account_locks {
-        bigint id PK
-        bigint loan_id FK
+        bigint loan_id PK
+        bigint version
         varchar lock_owner
         date lock_placed_on_cob_business_date
     }
@@ -66,35 +62,35 @@ erDiagram
 ### `AccountLock` (abstract base)
 
 - **File:** `fineract-cob/src/main/java/org/apache/fineract/cob/domain/AccountLock.java`
-- **Table:** *abstract — subclasses define `@Table`*
-- **Primary key:** `Long id`
-- **Base class:** implements `Persistable<Long>`, `Serializable` (no JPA superclass annotation, but provides `@Id` + `@GeneratedValue` and the `isNew` lifecycle)
-- **Important fields:** `Long loanId`, `Long version` (`@Version` for optimistic locking on concurrent lock attempts), `LockOwner lockOwner` (enum, `@Enumerated(EnumType.STRING)` — values include `LOAN_COB_PARTITIONING`, `LOAN_INLINE_COB_PROCESSING`, `LOAN_COB_CHUNK_PROCESSING`), `OffsetDateTime lockPlacedOn`, `String error`, `String stacktrace`, `LocalDate lockPlacedOnCobBusinessDate`.
-- **Key relationships:** None at the JPA level — `loanId` is a soft reference to `m_loan.id`. The CRUD logic that uses these rows is in `LockingService` / `CustomLoanAccountLockRepository`.
+- **Table:** *abstract `@MappedSuperclass` — subclasses define `@Table`*
+- **Primary key:** `Long loanId` (the `loan_id` column is itself the `@Id` — there is no separate surrogate key)
+- **Base class:** implements `Persistable<Long>`, `Serializable`. Provides the `@Id` on `loan_id`, the `@Version` column, and a transient `isNew` flag flipped by `@PrePersist` / `@PostLoad`.
+- **Important fields:** `Long loanId` (`@Id`), `Long version` (`@Version` for optimistic locking on concurrent lock attempts), `LockOwner lockOwner` (enum, `@Enumerated(EnumType.STRING)` — values `LOAN_COB_CHUNK_PROCESSING`, `LOAN_INLINE_COB_PROCESSING`), `OffsetDateTime lockPlacedOn`, `String error`, `String stacktrace`, `LocalDate lockPlacedOnCobBusinessDate`.
+- **Key relationships:** None at the JPA level — `loanId` is a soft reference to `m_loan.id` but also serves as the primary key. The CRUD logic that uses these rows is in `LockingService` / `CustomLoanAccountLockRepository`.
 
 ### `LoanAccountLock`
 
 - **File:** `fineract-provider/src/main/java/org/apache/fineract/cob/domain/LoanAccountLock.java`
 - **Table:** `m_loan_account_locks`
-- **Primary key:** `Long id`
+- **Primary key:** `loan_id` (inherited from `AccountLock`)
 - **Base class:** `AccountLock`
-- **Important fields:** inherits all fields from `AccountLock`. Each row marks **one** loan as held by **one** lock owner for **one** COB business date. The row is upserted by the partitioner before COB processes the loan and deleted on successful completion (or kept with `error`/`stacktrace` populated on failure).
-- **Key relationships:** Soft FK to `m_loan` via `loan_id`. The pair `(loan_id, lock_owner)` is unique — `LockingService.applyLock(...)` enforces this through database constraints + the `@Version` column.
+- **Important fields:** inherits all fields from `AccountLock`. Each row marks **one** loan as held by **one** lock owner for **one** COB business date. The row is inserted by the worker before COB processes the loan and deleted on successful completion (or kept with `error`/`stacktrace` populated on failure).
+- **Key relationships:** Soft FK to `m_loan` via `loan_id` (which is also the PK). `LockingService.applyLock(...)` uses the `@Version` column + the PK uniqueness to prevent concurrent lock acquisitions.
 
 ### `SavingsAccountLock`
 
 - **File:** `fineract-savings/src/main/java/org/apache/fineract/cob/savings/SavingsAccountLock.java`
 - **Table:** `m_savings_account_locks`
-- **Primary key:** `Long id`
+- **Primary key:** `savings_id` (mapped as `@Id` directly on the `savingsId` field)
 - **Base class:** none — declared as a standalone JPA `@Entity` (does not extend `AccountLock`, but mirrors the same column layout).
-- **Important fields:** `Long savingsId`, `Long version`, `SavingsLockOwner lockOwner` (enum analogous to `LockOwner` for the savings COB), `OffsetDateTime lockPlacedOn`, `String error`, `String stacktrace`, `LocalDate lockPlacedOnCobBusinessDate`.
-- **Key relationships:** Soft FK to `m_savings_account.id` via `savings_id`. The savings COB uses an independent lock row even though the column shape matches the loan one.
+- **Important fields:** `Long savingsId` (`@Id`), `Long version` (`@Version`), `SavingsLockOwner lockOwner` (enum analogous to `LockOwner` for the savings COB), `OffsetDateTime lockPlacedOn`, `String error`, `String stacktrace`, `LocalDate lockPlacedOnCobBusinessDate`.
+- **Key relationships:** Soft FK to `m_savings_account.id` via `savings_id` (also the PK). The savings COB uses an independent lock row even though the column shape matches the loan one.
 
 ### `WorkingCapitalLoanAccountLock`
 
 - **File:** `fineract-working-capital-loan/src/main/java/org/apache/fineract/cob/domain/WorkingCapitalLoanAccountLock.java`
 - **Table:** `m_wc_loan_account_locks`
-- **Primary key:** `Long id`
+- **Primary key:** `loan_id` (inherited from `AccountLock`)
 - **Base class:** `AccountLock`
 - **Important fields:** inherits from `AccountLock`. Used by the working-capital-loan COB job (a separate batch with its own steps).
 - **Key relationships:** Soft FK to `m_loan.id` for working-capital loan rows.
@@ -111,10 +107,9 @@ erDiagram
 ### `LockOwner` (enum)
 
 - **File:** `fineract-cob/src/main/java/org/apache/fineract/cob/domain/LockOwner.java`
-- **Values:** `LOAN_COB_PARTITIONING`, `LOAN_INLINE_COB_PROCESSING`, `LOAN_COB_CHUNK_PROCESSING`.
+- **Values:** `LOAN_COB_CHUNK_PROCESSING`, `LOAN_INLINE_COB_PROCESSING`.
 - **Usage:** Stored as the string value in `lock_owner` (`@Enumerated(EnumType.STRING)`). Each owner reflects a different stage of the loan COB:
-  - `LOAN_COB_PARTITIONING` — claimed during the partitioner step; once partitioning is done it is replaced with the per-chunk owner.
-  - `LOAN_COB_CHUNK_PROCESSING` — held by the worker chunk processing the loan.
+  - `LOAN_COB_CHUNK_PROCESSING` — held by the worker chunk processing the loan during the batch run.
   - `LOAN_INLINE_COB_PROCESSING` — held when a *synchronous* online request triggers a "catch up" COB on a single loan before applying the user's change.
 
 ### `LockingService`
@@ -126,11 +121,11 @@ erDiagram
 ## How the locks are used
 
 1. The COB scheduled job starts and pulls its step list from `m_batch_business_steps WHERE job_name = 'LOAN_COB'`.
-2. The `LoanCOBPartitioner` step calls `LockingService.applyLock(loanIds, LOAN_COB_PARTITIONING)`, inserting one row per loan in `m_loan_account_locks` with `lock_placed_on_cob_business_date = (current business date)`.
-3. Each worker thread processes a chunk of loans; before mutating a loan it swaps the partitioning lock for `LOAN_COB_CHUNK_PROCESSING`.
+2. The `LoanCOBPartitioner` step builds the list of loans eligible for COB; each worker thread then calls `LockingService.applyLock(loanIds, LOAN_COB_CHUNK_PROCESSING)`, inserting one row per loan in `m_loan_account_locks` with `lock_placed_on_cob_business_date = (current business date)`.
+3. The worker thread then processes its chunk of loans under the held lock.
 4. If a step throws, the catch handler updates the row's `error` + `stacktrace` columns (instead of deleting it) so the operator can inspect the failure.
 5. On successful chunk completion the row is deleted, releasing the loan for online traffic.
-6. Online write services consult `CustomLoanAccountLockRepository.findNonBypassLockedLoans(...)` before mutating a loan; if a lock row exists for the loan they reject the request (or trigger Inline COB for one-shot catch-up).
+6. Online write services consult `CustomLoanAccountLockRepository.findNonBypassLockedLoans(...)` before mutating a loan; if a lock row exists for the loan they reject the request (or trigger Inline COB for one-shot catch-up under owner `LOAN_INLINE_COB_PROCESSING`).
 
 The `m_business_date` table (documented on the [portfolio shared models](/models/portfolio-shared-models) page) carries the `BUSINESS_DATE` and `COB_DATE` rows that govern which business date each lock is for and what date COB is advancing to.
 

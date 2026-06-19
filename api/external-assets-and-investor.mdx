@@ -17,7 +17,7 @@ All endpoints live under `/fineract-provider/api/v1` — see the [REST API Overv
 | POST | `/v1/external-asset-owners/search` | `ExternalAssetOwnersApiResource.java` | Free-text search across owners. |
 | POST | `/v1/external-asset-owners/transfers/loans/{loanId}` | `ExternalAssetOwnersApiResource.java` | Open a transfer request for one loan. |
 | POST | `/v1/external-asset-owners/transfers/loans/external-id/{loanExternalId}` | `ExternalAssetOwnersApiResource.java` | Same, addressed by external loan id. |
-| POST | `/v1/external-asset-owners/transfers/{id}?command=cancel\|active` | `ExternalAssetOwnersApiResource.java` | Cancel a pending transfer or trigger buyback. |
+| POST | `/v1/external-asset-owners/transfers/{id}?command=…` | `ExternalAssetOwnersApiResource.java` | Drive the transfer state machine — `cancel`, `sale`, `intermediarySale`, `buyBack`. |
 | POST | `/v1/external-asset-owners/transfers/external-id/{externalId}?command=…` | `ExternalAssetOwnersApiResource.java` | Same by external transfer id. |
 | GET | `/v1/external-asset-owners/transfers` | `ExternalAssetOwnersApiResource.java` | List transfers (by status, owner, loan). |
 | GET | `/v1/external-asset-owners/transfers/active-transfer?loanId=…` | `ExternalAssetOwnersApiResource.java` | Currently-active transfer for a loan. |
@@ -54,7 +54,7 @@ A transfer is a state machine: `PENDING` → `ACTIVE` (owner takes possession) �
 | --- | --- | --- | --- |
 | POST | `/v1/external-asset-owners/transfers/loans/{loanId}` | `transferRequestWithLoanId` | Sell loan to owner (or schedule buyback). |
 | POST | `/v1/external-asset-owners/transfers/loans/external-id/{loanExternalId}` | `transferRequestWithLoanExternalId` | Same by external loan id. |
-| POST | `/v1/external-asset-owners/transfers/{id}?command=…` | `transferRequestWithId` | `cancel` a pending or `active` to trigger buyback. |
+| POST | `/v1/external-asset-owners/transfers/{id}?command=…` | `transferRequestWithId` | Dispatch by command — `cancel`, `sale`, `intermediarySale`, `buyBack` (the dispatcher's full registry lives in `COMMAND_HANDLER_REGISTRY`). |
 | POST | `/v1/external-asset-owners/transfers/external-id/{externalId}?command=…` | `transferRequestWithId` | Same by external transfer id. |
 | GET | `/v1/external-asset-owners/transfers` | `getTransfers` | Search transfers. |
 | GET | `/v1/external-asset-owners/transfers/active-transfer` | `getActiveTransfer` | Currently-active transfer for `?loanId=` or `?externalLoanId=`. |
@@ -145,7 +145,7 @@ flowchart LR
   JE[GL postings via JournalEntriesApiResource]
   Event["ExternalAssetOwnerTransferBusinessEvent"]
   Sink["External sink (Kafka/RabbitMQ/ActiveMQ)<br/>gated by ExternalEventConfigurationApiResource"]
-  Buyback["POST /v1/external-asset-owners/transfers/{id}?command=active<br/>buyback flow"]
+  Buyback["POST /v1/external-asset-owners/transfers/{id}?command=buyBack<br/>buyback flow"]
   Eligibility --> Transfer
   Owner --> Transfer
   Transfer --> COBJob --> Active --> JE
@@ -161,10 +161,10 @@ A transfer row in `m_external_asset_owner_transfer` walks through the following 
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: POST /transfers/loans/{loanId}
+    [*] --> PENDING: POST /transfers/loans/{loanId}?command=sale
     PENDING --> CANCELLED: POST /transfers/{id}?command=cancel
     PENDING --> ACTIVE: COB job picks up settlement date
-    ACTIVE --> BUYBACK: POST /transfers/{id}?command=active (buyback)
+    ACTIVE --> BUYBACK: POST /transfers/{id}?command=buyBack
     ACTIVE --> DECLINED: validation rule fails post-effective-date
     BUYBACK --> [*]
     CANCELLED --> [*]
@@ -225,7 +225,7 @@ curl -k -u admin:password \
 curl -k -u admin:password \
   -H 'Fineract-Platform-TenantId: default' \
   -H 'Content-Type: application/json' \
-  -X POST 'https://localhost:8443/fineract-provider/api/v1/external-asset-owners/transfers/loans/911' \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/external-asset-owners/transfers/loans/911?command=sale' \
   -d '{
     "ownerExternalId": "INV-0042",
     "transferExternalId": "TRF-2024-04-001",
@@ -244,7 +244,7 @@ curl -k -u admin:password \
 curl -k -u admin:password \
   -H 'Fineract-Platform-TenantId: default' \
   -H 'Content-Type: application/json' \
-  -X POST 'https://localhost:8443/fineract-provider/api/v1/external-asset-owners/transfers/151?command=active' \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/external-asset-owners/transfers/151?command=buyBack' \
   -d '{ "settlementDate": "30 September 2024", "dateFormat": "dd MMMM yyyy", "locale": "en" }'
 ```
 

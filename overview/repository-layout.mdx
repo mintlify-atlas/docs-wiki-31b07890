@@ -61,7 +61,7 @@ fineract/
 ├── fineract-avro-schemas/                        ← Avro schemas for external events
 ├── fineract-client/                              ← Generated Java client SDK
 ├── fineract-client-feign/                        ← Generated Feign-based client SDK
-├── fineract-doc/                                 ← AsciiDoc end-user documentation
+├── fineract-doc/                                 ← Antora/AsciiDoc end-user documentation
 ├── fineract-db/                                  ← Bootstrap SQL & legacy schema files
 ├── fineract-provider/                            ← Spring Boot application: assembles everything
 ├── fineract-war/                                 ← WAR packaging for external Tomcat
@@ -143,49 +143,77 @@ domain that contributes COB steps.
 </CardGroup>
 
 <Card title="fineract-doc" icon="book">
-The AsciiDoc end-user / operator documentation rendered by `./gradlew :fineract-doc:asciidoctor`.
-This is not the same as the wiki you are reading — `fineract-doc` is the
-"book"; this wiki is the "code map".
+The Antora/AsciiDoc end-user / operator documentation. The Gradle module
+(`fineract-doc/build.gradle`) pulls in the AsciiDoctor JVM plugin and renders
+content under `fineract-doc/src/` and `fineract-doc/modules/`. This is not the
+same as the wiki you are reading — `fineract-doc` is the "book"; this wiki is
+the "code map".
 </Card>
 
 ## The command pipeline modules
 
-The write path runs through five tightly-related modules. They share the
-package prefix `org.apache.fineract.commands.*` and persist into
-`m_portfolio_command_source`.
+Fineract actually has **two** parallel write pipelines.
 
-| Module | Role |
-|--------|------|
-| `fineract-command` | Core `CommandSourceService`, `CommandWrapper`, `NewCommandSourceHandler`, maker-checker flow |
-| `fineract-command-test` | Test fixtures (handler stubs, command builders) shared by every domain's test suite |
-| `fineract-command-jdbc` | JDBC projections, idempotency key store |
-| `fineract-command-audit` | Periodic audit reports & projections on top of the command source table |
-| `fineract-command-async` | Asynchronous (worker-node) command execution, retries, polling |
-| `fineract-command-disruptor` | LMAX Disruptor implementation for very high-throughput write paths |
+The **legacy command-source pipeline** — used by every production write path
+today — lives entirely inside `fineract-core`, under the package prefix
+`org.apache.fineract.commands.*`. It persists every write into
+`m_portfolio_command_source`. The key classes are:
 
-See `overview/architecture` for the request-flow diagram these modules
-implement.
+- `fineract-core/.../commands/service/SynchronousCommandProcessingService.java`
+- `fineract-core/.../commands/service/CommandSourceService.java`
+- `fineract-core/.../commands/service/PortfolioCommandSourceWritePlatformServiceImpl.java`
+- `fineract-core/.../commands/service/CommandWrapperBuilder.java`
+- `fineract-core/.../commands/handler/NewCommandSourceHandler.java`
+- `fineract-core/.../commands/domain/CommandSource.java`,
+  `CommandSourceRepository.java`, `CommandWrapper.java`
+
+The **new command pipeline** introduced under FINERACT-2169 ships as the
+`fineract-command*` family of modules with package prefix
+`org.apache.fineract.command.*` (singular). It runs independently next to the
+legacy pipeline and is opt-in per service.
+
+| Module | Role | Key classes |
+|--------|------|-------------|
+| `fineract-command` | Core SPI + default sync dispatcher | `command/core/CommandDispatcher.java`, `CommandHandler.java`, `CommandHandlerManager.java`, `CommandStore.java`, `command/implementation/SynchronousCommandDispatcher.java`, `command/implementation/DefaultCommandHandlerManager.java` |
+| `fineract-command-test` | Test fixtures (`DummyCommand`, `DummyApiController`, `DummyCommandHandler`) shared by every command-pipeline test suite | `command/test/sample/` |
+| `fineract-command-jdbc` | JDBC-backed command store | `command/jdbc/store/JdbcCommandStore.java`, `command/jdbc/store/domain/CommandEntity.java`, `CommandRepository.java` |
+| `fineract-command-audit` | Audit-hook implementations | `command/audit/hook/AuditCommandHookBefore.java`, `AuditCommandHookAfter.java`, `AuditCommandHookError.java` |
+| `fineract-command-async` | Async dispatcher | `command/async/implementation/AsyncCommandDispatcher.java` |
+| `fineract-command-disruptor` | LMAX Disruptor implementation for hot paths | `command/disruptor/implementation/DisruptorCommandDispatcher.java` |
+
+See `overview/architecture` for the request-flow diagram and `fineract-command/README.md`
+for the motivation behind the redesign.
 
 ## Domain (portfolio) modules
 
-Every portfolio module follows the same conventional sub-package layout:
+Every portfolio module follows roughly the same conventional sub-package
+layout, although not every sub-package is present in every module:
 
 ```text
 <module>/src/main/java/org/apache/fineract/<area>/<feature>/
-├── api/             ← JAX-RS resources (*ApiResource.java) + OpenAPI annotations
+├── api/             ← JAX-RS resources (*ApiResource.java) + OpenAPI Swagger annotations
 ├── data/            ← DTOs returned by *ReadPlatformService (read model)
 ├── domain/          ← JPA entities, aggregate roots, repositories
-├── handler/         ← CommandSourceHandler implementations (@CommandType)
-├── service/         ← *ReadPlatformService + *WritePlatformService(JpaRepository)Impl
-├── serialization/   ← Gson JsonCommand parsers + DataValidator's
-├── jobs/            ← Spring Batch step / tasklet definitions
+├── handler/         ← NewCommandSourceHandler implementations (annotated @CommandType)
+├── service/         ← *ReadPlatformService + *WritePlatformService(JpaRepositoryImpl)
+├── serialization/   ← Gson JsonCommand parsers + DataValidatorBuilder usages
+├── jobs/ or cob/    ← Spring Batch step / tasklet / business-step definitions
 ├── exception/       ← PlatformException subclasses (HTTP error mappers)
 └── starter/         ← Spring @Configuration that wires the module's beans
 ```
 
-The `starter` package is the integration seam — `fineract-provider`
-component-scans every module, but the actual bean wiring (e.g. choosing which
-`Impl` to bind) lives in each module's `*Configuration` class.
+A non-trivial number of `*ApiResource` and `*WritePlatformServiceJpaRepositoryImpl`
+classes actually live in `fineract-provider` rather than in the domain module
+that owns the corresponding `WritePlatformService` interface (for example
+`LoanWritePlatformService` is declared in `fineract-loan` but
+`LoanWritePlatformServiceJpaRepositoryImpl` lives in `fineract-provider`).
+This is a historical layering artefact — `fineract-provider` is still the
+canonical assembly module.
+
+The `starter` package, where it exists (e.g. `fineract-command/.../command/starter/CommandAutoConfiguration.java`),
+is the integration seam — `fineract-provider`
+component-scans `org.apache.fineract.**`, but the actual bean wiring (e.g.
+choosing which `Impl` to bind) lives in each module's `*Configuration` class.
 
 ### Loan products
 
@@ -293,11 +321,13 @@ HTTP-client.
 ## Database & migrations
 
 <Card title="fineract-db" icon="database">
-Holds bootstrap SQL (`mifospltaform-tenants-first-time-install.sql`), legacy
-schema files (`old-schema-files/`) and multi-tenant demo backups. The
-runtime migrations themselves are Liquibase XML in
-`fineract-provider/src/main/resources/db/` and `fineract-core`'s
-`db/changelog` resources.
+Holds bootstrap SQL (`fineract-db/mifospltaform-tenants-first-time-install.sql`,
+note the historic typo "platform" → "pltaform"), legacy schema files
+(`fineract-db/old-schema-files/`) and multi-tenant demo backups
+(`fineract-db/multi-tenant-demo-backups/`). The runtime migrations themselves
+are Liquibase XML rooted at
+`fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml`
+with `tenant/` and `tenant-store/` sub-changelogs.
 </Card>
 
 ## Docker, Kubernetes and ops

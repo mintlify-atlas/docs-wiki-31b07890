@@ -574,6 +574,21 @@ sequenceDiagram
   The provider stack publishes `HookEvent` to the webhook subsystem
   (`fineract-provider/.../infrastructure/hooks/`). The new SPI's
   `CommandHookBefore/After/Error` are in-process Spring listeners.
+- **Resilience4j retry instances** — `RetryConfigurationAssembler` registers
+  three named retries with `RetryRegistry`: `executeCommand` (used by
+  `retryWrapper(...)` around the outer `executeCommand`), `batchRetry` (used
+  inside an enclosing batch transaction so a `BatchExecutionException` cause
+  is inspected), and `commandResultPersistence` (used to retry the
+  `setStatus(PROCESSED) → saveResultSameTransaction(...)` step). All three
+  share the `fineract.retry.instances.executeCommand.*` properties
+  (`max-attempts`, `wait-duration`, `enable-exponential-backoff`,
+  `exponential-backoff-multiplier`, `retryExceptions`) from
+  `FineractProperties.RetryProperties`, with `executeCommand` retrying the
+  configured `retryExceptions` (default includes
+  `OptimisticLockException`, `ConcurrencyFailureException`,
+  `IdempotentCommandProcessUnderProcessingException`) and
+  `commandResultPersistence` retrying any `RuntimeException` except
+  `CommandResultPersistenceException`.
 
 ## Where to read more
 

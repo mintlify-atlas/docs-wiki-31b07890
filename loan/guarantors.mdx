@@ -153,10 +153,8 @@ The mutating endpoints follow Fineract's command pattern:
 @Produces(MediaType.APPLICATION_JSON)
 public CommandProcessingResult createGuarantor(@PathParam("loanId") final Long loanId,
         final GuarantorsRequest guarantorsRequest) {
-    final CommandWrapper commandRequest = new CommandWrapperBuilder()
-            .createGuarantor(loanId)
-            .withJson(GuarantorsRequestSerializer.serialize(guarantorsRequest))
-            .build();
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().createGuarantor(loanId)
+            .withJson(apiJsonSerializerService.serialize(guarantorsRequest)).build();
     return this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
 }
 ```
@@ -193,8 +191,8 @@ sequenceDiagram
 
     Client->>API: POST /v1/loans/{id}/guarantors (savingsId, amount)
     API->>Write: createGuarantor command
-    Write->>Domain: assistGuarantorFromSavings()
-    Domain->>Sav: holdAmount(amount)
+    Write->>Domain: assignGuarantor(fundingDetails)
+    Domain->>Sav: savingsAccount.holdFunds(amount)
     Sav-->>Domain: SavingsAccountTransaction (HOLD)
     Domain->>Write: new GuarantorFundingDetails ACTIVE\nGuarantorFundingTransaction
     Write-->>API: CommandProcessingResult
@@ -203,10 +201,10 @@ sequenceDiagram
 The write platform service is wired in
 `fineract-provider/.../guarantor/service/GuarantorWritePlatformServiceJpaRepositoryIImpl.java`
 and delegates the savings interaction to
-`GuarantorDomainServiceImpl`, which uses
-`SavingsAccountDomainService.holdAmount(...)` to create a transaction of type *HOLD* on the
-savings account. The resulting savings transaction is captured by a
-`GuarantorFundingTransaction` row so that the hold and the funding details stay in lock-step.
+`GuarantorDomainServiceImpl`, which calls `SavingsAccount.holdFunds(amount)` directly to
+place a *HOLD* transaction on the savings account. The resulting savings transaction is
+captured by a `GuarantorFundingTransaction` row so that the hold and the funding details
+stay in lock-step.
 
 ### Validation
 
@@ -225,14 +223,15 @@ savings account. The resulting savings transaction is captured by a
 
 Two domain hooks in `GuarantorDomainServiceImpl` keep the savings hold in step with the loan:
 
-- **`releaseGuarantorFunds(loan)`** is fired when the loan closes (full repayment, write-off
-  or undo). Each `ACTIVE` `GuarantorFundingDetails` is moved to `COMPLETED`, the hold on the
-  savings account is released using `SavingsAccountDomainService.releaseAmount(...)`, and a
-  release-type `GuarantorFundingTransaction` is recorded.
-- **`transferFundsFromGuarantor(loan, amountToRecover)`** is fired when a charge-off, NPA flag
-  or write-off requires recovery from the guarantor. The held amount is transferred onto the
-  loan (typically as a repayment); `amountTransfered` and `amountRemaining` on the funding row
-  are updated accordingly.
+- **`releaseGuarantorFunds(LoanTransaction)`** is fired when the loan closes (full repayment,
+  write-off or undo of the closing transaction). Each `ACTIVE` `GuarantorFundingDetails` is
+  moved to `COMPLETED` and the hold on the savings account is released, with a release-type
+  `GuarantorFundingTransaction` recorded.
+- **`transferFundsFromGuarantor(Loan)`** is fired when a write-off requires recovery from the
+  guarantor. For each `ACTIVE` funding row it computes a `remainingAmount` (pro-rated against
+  the guarantee total when the guarantee exceeds principal) and books an
+  `AccountTransferType.LOAN_REPAYMENT` transfer from the guarantor's savings to the loan;
+  `amountTransfered` and `amountRemaining` on the funding row are updated accordingly.
 
 ```mermaid
 stateDiagram-v2

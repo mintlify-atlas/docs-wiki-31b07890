@@ -38,7 +38,7 @@ This page lists the most important calls per resource and points at the source f
 | GET | `/v1/centers` | `CentersApiResource.java` | Search centres (groups-of-groups). |
 | POST | `/v1/centers/{centerId}?command=…` | `CentersApiResource.java` | Activate, close, generateCollectionSheet. |
 | GET | `/v1/grouplevels` | `GroupsLevelApiResource.java` | The configured hierarchy levels (Centre → Group → Sub-group …). |
-| POST | `/v1/v2/clients/search` | `ClientSearchV2ApiResource.java` | Free-text search through the new v2 client-search service. |
+| POST | `/v2/clients/search` | `ClientSearchV2ApiResource.java` | Free-text search through the new v2 client-search service (note: `/v2/...`, not `/v1/...`). |
 
 Every method on every resource is listed alongside its `@Path` and Swagger `@Operation` annotation in the source file — `grep -n '@Path\|@Operation' <file>` is the canonical index.
 

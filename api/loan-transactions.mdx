@@ -17,7 +17,7 @@ All endpoints mount under `/fineract-provider/api/v1` — see the [REST API Over
 | GET | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | One transaction (numeric ids). |
 | GET | `/v1/loans/{loanId}/transactions/external-id/{externalTransactionId}` | `LoanTransactionsApiResource.java` | One transaction (external txn id). |
 | POST | `/v1/loans/{loanId}/transactions?command=…` | `LoanTransactionsApiResource.java` | Execute a transaction. The `?command=` value picks the handler. |
-| POST | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | Adjust an existing transaction (`?command=undo`, `chargeback`, `chargeAdjustment`). |
+| POST | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | Adjust an existing transaction. Recognised `?command=` values are `chargeback`, `capitalizedIncomeAdjustment`, `buyDownFeeAdjustment`, `interestRefund`; any other value (or no command) falls through to a generic `adjustTransaction` (reverse + repost). |
 | PUT | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | Undo a waive-charge transaction. |
 | GET | `/v1/loans/{loanId}/transactions/reage-preview` | `LoanTransactionsApiResource.java` | Preview the schedule after a re-age, without persisting. |
 | GET | `/v1/loans/{loanId}/transactions/reamortization-preview` | `LoanTransactionsApiResource.java` | Preview the schedule after a re-amortize. |
@@ -68,15 +68,27 @@ This is the single most overloaded resource in the platform. The POST handler ac
 | `down-payment` | `DownPaymentLoanCommandHandler` | `DOWN_PAYMENT`. |
 | `accrual` | (manual periodic accrual) | `ACCRUAL`. |
 | `reAge` | `ReAgeLoanCommandHandler` | Schedule re-age (no money). |
+| `undoReAge` | `UndoReAgeLoanCommandHandler` | Undo a re-age. |
 | `reAmortize` | `ReAmortizeLoanCommandHandler` | Schedule re-amortise (no money). |
+| `undoReAmortize` | `UndoReAmortizeLoanCommandHandler` | Undo a re-amortize. |
+| `chargeOff` | `ChargeOffLoanCommandHandler` | Mark loan as charged-off (`CHARGE_OFF` transaction). |
+| `undoChargeOff` | `UndoChargeOffLoanCommandHandler` | Reverse a charge-off. |
+| `undowriteoff` | `UndoWriteOffLoanCommandHandler` | Reverse a previous write-off. |
+| `foreclosure` | `ForeclosureLoanCommandHandler` | Foreclose the loan (full prepayment + close). |
+| `capitalizedIncome` | (progressive-loan handler) | `CAPITALIZED_INCOME` transaction. |
+| `buyDownFee` | (progressive-loan handler) | `BUY_DOWN_FEE` transaction. |
 
 The adjust handler (POST against an existing transaction id) accepts:
 
 | `?command=` on `{transactionId}` | Effect |
 | --- | --- |
-| `undo` | Reverses the transaction. The reversal is itself written as a separate, audit-trail-preserving row with `is_reversed=true`. |
-| `chargeback` | Splits the transaction into a chargeback. |
-| `chargeAdjustment` | Apply a charge adjustment against a specific transaction. |
+| `chargeback` | Splits the transaction into a chargeback (`CHARGEBACK_TRANSACTION_COMMAND`). |
+| `capitalizedIncomeAdjustment` | Adjust a capitalized-income transaction (progressive loan). |
+| `buyDownFeeAdjustment` | Adjust a buy-down-fee transaction (progressive loan). |
+| `interestRefund` | Issue a manual interest refund tied to the existing transaction. |
+| *(absent or any other value)* | Falls through to the generic `adjustTransaction` handler, which reverses the original (`is_reversed=true`) and reposts. |
+
+Add to that the closely-related primary-write commands that produce **new** reversal-style rows from the main `POST /v1/loans/{loanId}/transactions?command=…` endpoint: `undowriteoff`, `foreclosure`, `prepayLoan`, `refundbycash`, `refundbytransfer`, plus the charge-off pair (`chargeoff` / `undochargeoff`).
 
 ### Symmetry: external-id paths
 
@@ -86,9 +98,9 @@ Every POST and GET above has four URL shapes — `{loanId}`/`external-id/{loanEx
 
 `GET /v1/loans/{loanId}/transactions/reage-preview` and `/reamortization-preview` are read-only — they call the schedule generator with the same parameters that a `?command=reAge` / `reAmortize` POST would use, return the new schedule, and **do not** persist anything. The UI uses them so the credit officer can confirm before committing.
 
-### Searching transactions
+### Listing and filtering transactions
 
-The resource also publishes the loan-transactions search endpoints — `GET /v1/loans/{loanId}/transactions/search` and `POST /v1/loans/{loanId}/transactions/query` (advanced JSON predicate). They are paginated and used heavily by the COB reconciliation UI.
+The `GET /v1/loans/{loanId}/transactions` endpoint is paged. It accepts an `excludedTypes` query parameter (comma-separated enum values from `LoanTransactionApiConstants.TransactionType` — e.g. `disbursement,repayment,accrual`, see the `transactionTypeFromParam` switch in the resource for the full enum). Standard Spring `Pageable` parameters (`page`, `size`, `sort=…`) apply.
 
 ## `LoanChargesApiResource`
 
@@ -237,31 +249,6 @@ The permission catalog for this domain (`m_permission`):
 | `READ_POSTDATEDCHECKS`, `UPDATE_POSTDATEDCHECKS`, `DELETE_POSTDATEDCHECKS` | `RepaymentWithPostDatedChecksApiResource`. |
 
 Maker-checker can be turned on per permission via `PermissionsApiResource` (see [Security & Users](/api/security-and-users)).
-
-## Search and advanced query payloads
-
-Both `GET /v1/loans/{loanId}/transactions/search` and `POST /v1/loans/{loanId}/transactions/query` accept the same filter primitives. The `search` form pushes them through query parameters (`?fromDate=…&toDate=…&transactionTypes=2,17,21`); the `query` form takes a JSON predicate:
-
-```json
-{
-  "request": {
-    "columnFilters": [
-      { "column": "transaction_type_enum", "filters": [
-          { "operator": "IN", "values": ["2", "17", "21"] }
-      ]},
-      { "column": "transaction_date", "filters": [
-          { "operator": "GTE", "values": ["2024-01-01"] },
-          { "operator": "LT",  "values": ["2024-04-01"] }
-      ]}
-    ],
-    "resultsAreaColumnList": [ "id", "transaction_type_enum", "amount", "transaction_date" ],
-    "paging": { "pageSize": 50, "pageNo": 0 },
-    "sortOrder": [ { "column": "transaction_date", "direction": "DESC" } ]
-  }
-}
-```
-
-The same structure is supported on the savings counterpart.
 
 ## Worked example — repay and reconcile
 

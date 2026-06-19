@@ -344,14 +344,14 @@ Two validators sit between JSON in and entity out:
 
 Both live in `fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/data/`.
 
-A semantic validator also runs inside the entity:
+A semantic validator runs on the entity tree — defined on `FixedDepositProduct` and re-used by `SavingsAccount` (the savings-account variant lives at `SavingsAccount.validateInterestPostingAndCompoundingPeriodTypes`):
 
 ```java
-// SavingsProduct.java :: validateInterestPostingAndCompoundingPeriodTypes(...)
+// FixedDepositProduct.java :: validateInterestPostingAndCompoundingPeriodTypes(...)
 // Rejects e.g. monthly compounding + daily posting.
 ```
 
-This guarantees the invariants that the [interest engine](/savings/interest-posting-and-compounding) relies on.
+`SavingsProduct.update(JsonCommand)` calls into the same validation path indirectly through the data validators; the rule itself is enforced by the entity-level method above. This guarantees the invariants that the [interest engine](/savings/interest-posting-and-compounding) relies on.
 
 ## Source paths
 

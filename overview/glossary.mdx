@@ -34,8 +34,7 @@ report. Distinct from Pentaho reports — these are stored in
 ### AppUser
 The platform user entity (login, hashed password, roles, office). Authentication
 maps the inbound credential to an `AppUser`.
-- Where:
-  `fineract-core/src/main/java/org/apache/fineract/useradministration/domain/AppUser.java`
+- Where: `fineract-core/src/main/java/org/apache/fineract/useradministration/domain/AppUser.java`
   (referenced from `fineract-security`).
 
 ### Avro schema
@@ -62,14 +61,17 @@ verified against the tenant's user table.
 The "operational" date Fineract is treating as today for COB purposes. Often
 behind the wall-clock if COB has not yet been run. Distinct from *system date*
 (see below).
-- Where: `BusinessDateType` enum and `BusinessDateService` in
-  `fineract-core/src/main/java/org/apache/fineract/infrastructure/businessdate/`.
+- Where: `BusinessDateType` enum at
+  `fineract-core/src/main/java/org/apache/fineract/infrastructure/businessdate/domain/BusinessDateType.java`,
+  with `BusinessDateReadPlatformService` / `BusinessDateWritePlatformService`
+  in `.../businessdate/service/`.
 
-### BusinessEventNotifier
+### BusinessEventNotifierService
 The in-process event bus that domain services publish to when an aggregate
 changes (loan approved, repayment posted, etc.). Listeners may persist an
 outbox row that is later pushed to Kafka/JMS.
-- Where: `fineract-core/src/main/java/org/apache/fineract/infrastructure/event/business/`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/infrastructure/event/business/service/BusinessEventNotifierService.java`
+  (impl: `BusinessEventNotifierServiceImpl.java`).
 
 ### Business step (COB step)
 A single unit of end-of-day work executed by the COB job — e.g. "apply
@@ -83,8 +85,8 @@ penalty for overdue", "accrue interest". Steps are configured in
 ### Cash vs. accrual basis
 See *Accrual accounting*. A product can be configured `NONE` (no accounting),
 `CASH_BASED`, `ACCRUAL_PERIODIC`, or `ACCRUAL_UPFRONT`.
-- Where: enum `AccountingRuleType` in
-  `fineract-accounting/.../common/`.
+- Where: enum `AccountingRuleType` at
+  `fineract-core/src/main/java/org/apache/fineract/accounting/common/AccountingRuleType.java`.
 
 ### Charge
 A monetary item attached to a loan or savings account: an upfront fee, a
@@ -103,7 +105,8 @@ In Fineract terminology:
 ### Checker
 The second user in a maker-checker workflow — the one who approves a
 command another user submitted.
-- Where: `fineract-command/.../service/PortfolioCommandSourceWritePlatformService.approveEntry`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/commands/service/PortfolioCommandSourceWritePlatformServiceImpl.java`
+  (the `approveEntry` method).
 
 ### Client
 A natural-person customer in Fineract. (Not to be confused with the generated
@@ -123,16 +126,19 @@ values are code values, editable per tenant without a release.
 - Where: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/codes/`.
 
 ### Command source
-The persisted record of an attempted write through Fineract's command
+The persisted record of an attempted write through Fineract's legacy command
 pipeline. Stored in `m_portfolio_command_source` with the full JSON payload,
 acting user, entity ids, and processing result.
-- Where: `fineract-command/.../domain/CommandSource.java`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/commands/domain/CommandSource.java`
+  (the pipeline lives in `fineract-core`, not in the `fineract-command*`
+  modules, which are the FINERACT-2169 replacement under package
+  `org.apache.fineract.command.*` singular).
 
 ### CommandWrapper
 The immutable request object handed to the command pipeline by an
 `*ApiResource`. Carries entity name, action, JSON, ids.
-- Where: `fineract-command/.../domain/CommandWrapper.java` +
-  `CommandWrapperBuilder`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/commands/domain/CommandWrapper.java`
+  + `fineract-core/.../commands/service/CommandWrapperBuilder.java`.
 
 ### Configuration (global)
 Tenant-wide toggle stored in `c_configuration` — e.g. "allow back-dated
@@ -228,12 +234,16 @@ external events — hooks are tenant-configured HTTP callbacks.
 The `Idempotency-Key` HTTP header. Hashed and stored on
 `m_portfolio_command_source` so duplicate retries return the original result
 instead of executing a second time.
-- Where: `fineract-command-jdbc/`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/commands/service/IdempotencyKeyResolver.java`
+  + `IdempotencyKeyGenerator.java`, with the filter logic in
+  `fineract-core/.../infrastructure/core/filters/IdempotencyStoreFilter.java`
+  and `IdempotencyStoreBatchFilter.java`.
 
 ### Instance mode
 Which subset of Fineract a node runs: read, write, batch-manager,
 batch-worker. See `overview/runtime-and-deployment`.
-- Where: `fineract-provider/.../infrastructure/instancemode/`
+- Where: `fineract-core/src/main/java/org/apache/fineract/infrastructure/instancemode/`
+  + `fineract-provider/src/main/java/org/apache/fineract/infrastructure/instancemode/api/`
   + the `fineract.mode.*` properties.
 
 ### Interoperation
@@ -246,7 +256,9 @@ Digital Financial Service Provider in cross-network transfers.
 ### Jersey
 The JAX-RS implementation that hosts every `*ApiResource` in Fineract. The
 servlet is registered at `/api/v1/*`.
-- Where: `fineract-provider/.../infrastructure/jersey/`.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/jersey/`
+  plus `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/jersey/`
+  and `fineract-core/.../infrastructure/core/api/jersey/`.
 
 ### JLG (Joint Liability Group)
 A solidarity-lending group where members co-guarantee each other's individual
@@ -298,7 +310,8 @@ A workflow where one user (the *maker*) submits a write command and a second
 user (the *checker*) must approve it before it executes. Implemented natively
 by the command pipeline — the maker's command is persisted in
 `awaitingApproval` state.
-- Where: `fineract-command/.../service/PortfolioCommandSourceWritePlatformService`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/commands/service/PortfolioCommandSourceWritePlatformServiceImpl.java`
+  (`approveEntry`, `rejectEntry`, `deleteEntry`).
 
 ### MIX (Microfinance Information eXchange)
 Industry-standard reporting taxonomy for microfinance institutions. Fineract
@@ -314,7 +327,9 @@ interoperable payments. Fineract integrates as a DFSP — see *Interoperation*.
 Fineract runs many institutions out of one process, each with its own
 database. The *tenant store* lists all tenants; each tenant has its own
 schema.
-- Where: `fineract-core/.../service/tenant/DataSourcePerTenantService.java`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/service/tenant/JdbcTenantDetailsService.java`
+  + `fineract-core/.../infrastructure/core/service/database/TomcatJdbcDataSourcePerTenantService.java`
+  + `RoutingDataSource.java` (in the same `database/` package).
 
 ## N
 
@@ -419,7 +434,8 @@ when COB has not yet been run for the operational day.
 ### Tenant
 One financial institution running on this Fineract installation. Has its own
 database, its own `AppUser`s, its own configurations.
-- Where: `FineractPlatformTenant` in `fineract-core/.../core/domain/`.
+- Where: `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/domain/FineractPlatformTenant.java`
+  + `FineractPlatformTenantConnection.java`.
 
 ### Tenant store
 The *meta* database — usually named `fineract_tenants` — that lists every

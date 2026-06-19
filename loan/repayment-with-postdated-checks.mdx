@@ -109,9 +109,9 @@ public interface PostDatedChecksStatus {
 ```
 
 The status column starts at `PENDING (0)`. When a repayment is recorded against the linked
-installment the assembler moves the cheque to `PAID (2)`; when the cheque is returned
-unpaid the bounce flow sets it to `BOUNCED (1)` and creates a *new* PENDING row capturing
-the replacement cheque.
+installment, `LoanAccountDomainServiceJpa` looks up the matching cheque and flips its status
+to `PAID (2)`; when the cheque is returned unpaid the bounce flow sets the original row to
+`BOUNCED (1)` and creates a *new* PENDING row capturing the replacement cheque.
 
 ```mermaid
 stateDiagram-v2
@@ -140,7 +140,8 @@ public String getPostDatedCheck(
 }
 ```
 
-When a loan repayment posts on the installment, `RepaymentWithPostDatedChecksAssembler`
+When a loan repayment posts on the installment, `LoanAccountDomainServiceJpa`
+(`fineract-provider/.../portfolio/loanaccount/domain/LoanAccountDomainServiceJpa.java`)
 flips the cheque's status to `POST_DATED_CHECKS_PAID`. Conversely, if the user starts the
 bounce workflow, the original cheque is moved to `BOUNCED` and a new PENDING cheque is added
 to take its place for the same installment.

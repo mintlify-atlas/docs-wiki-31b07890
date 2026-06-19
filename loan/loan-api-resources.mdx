@@ -45,13 +45,13 @@ delinquency tags / actions, approved-amount adjustments and external-id mirror e
 `fineract-provider/.../portfolio/loanaccount/api/BulkLoansApiResource.java` — base path
 **`/v1/loans/loanreassignment`**.
 
-Reassigns loan officers across many loans in one call (with optional date), backed by
-`bulkLoanReassignment` commands.
+Reassigns loan officers across many loans in one call (with optional date), backed by the
+`assignLoanOfficersInBulk` command.
 
 ### `LoanScheduleApiResource`
 
 `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanScheduleApiResource.java`
-— base path **`/v1/loans/{loanId}/schedule}`**.
+— base path **`/v1/loans/{loanId}/schedule`**.
 
 Schedule-only endpoints used to update or recalculate the schedule on an active loan via
 `?command=updateLoanSchedule`. Reads return a `LoanScheduleData` projection.
@@ -132,7 +132,8 @@ Commands include `createInterestPause`, `updateInterestPause`, `deleteInterestPa
 ### `LoanCapitalizedIncomeApiResource`
 
 `fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanCapitalizedIncomeApiResource.java`
-— base path **`/v1/loans`**, sub-paths under `/{loanId}/capitalized-income`.
+— base path **`/v1/loans`**, sub-paths under `/{loanId}/capitalized-incomes` and
+`/{loanId}/deferredincome`.
 
 Posts capitalised income amounts and their adjustments on **progressive loan** schedules,
 adding a new bucket of capital to the next installment.
@@ -140,7 +141,7 @@ adding a new bucket of capital to the next installment.
 ### `LoanBuyDownFeeApiResource`
 
 `fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanBuyDownFeeApiResource.java`
-— base path **`/v1/loans`**, sub-paths under `/{loanId}/buy-down-fee`.
+— base path **`/v1/loans`**, sub-paths under `/{loanId}/buydown-fees`.
 
 Records buy-down (rate buy-down) fees against a progressive loan – conceptually similar to a
 capitalised origination fee.

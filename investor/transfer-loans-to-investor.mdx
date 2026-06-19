@@ -261,8 +261,8 @@ For pending transfers, `LoanTransferabilityServiceImpl.isTransferable(loan, tran
 
 If declined, `getDeclinedSubStatus(loan)` returns:
 
-- `BALANCE_ZERO` when `totalOutstanding == 0`
-- `BALANCE_NEGATIVE` when `totalOutstanding < 0` (loan is overpaid)
+- `BALANCE_NEGATIVE` when `loan.getTotalOverpaid() > 0` (loan is overpaid).
+- `BALANCE_ZERO` otherwise (total outstanding fell to zero before settlement).
 
 The DECLINED row records this, the loan stays bank-owned, no GL postings happen, and a `LoanOwnershipTransferBusinessEvent` is fired so downstream systems learn the sale was rejected.
 

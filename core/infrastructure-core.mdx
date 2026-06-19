@@ -152,7 +152,7 @@ REST API plumbing shared by every API resource.
 | `ApiFacingEnum` | Marker for enums that have an `id` + `code` + `value` representation in JSON. |
 | `MutableUriInfo` | Wrapper around `UriInfo` allowing query-parameter mutation (used by the Batch API). |
 | `*Adapter` classes | JAXB / Gson adapters for `LocalDate`, `LocalDateTime`, `LocalTime`, `OffsetDateTime`, `MonthDay`, `ExternalId`. |
-| `IdTypeResolver` | Jackson polymorphic type resolver for `id`-tagged payloads. |
+| `IdTypeResolver` | Abstract resolver with an `IdType` enum (`ID`, `EXTERNAL_ID`, `SHORT_NAME`) used by API resources that let callers identify a resource by any of the three. |
 | `ParameterListExclusionStrategy` / `ParameterListInclusionStrategy` | Gson strategies used by `DefaultToApiJsonSerializer` to honour the `?fields=` query parameter. |
 
 Sub-folder `api/jersey/` contains Jersey-specific `ExceptionMapper` and provider wiring.

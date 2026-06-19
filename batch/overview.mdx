@@ -182,8 +182,9 @@ The dependency tree built by
 [`ResolutionHelper.buildNodesTree`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/service/ResolutionHelper.java)
 is a single linear chain: `1 → 2 → 3 → 4`. The dispatcher walks the chain
 depth-first; if any node returns a non-200 status, the remaining children
-are skipped and a synthetic `409 Conflict` response is emitted in their
-place.
+are skipped and a synthetic response is emitted in their place carrying the
+parent's failure status code and a `"Parent request with id N was
+erroneous!"` body.
 
 ## Dispatch sequence
 
@@ -262,7 +263,8 @@ strategies, both implemented in the same service:
   <Tab title="enclosingTransaction=false (default)">
     Each root sub-request commits independently. A failure in sub-request 3
     does not roll back the writes from 1 and 2. Children of a failing parent
-    are still short-circuited — they receive a `409` body of
+    are still short-circuited — they receive a response with the parent's
+    status code and a body of
     `"Parent request with id N was erroneous!"` — but every other root
     branch runs.
 

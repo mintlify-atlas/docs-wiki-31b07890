@@ -459,6 +459,6 @@ fineract-mix/src/main/java/org/apache/fineract/mix/
 
 ## Related pages
 
-- [Reporting overview](/reporting/overview) — where the MIX engine sits relative to stretchy and Pentaho reports.
+- [Reporting overview](/reporting/overview) — where the MIX engine sits relative to the stretchy SQL runner and the seeded (but currently unimplemented) Pentaho rows.
 - [Reports API and runner](/reporting/reports-api-and-runner) — the *other* report runner. MIX deliberately does not register with `ReportingProcessServiceProvider` because its output is XML, not tabular.
-- [Report mailing job](/reporting/report-mailing-job) — the scheduled email engine, which only knows how to handle stretchy/Pentaho output, not MIX.
+- [Report mailing job](/reporting/report-mailing-job) — the scheduled email engine, which only knows how to mail stretchy report output, not MIX XBRL.

@@ -143,7 +143,7 @@ erDiagram
 
 ### `DepositAccountRecurringDetail`
 
-- **File:** `fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/domain/DepositAccountRecurringDetail.java` (declared as `DepositAccountRecurringDetail`)
+- **File:** `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/domain/DepositAccountRecurringDetail.java`
 - **Table:** `m_deposit_account_recurring_detail`
 - **Primary key:** `Long id`
 - **Base class:** `AbstractPersistableCustom<Long>`
@@ -179,6 +179,6 @@ erDiagram
 
 `DepositAccountType`: SAVINGS_DEPOSIT (100), FIXED_DEPOSIT (200), RECURRING_DEPOSIT (300), CURRENT_DEPOSIT (400). Stored in `deposit_type_enum`.
 
-`SavingsAccountTransactionType` (commonly referenced): DEPOSIT (1), WITHDRAWAL (2), INTEREST_POSTING (3), WITHDRAWAL_FEE (4), ANNUAL_FEE (5), WAIVE_CHARGES (6), PAY_CHARGE (7), DIVIDEND_PAYOUT (8), INITIATE_TRANSFER (12), APPROVE_TRANSFER (13), WITHDRAW_TRANSFER (14), REJECT_TRANSFER (15), WRITTEN-OFF (16), OVERDRAFT_INTEREST (17), WITHHOLD_TAX (18), ESCHEAT (19), AMOUNT_HOLD (20), AMOUNT_RELEASE (21).
+`SavingsAccountTransactionType`: DEPOSIT (1), WITHDRAWAL (2), INTEREST_POSTING (3), WITHDRAWAL_FEE (4), ANNUAL_FEE (5), WAIVE_CHARGES (6), PAY_CHARGE (7), DIVIDEND_PAYOUT (8), ACCRUAL (10), INITIATE_TRANSFER (12), APPROVE_TRANSFER (13), WITHDRAW_TRANSFER (14), REJECT_TRANSFER (15), WRITTEN_OFF (16), OVERDRAFT_INTEREST (17), WITHHOLD_TAX (18), ESCHEAT (19), AMOUNT_HOLD (20), AMOUNT_RELEASE (21).
 
 Interest is computed in `SavingsAccount` itself (`postInterest`, `calculateInterestUsing`) using `SavingsCompoundingInterestPeriodType` and `SavingsPostingInterestPeriodType`.

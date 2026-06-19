@@ -108,35 +108,49 @@ total realisable collateral is the sum of `totalCollateral` for each
 
 ## Validation rules (loan-to-value)
 
-When a collateralised loan is submitted, approved or disbursed, the assembler in
-`fineract-provider/.../collateralmanagement/service/LoanCollateralAssembler.java` walks every
-pledge and asserts that the sum of computed collateral values is at least the loan's principal.
-If not, the writer throws:
+When a collateralised individual loan is disbursed, `LoanTransactionValidatorImpl`
+(`fineract-provider/.../loanaccount/serialization/LoanTransactionValidatorImpl.java`) walks
+every pledge and asserts that the sum of collateral values is at least the total disbursed
+amount. If not, it throws:
 
 ```java
-throw new LoanCollateralAmountNotSufficientException(loanPrincipal);
+final Set<LoanCollateralManagement> loanCollateralManagements = loan.getLoanCollateralManagements();
+if ((loanCollateralManagements != null && !loanCollateralManagements.isEmpty())
+        && loan.getLoanType().isIndividualAccount()) {
+    BigDecimal totalCollateral = collectTotalCollateral(loanCollateralManagements);
+    if (totalDisbursedAmount.compareTo(totalCollateral) > 0) {
+        throw new LoanCollateralAmountNotSufficientException(totalDisbursedAmount);
+    }
+}
 ```
 
 (see `fineract-provider/.../collateralmanagement/exception/LoanCollateralAmountNotSufficientException.java`).
-This is Fineract's enforced loan-to-value (LTV) ceiling: **principal ≤ Σ collateral value**.
-Other domain checks performed by the write service include:
+This is Fineract's enforced loan-to-value (LTV) ceiling for individual loans:
+**totalDisbursedAmount ≤ Σ collateral value**. Note the check is scoped to
+`loan.getLoanType().isIndividualAccount()`; group / JLG accounts are not gated this way.
 
-- Each pledged `clientCollateralManagement` must belong to the loan's client.
-- `quantity` must be > 0 and ≤ the quantity currently free on the client row (i.e. not already
-  pledged elsewhere).
-- A `LoanCollateralManagement` row cannot be deleted once `is_released = false` and the loan
-  is `ACTIVE`; the release must instead be processed via the dedicated transition.
-- A missing row throws `LoanCollateralManagementNotFoundException`
+Additional checks performed by `LoanCollateralAssembler.fromParsedJson(...)`:
+
+- Each pledged `clientCollateralId` is resolved via the client-collateral repository wrapper,
+  so an unknown id raises a not-found error.
+- The pledged `quantity` must leave a non-negative remainder on the client row
+  (`ClientCollateralManagement.quantity − pledged ≥ 0`); otherwise the assembler throws
+  `InvalidAmountOfCollateralQuantity(quantity)`.
+- Editing an existing pledge (id present in the payload) reapplies the same balance check
+  taking the previous pledged amount back into account first.
+- A missing row on `GET` / `DELETE` throws `LoanCollateralManagementNotFoundException`
   (`fineract-provider/.../collateralmanagement/exception/LoanCollateralManagementNotFoundException.java`).
 
 ```mermaid
 flowchart TD
-    A[Submit/approve/disburse loan] --> B[LoanCollateralAssembler]
-    B --> C[For each pledge:\nquantity > 0\nbelongs to client\nrow is not released]
-    C --> D[Sum collateralValue]
-    D --> E{Σ collateralValue ≥ principal?}
+    A[Submit/approve loan] --> B[LoanCollateralAssembler.fromParsedJson]
+    B --> C[For each pledge:\nresolve clientCollateralId\nclient.quantity - quantity >= 0]
+    C --> F[Persist LoanCollateralManagement rows]
+    F --> G[Disburse loan]
+    G --> H[LoanTransactionValidatorImpl]
+    H --> E{totalDisbursedAmount <= Σ collateralValue?}
     E -- no --> X[LoanCollateralAmountNotSufficientException]
-    E -- yes --> F[Persist LoanCollateralManagement rows]
+    E -- yes --> Y[Disbursement proceeds]
 ```
 
 ## REST API: `LoanCollateralManagementApiResource`

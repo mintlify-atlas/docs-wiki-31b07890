@@ -60,15 +60,19 @@ flowchart TB
     provider[fineract-provider]:::assembly
     war[fineract-war]:::assembly
 
-    %% Foundation
+    %% Foundation — note that fineract-core itself depends on
+    %% fineract-command, fineract-validation and fineract-avro-schemas;
+    %% the "old" command-source pipeline lives inside fineract-core.
+    core --> command
+    core --> validation
+    core --> avro
     security --> core
     cob --> core
     cob --> command
     cob --> validation
     cob --> avro
-    command --> core
 
-    %% Pipeline siblings
+    %% Pipeline siblings (the FINERACT-2169 redesign — independent of fineract-core)
     cmdjdbc --> command
     cmdaudit --> command
     cmdasync --> command
@@ -159,19 +163,27 @@ flowchart TB
 
 Five horizontal "tiers" emerge:
 
-1. **Foundation** — `fineract-core`, `fineract-validation`, `fineract-security`,
-   `fineract-avro-schemas`. No project dependencies outside this tier.
-2. **Pipeline** — `fineract-command` and its companions (`-jdbc`, `-audit`,
-   `-async`, `-disruptor`). All depend on `fineract-command`; `fineract-command`
-   depends only on `fineract-core`.
+1. **Foundation** — `fineract-validation`, `fineract-avro-schemas`,
+   `fineract-command`. None of these have any first-party project dependencies
+   (`fineract-command` only pulls in `fineract-command-test` and
+   `fineract-validation` as test deps). `fineract-core` is *built on top of*
+   these — it `implementation`-depends on `fineract-command`,
+   `fineract-validation` and `fineract-avro-schemas`. The legacy command-source
+   classes (`SynchronousCommandProcessingService`, `CommandSource`, …) live
+   inside `fineract-core`.
+2. **New-pipeline siblings** — `fineract-command-jdbc`, `fineract-command-audit`,
+   `fineract-command-async`, `fineract-command-disruptor`,
+   `fineract-command-test`. All depend on `fineract-command` only.
 3. **Cross-cutting domains** — `fineract-cob`, `fineract-tax`, `fineract-rates`,
    `fineract-charge`, `fineract-accounting`, `fineract-branch`,
-   `fineract-document`, `fineract-report`, `fineract-mix`.
+   `fineract-document`, `fineract-report`, `fineract-mix`,
+   `fineract-security`.
 4. **Product domains** — `fineract-loan`, `fineract-savings`,
    `fineract-progressive-loan`, `fineract-working-capital-loan`,
    `fineract-loan-origination`, `fineract-investor`.
 5. **Assembly** — `fineract-provider` pulls in nearly everything; `fineract-war`
-   only wraps `fineract-provider` for external servlet containers.
+   wraps `fineract-provider` (plus a curated list of domain modules) for
+   external servlet containers.
 
 <Tip>
 The graph is acyclic by construction. The Gradle build will fail loudly the
@@ -196,8 +208,9 @@ The root of every other module. Owns:
 
 ### `fineract-validation`
 
-No project dependencies. Pure validation primitives. Imported by `fineract-cob`
-and indirectly by every domain module via Spring component scanning.
+No first-party project dependencies. Pure validation primitives. Imported by
+`fineract-core`, `fineract-cob` and indirectly by every domain module via
+Spring component scanning.
 
 ### `fineract-security`
 
@@ -206,9 +219,10 @@ resource server, optional 2FA, CORS and HSTS.
 
 ### `fineract-avro-schemas`
 
-Houses Avro `.avsc` files for the external event contract. Many domain modules
-depend on it because their `event/` payload classes are generated from these
-schemas.
+Houses Avro `.avsc` files for the external event contract. `fineract-core`
+depends on it (the `ExternalEventProducer` SPI references generated event
+types), and many domain modules pull it in as well because their `event/`
+payload classes are generated from these schemas.
 
 ## Pipeline tier
 
@@ -219,19 +233,35 @@ flowchart LR
     command --> audit[fineract-command-audit]
     command --> async[fineract-command-async]
     command --> disruptor[fineract-command-disruptor]
-    command --> test[fineract-command-test]
+    command -.testImplementation.-> test[fineract-command-test]
+    jdbc -.testImplementation.-> test
+    audit -.testImplementation.-> test
+    async -.testImplementation.-> test
+    disruptor -.testImplementation.-> test
 ```
 
-`fineract-command` is the pipeline's heart — `CommandSourceService`,
-`NewCommandSourceHandler`, `CommandWrapper`, `CommandSource` entity.
-The companion modules each plug *into* the pipeline:
+The `fineract-command*` modules are the new (FINERACT-2169) command pipeline
+under package prefix `org.apache.fineract.command.*`:
 
-- `fineract-command-jdbc` — JDBC projections and idempotency-key store.
-- `fineract-command-audit` — periodic audit reports.
-- `fineract-command-async` — asynchronous execution / worker-side polling.
-- `fineract-command-disruptor` — LMAX Disruptor for hot write paths.
-- `fineract-command-test` — `testImplementation` dependency for shared
-  command-pipeline test fixtures.
+- `fineract-command` — SPI + default sync dispatcher
+  (`CommandDispatcher`, `CommandHandler`, `CommandHandlerManager`,
+  `CommandStore`, `SynchronousCommandDispatcher`).
+- `fineract-command-jdbc` — `JdbcCommandStore` plus `CommandEntity` /
+  `CommandRepository` (Spring Data JDBC).
+- `fineract-command-audit` — `AuditCommandHookBefore`, `AuditCommandHookAfter`,
+  `AuditCommandHookError`.
+- `fineract-command-async` — `AsyncCommandDispatcher`.
+- `fineract-command-disruptor` — `DisruptorCommandDispatcher` backed by an LMAX
+  Disruptor ring buffer.
+- `fineract-command-test` — `DummyCommand`, `DummyCommandHandler`,
+  `DummyApiController`, `CommandBaseTest` and friends; pulled in as
+  `testImplementation` only.
+
+The legacy command-source pipeline, which is what every existing JAX-RS write
+endpoint actually runs through today, lives **inside `fineract-core`** under
+`org.apache.fineract.commands.*` (`SynchronousCommandProcessingService`,
+`PortfolioCommandSourceWritePlatformServiceImpl`,
+`NewCommandSourceHandler`, `CommandSource`, `CommandWrapper`).
 
 ## Cross-cutting tier
 
@@ -299,7 +329,7 @@ implementation(project(path: ':fineract-loan-origination'))
 implementation(project(path: ':fineract-security'))
 implementation(project(path: ':fineract-working-capital-loan'))
 implementation(project(path: ':fineract-mix'))
-// + fineract-avro-schemas (testImplementation)
+implementation(project(path: ':fineract-avro-schemas'))
 ```
 
 Note that **`fineract-command-async` and `fineract-command-disruptor` are not
@@ -311,7 +341,12 @@ module.
 
 Wraps `fineract-provider` for deployment into a standalone Tomcat/Jetty. It
 only owns packaging-related code; there is no business logic in
-`fineract-war/`.
+`fineract-war/`. Its `build.gradle` `implementation`-depends on
+`fineract-provider` plus a curated list of domain modules
+(`fineract-accounting`, `fineract-branch`, `fineract-charge`, `fineract-core`,
+`fineract-document`, `fineract-investor`, `fineract-loan`,
+`fineract-loan-origination`, `fineract-mix`, `fineract-progressive-loan`,
+`fineract-rates`, `fineract-savings`, `fineract-working-capital-loan`).
 
 ## Package ownership
 
@@ -342,7 +377,7 @@ sub-package, with the modules that also contribute.
 | `org.apache.fineract.infrastructure.springbatch` | `fineract-provider` | — |
 | `org.apache.fineract.infrastructure.survey` | `fineract-provider` | — |
 | `org.apache.fineract.infrastructure.openapi` | `fineract-provider` | — |
-| `org.apache.fineract.commands` | `fineract-command` | `fineract-command-audit`, `-jdbc`, `-async`, `-disruptor` |
+| `org.apache.fineract.commands` (plural) | `fineract-core` | — (this is the legacy command-source pipeline) |
 | `org.apache.fineract.cob` | `fineract-cob` | `fineract-loan`, `fineract-investor`, `fineract-savings` |
 | `org.apache.fineract.accounting` | `fineract-accounting` | `fineract-loan`, `fineract-savings` (product-account mapping) |
 | `org.apache.fineract.adhocquery` | `fineract-provider` | — |
@@ -368,11 +403,12 @@ sub-package, with the modules that also contribute.
 | `org.apache.fineract.portfolio.shareproducts` | `fineract-savings` | — |
 | `org.apache.fineract.spm` | `fineract-provider` | — |
 | `org.apache.fineract.template` | `fineract-provider` | — |
-| `org.apache.fineract.useradministration` | `fineract-provider` | `fineract-security` |
+| `org.apache.fineract.useradministration` | `fineract-core` | `fineract-provider`, `fineract-security` |
 | `org.apache.fineract.investor` | `fineract-investor` | — |
-| `org.apache.fineract.binx`/`mix` | `fineract-mix` | — |
+| `org.apache.fineract.mix` | `fineract-mix` | — |
 | `org.apache.fineract.report` | `fineract-report` | — |
 | `org.apache.fineract.document` | `fineract-document` | — |
+| `org.apache.fineract.command` (singular) | `fineract-command` | `fineract-command-async`, `-audit`, `-disruptor`, `-jdbc`, `-test` |
 
 <Note>
 Because Spring scans `org.apache.fineract.**` from a single
@@ -394,6 +430,9 @@ done
 ```
 
 That command produced the data behind every arrow in this page.
+`fineract-war` declares its dependencies inside `build.gradle` instead of a
+sibling `dependencies.gradle`, so include `grep -E "project\(':" fineract-war/build.gradle`
+in the same scan to see the WAR's deps.
 
 ## Where to look for…
 

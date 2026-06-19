@@ -229,7 +229,7 @@ Centers are not modelled as a separate Java class — they are `Group` rows whos
 
 ## Lifecycle & status notes
 
-- **`ClientStatus`** (`portfolio/client/domain/ClientStatus.java`) — PENDING (100), ACTIVE (300), TRANSFER_IN_PROGRESS (304), TRANSFER_ON_HOLD (305), CLOSED (600), REJECTED (700), WITHDRAWN (800).
+- **`ClientStatus`** (`portfolio/client/domain/ClientStatus.java`) — PENDING (100), ACTIVE (300), TRANSFER_IN_PROGRESS (303), TRANSFER_ON_HOLD (304), CLOSED (600), REJECTED (700), WITHDRAWN (800).
 - **`LegalForm`** — PERSON (1), ENTITY (2). When `ENTITY` the row in `m_client_non_person` is required.
 - **`GroupingTypeStatus`** (status for both `Group` and centers) — PENDING (100), ACTIVE (300), CLOSED (600).
 - A client can simultaneously belong to multiple groups; a group always belongs to exactly one office. Transfers move the rows and write a `m_client_transfer_details` row (see `ClientTransferDetails`).

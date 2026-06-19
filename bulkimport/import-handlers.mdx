@@ -31,7 +31,7 @@ The return is a [`Count`](/bulkimport/overview#data-types) of successes and erro
 
 ## Catalogue
 
-Every handler is `@Service`-registered, has package-private `readExcelFile` / `importEntity` methods, and is picked up from `BulkImportWorkbookServiceImpl.importWorkbook(...)` based on the `GlobalEntityType` code:
+Every handler is `@Service`-registered, has package-private `readExcelFile` / `importEntity` methods, and is picked up from `BulkImportEventListener.onApplicationEvent(...)` based on the `GlobalEntityType` value carried on the published `BulkImportEvent`. The listener looks the bean up by name through `ApplicationContext.getBean("<handlerName>", ImportHandler.class)`:
 
 | `GlobalEntityType`                | Handler class                                                                              | Sheet read                          |
 | --------------------------------- | ------------------------------------------------------------------------------------------ | ----------------------------------- |
@@ -50,7 +50,7 @@ Every handler is `@Service`-registered, has package-private `readExcelFile` / `i
 | `FIXED_DEPOSIT_ACCOUNTS` (`fixeddepositaccounts`) | `importhandler/fixeddeposits/FixedDepositImportHandler.java`               | `FixedDeposit`                      |
 | `FIXED_DEPOSIT_TRANSACTIONS` (`fixeddeposittransactions`) | `importhandler/fixeddeposits/FixedDepositTransactionImportHandler.java` | `FixedDepositTransactions` |
 | `RECURRING_DEPOSIT_ACCOUNTS` (`recurringdeposits`) | `importhandler/recurringdeposit/RecurringDepositImportHandler.java`       | `RecurringDeposit`                  |
-| `RECURRING_DEPOSIT_ACCOUNTS_TRANSACTIONS` (`recurringdepositstransactions`) | `importhandler/recurringdeposit/RecurringDepositTransactionImportHandler.java` | derived |
+| `RECURRING_DEPOSIT_ACCOUNTS_TRANSACTIONS` (`recurringdepositstransactions`) | `importhandler/recurringdeposit/RecurringDepositTransactionImportHandler.java` | `SavingsTransaction` (shared sheet name) |
 | `SHARE_ACCOUNTS` (`shareaccounts`) | `importhandler/sharedaccount/SharedAccountImportHandler.java`                             | `SharedAccounts`                    |
 | `CHART_OF_ACCOUNTS` (`chartofaccounts`) | `importhandler/chartofaccounts/ChartOfAccountsImportHandler.java`                    | `ChartOfAccounts`                   |
 | `GL_JOURNAL_ENTRIES` (`gljournalentries`) | `importhandler/journalentry/JournalEntriesImportHandler.java`                      | `AddJournalEntries`                 |
@@ -242,7 +242,7 @@ If you need to support a new entity type:
     Implement `ImportHandler` in `importhandler/<entity>/`. Read the sheet, build commands, replay through `PortfolioCommandSourceWritePlatformService`, write status columns.
   </Step>
   <Step title="Wire the dispatch">
-    Extend the `if/else` chain in `BulkImportWorkbookPopulatorServiceImpl.getTemplate(...)` and `BulkImportWorkbookServiceImpl.importWorkbook(...)` to pick the new populator and handler when `GlobalEntityType.X.toString()` matches.
+    Extend the `if/else` chain in `BulkImportWorkbookPopulatorServiceImpl.getTemplate(...)` (download) and `BulkImportWorkbookServiceImpl.importWorkbook(...)` (upload string-to-enum resolution) for the new entity name, then add a `case <ENUM> -> applicationContext.getBean("<handlerBeanName>", ImportHandler.class)` branch to the `switch` in `BulkImportEventListener.onApplicationEvent(...)` so the listener can route the event to the new handler.
   </Step>
 </Steps>
 
@@ -271,7 +271,7 @@ Because handlers always check `STATUS_COL` before they touch a row, the operator
 ## Concurrency considerations
 
 <Note>
-Handlers run **single-threaded** per `BulkImportEvent`. They are dispatched from `BulkImportEventListener` on Spring's default async executor, so multiple uploads can run concurrently, but rows within one workbook are processed sequentially. This matters when one row depends on another (a client referenced as a co-borrower must be created before the loan row that references them) — the operator must order rows accordingly.
+Handlers run **single-threaded** per `BulkImportEvent`. `BulkImportEventListener` implements `ApplicationListener<BulkImportEvent>`, and Spring's default `SimpleApplicationEventMulticaster` dispatches events synchronously on the publishing thread — there is no `@Async` or `TaskExecutor` configured in the bulk-import package. As a result the original HTTP upload thread runs the handler to completion before responding. Rows within one workbook are processed sequentially, which matters when one row depends on another (a client referenced as a co-borrower must be created before the loan row that references them) — the operator must order rows accordingly.
 </Note>
 
 Two practical implications:
@@ -284,7 +284,7 @@ Two practical implications:
 For very large workbooks, a few common patterns help:
 
 - Pre-populate any auxiliary `Extras` data once and reuse across uploads — the populator service already paginates client and staff lookups via `SearchParameters`.
-- Split a workbook by office and process them in parallel uploads; each upload becomes its own `BulkImportEvent` and runs on a separate listener thread.
+- Split a workbook by office and process the chunks as separate concurrent uploads from different HTTP clients; because each upload runs synchronously on its own HTTP thread, parallelism comes from issuing multiple uploads in parallel rather than from any internal queue.
 - Use `external_id` columns where available so re-uploads after a database refresh stay idempotent.
 
 ## See also
@@ -299,5 +299,5 @@ For very large workbooks, a few common patterns help:
 </CardGroup>
 
 <Tip>
-When you re-implement an existing handler with custom business logic, override the `@Service` registration by giving your bean a higher `@Order` or a `@Primary` annotation; the dispatch chain in `BulkImportWorkbookServiceImpl.importWorkbook(...)` resolves handlers by Spring bean name through `@Autowired`, so a renamed bean is picked up automatically without touching the dispatch chain.
+When you re-implement an existing handler with custom business logic, keep the same Spring bean name as the stock handler — the dispatch in `BulkImportEventListener` uses `applicationContext.getBean("loanImportHandler", ImportHandler.class)` (and equivalents), so swapping the implementation behind the same bean name is the cleanest extension point. Avoid `@Primary` here: the listener looks up by *name*, not by type, so `@Primary` on a differently-named bean does not redirect the dispatch.
 </Tip>

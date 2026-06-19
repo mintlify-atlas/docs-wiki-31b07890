@@ -89,8 +89,8 @@ sequenceDiagram
 | Partitioner | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanCOBPartitioner.java` (extends `fineract-cob/src/main/java/org/apache/fineract/cob/common/CommonPartitioner.java`) | Slices loan ids into partitions sized by `propertyService.getPartitionSize(JOB_NAME)`. |
 | Step registry | `fineract-cob/src/main/java/org/apache/fineract/cob/COBBusinessStepService.java` and impl in same module | Loads the configured order of business-step beans from `batch_business_steps`. |
 | Worker config | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanCOBWorkerConfiguration.java` | Worker flow: `initialisationStep → applyLockStep → loanBusinessStep → resetContextStep`. |
-| Initialisation | `fineract-cob/src/main/java/org/apache/fineract/cob/common/InitialisationTasklet.java` | Sets `AppUser`, `ActionContext.COB` on the worker thread. |
-| Lock acquisition | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/ApplyLoanLockTasklet.java` (extends `fineract-cob/.../common/ApplyCommonLockTasklet.java`) | Inserts `m_loan_account_locks` rows for the partition's loan ids. |
+| Initialisation | `fineract-provider/src/main/java/org/apache/fineract/cob/common/InitialisationTasklet.java` | Sets `AppUser`, `ActionContext.COB` on the worker thread. |
+| Lock acquisition | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/ApplyLoanLockTasklet.java` (extends `fineract-cob/src/main/java/org/apache/fineract/cob/tasklet/ApplyCommonLockTasklet.java`) | Inserts `m_loan_account_locks` rows for the partition's loan ids. |
 | Lock service | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanLockingServiceImpl.java` | Implements `LockingService<LoanAccountLock>`. |
 | Item reader | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanItemReader.java` | Pages `Loan` rows for the partition's id range. |
 | Item processor | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanItemProcessor.java` | Calls `COBBusinessStepService.run(executionMap, loan)`. |

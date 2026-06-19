@@ -545,7 +545,7 @@ sequenceDiagram
         end
         TDS->>Store: liquibase.update (tenant_store_db)
         TDS->>Store: SELECT * FROM tenants (via tenantDetailsService)
-        Store-->>TDS: List<FineractPlatformTenant>
+        Store-->>TDS: List&lt;FineractPlatformTenant&gt;
         par parallel per tenant
             TDS->>Pool: create temp pool for tenant 1
             TDS->>T1: liquibase.update (tenant_db, custom_changelog, "tenant1")
@@ -609,7 +609,7 @@ flowchart TB
       MAS[db.changelog-master.xml]
       TS[tenant-store/]
       T[tenant/]
-      MOD[tenant/module/loan|investor|savings|...]
+      MOD["tenant/module/loan, investor, savings, ..."]
       CUST[db/custom-changelog/]
     end
     subgraph legacy

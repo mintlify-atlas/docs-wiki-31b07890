@@ -118,10 +118,8 @@ Content-Type: application/json
   "name":        "Financial Health Indicator",
   "description": "Quarterly client well-being snapshot",
   "countryCode": "ZM",
-  "validFrom":   "2024-01-01",
-  "validTo":     "2024-12-31",
   "componentDatas": [
-    { "key": "INCOME", "name": "Income stability", "description": "" }
+    { "key": "INCOME", "text": "Income stability", "description": "", "sequenceNo": 1 }
   ],
   "questionDatas": [
     {
@@ -143,6 +141,14 @@ Response:
 ```json
 { "resourceId": 17 }
 ```
+
+<Note>
+`ComponentData` uses the field name `text` (not `name`) — it is mapped to the `m_survey_components.a_text` column. `QuestionData` nests responses under `responseDatas`, not `responses`.
+</Note>
+
+<Warning>
+`SpmService.createSurvey(...)` **ignores any `validFrom` / `validTo` you supply in the body** and overwrites them with `today` and `today + 100 years`. If a survey with the same `key` is currently valid, the service also auto-deactivates that previous version (it calls `deactivateSurvey(previousSurvey.getId())`). Treat `key` as the version handle: bump it whenever you publish a revision you want to coexist with history.
+</Warning>
 
 ### Edit
 
@@ -178,7 +184,7 @@ public void activateOrDeactivateSurvey(@PathParam("id") final Long id,
 }
 ```
 
-Anything other than `activate` / `deactivate` (case‑insensitive) is a 400. Internally this is implemented by adjusting `validFrom`/`validTo` so the `isActive=true` listing reflects the change.
+Anything other than `activate` / `deactivate` (case‑insensitive) is a 400. Internally this is implemented by adjusting `validFrom`/`validTo` so the `isActive=true` listing reflects the change: `activateSurvey` sets `validFrom = today` and `validTo = today + 100 years`; `deactivateSurvey` sets `validTo = yesterday`.
 
 ```http
 POST /fineract-provider/api/v1/surveys/17?command=activate
@@ -216,6 +222,10 @@ Mandatory body fields per the `@Operation` annotation:
 
 > `clientId, createdOn, questionId, responseId, staffId`
 
+<Note>
+The `@Operation` summary above is what Swagger advertises, but `ScorecardValue` (the entry that actually goes inside `scorecardValues`) only carries `questionId`, `responseId`, `value`, and `createdOn` — there is no `staffId` field on the DTO. The `AppUser` recorded against each `Scorecard` row is the authenticated session user (`securityContext.authenticatedUser()`), not a body field. Treat `staffId` in the swagger comment as documentation drift.
+</Note>
+
 `ScorecardData` carries a `scorecardValues` list so you can submit multiple answers in one POST:
 
 ```java
@@ -231,7 +241,7 @@ public class ScorecardData {
 }
 ```
 
-`ScorecardValue` (`spm/data/ScorecardValue.java`) holds the per‑question reference: `questionId`, `responseId`, `value`, `createdOn`, `staffId`. The mapper expands the list into N `Scorecard` rows.
+`ScorecardValue` (`spm/data/ScorecardValue.java`) holds the per‑question reference: `questionId`, `responseId`, `value`, `createdOn`. The mapper expands the list into N `Scorecard` rows, attaching the same `AppUser` and `Client` to each. If `scorecardValues` is null or empty, `ScorecardMapper.map(...)` throws `SurveyResponseNotAvailableException` (HTTP 403 with `error.msg.no.survey.response`).
 
 ```http
 POST /fineract-provider/api/v1/surveys/scorecards/17
@@ -241,12 +251,12 @@ Content-Type: application/json
   "clientId": 42,
   "scorecardValues": [
     { "questionId": 101, "responseId": 1003, "value": 10,
-      "createdOn": "2024-04-15T10:30:00Z", "staffId": 7 }
+      "createdOn": "2024-04-15T10:30:00Z" }
   ]
 }
 ```
 
-A 201 / 200 with no body indicates success — read back with the `GET` endpoints below.
+A 200 with no body indicates success — read back with the `GET` endpoints below. Note that the `createdOn` you supply per row is ignored at write time: `ScorecardMapper` always stamps each `Scorecard` with `DateUtils.getLocalDateTimeOfTenant()`.
 
 ### List entries for a survey
 
@@ -321,12 +331,15 @@ sequenceDiagram
 | Validation | `spm/domain/SurveyValidator.java` |
 | Exceptions | `spm/exception/{SurveyNotFoundException,SurveyResponseNotAvailableException}.java` |
 
-`SurveyValidator` runs inside `SpmService.createSurvey(...)` and `updateSurvey(...)`. It enforces:
+`SurveyValidator` runs inside `SpmService.createSurvey(...)` and `updateSurvey(...)`. Reading from `spm/domain/SurveyValidator.java`, it enforces:
 
-- A survey carries at least one question.
-- Each question has at least one response.
-- `validFrom <= validTo`.
-- `countryCode` is two characters.
+- `key`, `name`, `countryCode` are present, non‑blank, and do not exceed `maxKeyLength=32`, `maxNameLength=255`, `maxCountryCodeLength=2`.
+- `description` (optional) does not exceed `maxDescriptionLength=4000`.
+- `questions` is non‑null and not an empty array.
+- For each question: `key` (≤ 32 chars) and `text` (≤ 255 chars) are present; `options` (the `responseDatas` list) is non‑null and non‑empty.
+- For each response: `text` is present and ≤ 255 chars; `value` is non‑null and not greater than `maxOptionsValue=9999`.
+
+Notable gaps: there is **no** check that `validFrom <= validTo` (the service overwrites both anyway) and **no** check that `countryCode` is *exactly* two characters — only that it does not exceed two.
 
 Validation failures surface as `PlatformApiDataValidationException` → HTTP 400 with the standard `errors[]` array.
 
@@ -343,9 +356,10 @@ Both resources call `securityContext.authenticatedUser()` rather than `validateH
 |---|---|
 | `404 SurveyNotFoundException` | Any `/v1/surveys/{id}` or `/v1/surveys/scorecards/{surveyId}` referencing an unknown survey. |
 | `404 ClientNotFoundException` | Scorecard create with an unknown `clientId`. |
-| `400 SurveyResponseNotAvailableException` | Scorecard create references a `responseId` that isn't part of the supplied question / survey. |
+| `403 SurveyResponseNotAvailableException` | Scorecard create with an empty or missing `scorecardValues` list. The mapper raises this before any insert. |
 | `400 UnrecognizedQueryParamException` | `?command=` value other than `activate`/`deactivate`. |
 | `400 PlatformApiDataValidationException` | A required SurveyData field is missing on create/edit. |
+| `409 PlatformDataIntegrityException` | `error.msg.survey.duplicate.key` on a unique‑constraint collision, or `error.msg.survey.cannot.be.modified.as.used.in.client.survey` if an edit would break an existing scorecard FK. |
 
 ## Practical tips
 

@@ -93,8 +93,10 @@ literal isn't repeated in 30 places.
 
 `fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/helper/SmsConfigUtils.java`
 is the *only* helper in the package — it is the glue between the
-external SMS gateway (configured per-tenant in `c_external_service`)
-and any tasklet that needs to talk HTTP to it.
+external SMS gateway (configured per-tenant under the
+`MESSAGE_GATEWAY` row of `c_external_service` + its
+`c_external_service_properties`) and any tasklet that needs to talk
+HTTP to it.
 
 ```java
 @Component
@@ -135,8 +137,9 @@ public class SmsConfigUtils {
 
 What it does:
 
-- Reads the per-tenant gateway configuration (hostname, port, base
-  path, tenant app key) from `c_external_service`.
+- Reads the per-tenant gateway configuration — `host_name`,
+  `port_number`, `end_point`, `tenant_app_key` — from the
+  `MESSAGE_GATEWAY` external service.
 - Builds the final URI for the supplied `apiEndPoint`
   (`message`, `delivery-reports`, etc.).
 - Constructs an `HttpEntity` carrying the JSON body and the headers
@@ -149,7 +152,7 @@ What it does:
 flowchart LR
   Tasklet --> Util[SmsConfigUtils]
   Util --> Props[ExternalServicesPropertiesReadPlatformService]
-  Props --> CES[(c_external_service<br/>SMS_GATEWAY)]
+  Props --> CES[(c_external_service<br/>MESSAGE_GATEWAY)]
   Util --> Tenant[ThreadLocalContextUtil]
   Util --> Headers[HttpHeaders<br/>tenant id + app key]
   Util --> URI[Computed URI]
@@ -276,7 +279,7 @@ the same transaction as the SMTP send result.
 
 ```mermaid
 flowchart TB
-  subgraph Scheduler tick - Quartz / Cron
+  subgraph Tick["Scheduler tick (Quartz / Cron)"]
     A[UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE]
     B[SEND_MESSAGES_TO_SMS_GATEWAY]
     C[GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY]

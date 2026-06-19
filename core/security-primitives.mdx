@@ -40,6 +40,9 @@ flowchart LR
 
     subgraph EXC["security/exception"]
         SVE[SqlValidationException]
+        NAE[NoAuthorizationException]
+        ITIE[InvalidTenantIdentifierException]
+        IITM[InvalidInstanceTypeMethodException]
     end
 
     PSC --> PURC
@@ -261,7 +264,16 @@ Companion to `SQLBuilder` — encapsulates one `column OP value` predicate toget
 
 ### `SQLInjectionException`
 
-Thrown by `SQLBuilder` when an identifier fails the regex check.
+Lives at `security/utils/SQLInjectionException.java` (not `exception/`) — thrown by `SQLBuilder` when an identifier fails the regex check.
+
+### Other exceptions in `security/exception/`
+
+| Exception | Used for |
+| --- | --- |
+| `SqlValidationException` | Top-level failure thrown by `SqlValidator`/`DefaultSqlValidator`. Extends `AbstractPlatformDomainRuleException`. |
+| `NoAuthorizationException` | 403 — current user lacks the requested permission. |
+| `InvalidTenantIdentifierException` | 400 — incoming tenant header doesn't resolve. |
+| `InvalidInstanceTypeMethodException` | Thrown by the instance-mode filter when a write call hits a read-only JVM (see `infrastructure/instancemode/`). |
 
 ### `EncryptionUtil` and `LogParameterEscapeUtil`
 

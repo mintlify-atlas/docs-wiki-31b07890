@@ -77,7 +77,7 @@ In all three cases the call site is identical: build a `Set<TaxGroupMappings>` f
 | `exception/` | `TaxComponentNotFoundException`, `TaxGroupNotFoundException`, `TaxMappingNotFoundException` |
 | `handler/` | `CreateTaxComponentCommandHandler`, `UpdateTaxComponentCommandHandler`, `CreateTaxGroupCommandHandler`, `UpdateTaxGroupCommandHandler` — all wired by `@CommandType(entity, action)` |
 | `mapper/` | MapStruct entity → DTO mappers: `TaxComponentMapper`, `TaxGroupMapper`, `TaxGroupMappingsMapper` |
-| `serialization/` | `TaxComponentDataValidator`, `TaxGroupDataValidator` (DataValidatorBuilder–based JSON validation) |
+| `serialization/` | `TaxValidator` — DataValidatorBuilder-based JSON validation for both tax-component and tax-group create/update payloads |
 | `service/` | `TaxReadPlatformService`, `TaxWritePlatformService`, `TaxUtils` (the static math), `ChargeTaxApplicationService` |
 
 Other modules (loan, savings) hold their own *attachment* and *posting* code; `fineract-tax` only owns the catalogue + the math.

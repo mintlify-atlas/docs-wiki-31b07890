@@ -191,8 +191,8 @@ See [Disruptor Dispatcher](/command/command-disruptor).
 
 ## The provider-side glue (`fineract-core`)
 
-Even though the new `CommandHandler<REQ, RES>` SPI exists, **every domain
-handler in Fineract today** still implements the older provider-side interface:
+The vast majority of domain handlers (~390 of ~460 production
+`*CommandHandler.java` classes) implement the older provider-side interface:
 
 ```java
 // fineract-core/.../commands/handler/NewCommandSourceHandler.java
@@ -201,6 +201,16 @@ public interface NewCommandSourceHandler {
     CommandProcessingResult processCommand(JsonCommand command);
 }
 ```
+
+A growing minority (~40 handlers in modules such as `fineract-document`,
+`fineract-mix`, `fineract-provider/.../organisation/staff/handler/`,
+`fineract-provider/.../portfolio/note/handler/`, the hooks and template
+packages, and a few `fineract-core` infrastructure handlers) already implement
+the **new** generic `CommandHandler<REQ, RES>` SPI from `fineract-command/core/`
+described in [Command Core SPI](/command/command-core). Those are dispatched
+through `DefaultCommandHandlerManager` instead of `CommandHandlerProvider` —
+they don't carry a `@CommandType` annotation and don't show up at
+`/v1/audits` unless `fineract.command.audit.enabled` is on.
 
 Handlers are picked by
 `fineract-core/.../commands/provider/CommandHandlerProvider.java`, which scans

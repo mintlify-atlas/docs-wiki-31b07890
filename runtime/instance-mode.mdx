@@ -132,14 +132,14 @@ For each request that reaches the filter:
 
 ```mermaid
 flowchart TD
-    A[Request arrives] --> B{Path on exception list?<br/>(jobs, scheduler, instance-mode, ...)}
+    A[Request arrives] --> B{Path on exception list?<br/>jobs, scheduler, instance-mode, ...}
     B -- yes, and mode allows --> Z[proceed]
     B -- yes, but mode rejects --> R[reject 405]
-    B -- no --> C{Is /actuator/**?}
+    B -- no --> C{Is /actuator/** path?}
     C -- yes --> Z
     C -- no --> D{HTTP method is GET?}
-    D -- yes & read-enabled --> Z
-    D -- no & write-enabled --> Z
+    D -- "yes and read-enabled" --> Z
+    D -- "no and write-enabled" --> Z
     D -- otherwise --> R
 ```
 

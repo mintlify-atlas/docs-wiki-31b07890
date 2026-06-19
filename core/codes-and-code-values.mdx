@@ -169,7 +169,7 @@ Once values are in place the loan create UI populates its "Loan purpose" dropdow
 
 ## System-defined codes
 
-The Liquibase migrations under `fineract-core/src/main/resources/db/changelog/tenant/` seed a handful of system-defined codes (e.g. `Gender`, `YesNo`, `LoanCollateral`, status reasons) with `is_system_defined = true`. Those code rows cannot be renamed via the API; their values can usually still be edited (so an operator can rename "Male" → "M" if desired) unless flagged otherwise in the migration.
+The tenant database migrations (`fineract-db/`) seed a handful of system-defined codes (e.g. `Gender`, `YesNo`, `LoanCollateral`, status reasons) with `is_system_defined = true`. Those code rows cannot be renamed via the API; their values can usually still be edited (so an operator can rename "Male" → "M" if desired) unless flagged otherwise in the migration.
 
 <Tip>
 If you need a hard-coded enum (one whose semantics the code branches on), keep it in Java and don't model it as a code. The `Code`/`CodeValue` model is exclusively for *user-facing dropdowns whose semantics are inert to the platform*.
@@ -201,15 +201,13 @@ These are used by `CodeCommandFromApiJsonDeserializer` in the provider when vali
 
 ## Exceptions
 
-`exception/`:
+`exception/` declares three typed exceptions:
 
 - `CodeNotFoundException` — 404 when a code id/name does not resolve.
 - `CodeValueNotFoundException` — 404 when a code-value id does not resolve.
 - `SystemDefinedCodeCannotBeChangedException` — 403 on attempts to rename a system code.
-- `CodeValueLabelInvalidException` — 400 on invalid label content.
-- `CodeDeletedException` — surfaces FK violations when a value or code is in use.
 
-These derive from the standard `Abstract*` base classes in `infrastructure/core/exception/` (see [Infrastructure Core](/core/infrastructure-core)).
+These derive from the standard `Abstract*` base classes in `infrastructure/core/exception/` (see [Infrastructure Core](/core/infrastructure-core)). FK violations from deleting an in-use code value surface as the generic `PlatformDataIntegrityException`.
 
 ## Mapper
 

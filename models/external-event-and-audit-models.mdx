@@ -114,12 +114,12 @@ erDiagram
 - **Important fields:** `String type` (event class name — same vocabulary as `ExternalEvent.type`), `boolean enabled`.
 - **Key relationships:** Soft relationship to `ExternalEvent.type`. Each business event class checks this row before recording itself; if `enabled = false` the publisher silently drops the event. This is how operators turn off noisy events (e.g. accrual postings) without redeploying.
 
-### `ExternalEventView` (read-only)
+### `ExternalEventView` (projection interface)
 
-- **File:** `ExternalEventView.java` in the same package
-- **Table:** view over `m_external_event` (or a materialized projection used by `LongPollingService`)
-- **Important fields:** Mirrors `ExternalEvent` plus computed fields used by the long-polling read service that streams events to subscribers.
-- **Key relationships:** Read-only; no writes.
+- **File:** `fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/repository/domain/ExternalEventView.java`
+- **Type:** Spring Data projection interface (not a database view) — exposes a read-only subset of `m_external_event` columns to the publisher pipeline so the full byte[] payload doesn't have to be hydrated for every consumer query.
+- **Important fields:** `Long getId()`, `String getType()`, `String getCategory()`, `String getSchema()`, `byte[] getData()`, `OffsetDateTime getCreatedAt()`, `ExternalEventStatus getStatus()`, `OffsetDateTime getSentAt()`, `String getIdempotencyKey()`, `LocalDate getBusinessDate()`, `Long getAggregateRootId()`.
+- **Key relationships:** Read-only; backed by `m_external_event`.
 
 ### `CommandSource` (audit log + maker-checker)
 

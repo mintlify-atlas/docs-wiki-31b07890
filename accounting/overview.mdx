@@ -44,7 +44,7 @@ fineract-provider/src/main/java/org/apache/fineract/accounting/
 
 This separation also keeps the entity layer reusable. A custom module can pull `fineract-accounting`, depend on `GLAccount`, `JournalEntry`, and `ProductToGLAccountMapping`, and post entries through the `JournalEntryWritePlatformService` interface without needing the loan/savings processors.
 
-## The three accounting rule types
+## The four accounting rule types
 
 Every product (loan or savings) in Fineract is tagged with one of four accounting modes, modelled by the `AccountingRuleType` enum in `fineract-core/src/main/java/org/apache/fineract/accounting/common/AccountingRuleType.java`:
 

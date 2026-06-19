@@ -514,7 +514,7 @@ public class PurgeExternalEventsTasklet implements Tasklet {
 ```
 
 The retention window is read from `c_configuration` (key
-`external-events-purge-days-criteria`) so it can be edited via the global-configuration API
+`purge-external-events-older-than-days`) so it can be edited via the global-configuration API
 without redeploying. The job display name is
 `JobName.PURGE_EXTERNAL_EVENTS("Purge External Events")`.
 

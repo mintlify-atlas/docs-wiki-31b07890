@@ -216,10 +216,11 @@ is used when computing the *expected* next repayment date for grace/pause logic.
 ```java
 @POST @Path("ranges")
 public CommandProcessingResult createDelinquencyRange(
-        @Parameter(required = true) DelinquencyRangeRequest request) {
+        final DelinquencyRangeRequest delinquencyRangeRequest) {
+    securityContext.authenticatedUser().validateHasCreatePermission(DELINQUENCY_BUCKET);
     final CommandWrapper commandRequest = new CommandWrapperBuilder().createDelinquencyRange()
-            .withJson(DelinquencyRangeRequestSerializer.toJson(request)).build();
-    return this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+            .withJson(jsonSerializer.serialize(delinquencyRangeRequest)).build();
+    return commandWritePlatformService.logCommandSource(commandRequest);
 }
 ```
 

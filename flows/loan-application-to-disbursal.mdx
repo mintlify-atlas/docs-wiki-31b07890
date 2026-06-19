@@ -196,8 +196,8 @@ public class DisburseLoanCommandHandler implements NewCommandSourceHandler {
 | --- | --- |
 | `fineract-loan/.../handler/DisburseLoanCommandHandler.java` | Routes to `LoanWritePlatformService`. |
 | `fineract-provider/.../service/LoanWritePlatformServiceJpaRepositoryImpl.java` | `disburseLoan(Long, JsonCommand, Boolean, Boolean)` — actual work. |
-| `fineract-loan/.../service/LoanDisbursementService.java` | `adjustDisburseAmount(loan, command, actualDate)` — handles tranches & top-up. |
-| `fineract-provider/.../service/LoanJournalEntryPoster.java` | `postJournalEntriesForLoanTransaction(...)` — writes `acc_gl_journal_entry`. |
+| `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanDisbursementService.java` | `adjustDisburseAmount(loan, command, actualDate)` — handles tranches & top-up. |
+| `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanJournalEntryPoster.java` (interface; impl `LoanJournalEntryPosterImpl` in `fineract-provider`) | `postJournalEntriesForLoanTransaction(...)` — writes `acc_gl_journal_entry`. |
 
 ### Inside disburseLoan
 
