@@ -1,0 +1,360 @@
+---
+title: "Liquibase Changelogs and the Master Include Graph"
+sidebarTitle: "Liquibase Changelogs"
+description: "Apache Fineract's database schema is built by Liquibase. This page walks the master changelog, the tenant / tenant-store split, every per-module include, the 0001_xxx.xml naming convention, and the four Liquibase contexts (tenant_store_db, tenant_db, initial_switch, custom_changelog)."
+---
+
+Every Apache Fineract database — both the small tenant-store catalog and each large per-tenant business database — is created and evolved by **Liquibase**. There is exactly one entry point that Spring Boot points at, `db.changelog-master.xml`, and from there a graph of `<include>` declarations stitches together hundreds of changesets that live under `fineract-provider/` and under every business module (`fineract-loan`, `fineract-savings`, `fineract-investor`, `fineract-progressive-loan`, `fineract-loan-origination`, `fineract-command-jdbc`, `fineract-working-capital-loan`, …). This page is the map of that graph.
+
+## The single entry point
+
+`fineract-provider/src/main/resources/application.properties` wires Liquibase up:
+
+```properties application.properties
+spring.liquibase.enabled=${FINERACT_LIQUIBASE_ENABLED:true}
+spring.liquibase.changeLog=classpath:/db/changelog/db.changelog-master.xml
+```
+
+So Spring Boot's `LiquibaseAutoConfiguration` will look up `db/changelog/db.changelog-master.xml` on the classpath at startup and run it. The Liquibase context (`tenant_store_db` vs. `tenant_db`, with or without `initial_switch`) is set programmatically by Fineract's own bootstrap code depending on whether it is bringing up the tenant-store or a per-tenant database.
+
+## `db.changelog-master.xml` — the whole picture
+
+Here is the entire master changelog (license header trimmed for readability):
+
+```xml fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml
+<databaseChangeLog ...>
+    <property name="current_date" value="CURDATE()" context="mysql"/>
+    <property name="current_date" value="CURRENT_DATE" context="postgresql"/>
+    <property name="current_datetime" value="NOW()"/>
+    <property name="uuid" value="uuid()" context="mysql"/>
+    <property name="uuid" value="uuid_generate_v4()" context="postgresql"/>
+
+    <include file="tenant-store/initial-switch-changelog-tenant-store.xml"
+             relativeToChangelogFile="true"
+             context="tenant_store_db AND initial_switch"/>
+    <include file="tenant-store/changelog-tenant-store.xml"
+             relativeToChangelogFile="true"
+             context="tenant_store_db AND !initial_switch"/>
+
+    <include file="tenant/initial-switch-changelog-tenant.xml"
+             relativeToChangelogFile="true"
+             context="tenant_db AND initial_switch"/>
+    <include file="tenant/changelog-tenant.xml"
+             relativeToChangelogFile="true"
+             context="tenant_db AND !initial_switch"/>
+
+    <!-- Add new module to the end of this modules list
+         (to keep the existing auto-increment identifiers) -->
+    <include file="db/changelog/tenant/module/loan/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+    <include file="db/changelog/tenant/module/investor/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+    <include file="db/changelog/tenant/module/savings/parts/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+
+    <includeAll path="db/custom-changelog" errorIfMissingOrEmpty="false"
+                context="tenant_db AND !initial_switch AND custom_changelog"/>
+
+    <include file="/db/changelog/tenant/module/progressiveloan/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+    <include file="db/changelog/tenant/module/loanorigination/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+    <include file="db/changelog/tenant/module/command/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+    <include file="db/changelog/tenant/module/workingcapitalloan/module-changelog-master.xml"
+             context="tenant_db AND !initial_switch"/>
+
+    <!-- Scripts to run after the modules were initialized  -->
+    <include file="tenant/final-changelog-tenant.xml"
+             relativeToChangelogFile="true"
+             context="tenant_db AND !initial_switch"/>
+</databaseChangeLog>
+```
+
+The order matters. Liquibase runs the includes top-to-bottom, and the per-tenant changelog `0001_initial_schema.xml` has to land before any module changelog tries to add a column to one of its tables.
+
+## The four Liquibase contexts
+
+Almost every include is wrapped in a context expression. There are four contexts in use across the whole repo:
+
+| Context | When it is set | What it does |
+| --- | --- | --- |
+| `tenant_store_db` | When Liquibase runs against the tenant-store database | Activates the `tenant-store/` includes |
+| `tenant_db` | When Liquibase runs against a per-tenant database | Activates the `tenant/` and per-module includes |
+| `initial_switch` | Once, on the very first boot after upgrading from Flyway | Activates `initial-switch-changelog-*.xml` so Liquibase pretends the Flyway-era objects were created by changesets `1` and `2` |
+| `custom_changelog` | Opt-in deployment toggle | Activates the `includeAll path="db/custom-changelog"` slot so a downstream distribution can ship extra changelogs without forking |
+
+The Boolean combinator (`AND`, `!`) is plain Liquibase context expression syntax. `tenant_db AND !initial_switch` means "run on a per-tenant DB **only after** the Flyway → Liquibase switch has been completed".
+
+There are also two **dialect** contexts — `mysql` and `postgresql` — but those are only used by the `<property>` declarations above, not by includes.
+
+## Tenant-store side
+
+The tenant-store entry point is `tenant-store/changelog-tenant-store.xml`. Together with `initial-switch-changelog-tenant-store.xml` and the `parts/` directory it looks like this:
+
+```text fineract-provider/src/main/resources/db/changelog/tenant-store/
+changelog-tenant-store.xml
+initial-switch-changelog-tenant-store.xml
+parts/
+  0001_initial_schema.xml
+  0002_initial_data.xml
+  0003_reset_postgresql_sequences.xml
+  0004_readonly_database_connection.xml
+  0005_jdbc_connection_string.xml
+  0006_drop_retry_parameter_columns.xml
+  0007_encrypt_existing_tenant_passwords.xml
+  0007_x_extend_tenant_ro_passwords.xml
+  0008_encrypt_existing_ro_tenant_passwords.xml
+  0009_set_and_encrypt_ro_if_not_exists.xml
+  0010_set_datetime_precision.xml
+  0011_standardize_character_set_and_collation.xml
+upgrades/
+  0000_upgrade_to_1.6.xml
+```
+
+The `initial-switch-changelog-tenant-store.xml` only includes the first two parts under the `initial_switch` context — that is the Flyway-era boundary:
+
+```xml fineract-provider/src/main/resources/db/changelog/tenant-store/initial-switch-changelog-tenant-store.xml
+<include file="parts/0001_initial_schema.xml" relativeToChangelogFile="true" context="initial_switch"/>
+<include file="parts/0002_initial_data.xml"   relativeToChangelogFile="true" context="initial_switch"/>
+<!-- The first 2 changelog files are ran with the initial_switch context to handle the Flyway -> Liquibase migration -->
+<!-- The rest of the changelogs will not need this context set -->
+```
+
+`changelog-tenant-store.xml` then picks up from `0003_reset_postgresql_sequences.xml` and runs every subsequent change for normal upgrades:
+
+```xml fineract-provider/src/main/resources/db/changelog/tenant-store/changelog-tenant-store.xml
+<include file="parts/0003_reset_postgresql_sequences.xml"   relativeToChangelogFile="true"/>
+<include file="parts/0004_readonly_database_connection.xml" relativeToChangelogFile="true"/>
+<include file="parts/0005_jdbc_connection_string.xml"       relativeToChangelogFile="true"/>
+<include file="parts/0006_drop_retry_parameter_columns.xml" relativeToChangelogFile="true"/>
+<include file="parts/0007_encrypt_existing_tenant_passwords.xml"     relativeToChangelogFile="true"/>
+<include file="parts/0007_x_extend_tenant_ro_passwords.xml"           relativeToChangelogFile="true"/>
+<include file="parts/0008_encrypt_existing_ro_tenant_passwords.xml"  relativeToChangelogFile="true"/>
+<include file="parts/0009_set_and_encrypt_ro_if_not_exists.xml"      relativeToChangelogFile="true"/>
+<include file="parts/0010_set_datetime_precision.xml"        relativeToChangelogFile="true"/>
+<include file="parts/0011_standardize_character_set_and_collation.xml" relativeToChangelogFile="true"/>
+```
+
+These changesets evolve the three tenant-store tables — `tenant_server_connections`, `tenants`, `timezones` — over time. The story they tell, in order:
+
+1. `0001_initial_schema.xml` — the initial DDL for `tenant_server_connections`, `tenants`, `timezones` (replaces the Flyway baseline).
+2. `0002_initial_data.xml` — inserts the default tenant row and the static timezone list.
+3. `0003_reset_postgresql_sequences.xml` — fixes auto-increment sequences after the initial inserts on PostgreSQL.
+4. `0004_readonly_database_connection.xml` — adds the `readonly_*` columns to `tenant_server_connections` so each tenant can declare a read replica.
+5. `0005_jdbc_connection_string.xml` — stores the additional `schema_connection_parameters` text column so JDBC URL parameters can be customized per tenant.
+6. `0006_drop_retry_parameter_columns.xml` — removes obsolete retry-tuning columns.
+7. `0007_encrypt_existing_tenant_passwords.xml` — encrypts the previously-plaintext `schema_password` column using the master password.
+8. `0007_x_extend_tenant_ro_passwords.xml` — extends column widths so the encrypted RO passwords fit.
+9. `0008_encrypt_existing_ro_tenant_passwords.xml` — encrypts the read-only schema password.
+10. `0009_set_and_encrypt_ro_if_not_exists.xml` — backfills encrypted RO passwords for rows that never had one.
+11. `0010_set_datetime_precision.xml` — normalizes `DATETIME` precision across MariaDB versions.
+12. `0011_standardize_character_set_and_collation.xml` — standardizes character set and collation across all tenant-store tables.
+
+The `upgrades/0000_upgrade_to_1.6.xml` is a historical, one-time helper used by an old release-channel upgrade flow; current installs do not depend on it.
+
+## Per-tenant side
+
+The per-tenant entry point is the much larger `tenant/changelog-tenant.xml`. It currently pulls in **230+ numbered changesets** under `tenant/parts/`, evolving the core business schema:
+
+```text fineract-provider/src/main/resources/db/changelog/tenant/
+changelog-tenant.xml
+final-changelog-tenant.xml
+initial-switch-changelog-tenant.xml
+parts/
+  0001_initial_schema.xml
+  0002_initial_data.xml
+  0003_postgresql_specific_initial_data.xml
+  0004_camelcase_column_renaming.xml
+  ...
+  0231_remove_clientcharge_inactivate_permissions.xml
+  0232_add_repayment_start_date_to_loan.xml
+  0233_backfill_repayment_start_date_type_on_loan.xml
+upgrades/
+  0000_upgrade_to_1.5.xml
+  0000_upgrade_to_1.6.xml
+```
+
+`initial-switch-changelog-tenant.xml` mirrors the tenant-store pattern: it only runs `parts/0001_initial_schema.xml` and `parts/0002_initial_data.xml` under the `initial_switch` context, so installs that came from Flyway pick up at part 3.
+
+`changelog-tenant.xml` starts at `parts/0003_postgresql_specific_initial_data.xml` and chains every subsequent part in numerical order. Each part is a small, focused changeset — a single new column, a single new permission, a backfill, a new permission row, a fix to a stored report. The size of this list (`0001` … `0233`) is the main reason why touching the core schema is a careful exercise: any new change has to claim the next free number and be appended at the bottom.
+
+The terminal include is **outside** `changelog-tenant.xml`. The master changelog runs all per-module changelogs first, then runs `tenant/final-changelog-tenant.xml` last:
+
+```xml fineract-provider/src/main/resources/db/changelog/tenant/final-changelog-tenant.xml
+<include file="parts/0146_add_final_constraints.xml" relativeToChangelogFile="true"/>
+```
+
+That final part adds cross-module foreign-key constraints that only make sense after the module tables exist.
+
+## Per-module changelogs
+
+Each business module ships its own `module-changelog-master.xml`. They are wired into the top-level master via classpath includes. The wiring **and** the numbering range used by each module:
+
+| Module | Master file | Numbering range (used by `parts/`) |
+| --- | --- | --- |
+| **loan** | `fineract-loan/src/main/resources/db/changelog/tenant/module/loan/module-changelog-master.xml` | `1001_` … `1035_` |
+| **investor** | `fineract-investor/src/main/resources/db/changelog/tenant/module/investor/module-changelog-master.xml` | `0001_` … `0022_` |
+| **savings** | `fineract-savings/src/main/resources/db/changelog/tenant/module/savings/parts/module-changelog-master.xml` | `2001_` … `2005_` |
+| **progressive-loan** | `fineract-progressive-loan/src/main/resources/db/changelog/tenant/module/progressiveloan/module-changelog-master.xml` | `5001_` … `5003_` |
+| **loan-origination** | `fineract-loan-origination/src/main/resources/db/changelog/tenant/module/loanorigination/module-changelog-master.xml` | `0001_` upwards |
+| **command** | `fineract-command-jdbc/src/main/resources/db/changelog/tenant/module/command/module-changelog-master.xml` | `0001_command_init.xml`, `0002_command_fix_structure.xml` |
+| **working-capital-loan** | `fineract-working-capital-loan/src/main/resources/db/changelog/tenant/module/workingcapitalloan/module-changelog-master.xml` | `0001_` … `0036_` |
+| **accounting** | `fineract-accounting/src/main/resources/jpa/accounting/db/changelog/tenant/module/accounting/module-changelog-master.xml` | reserved `3000+` (currently empty placeholder) |
+| **charge** | `fineract-charge/src/main/resources/jpa/charge/db/changelog/tenant/module/charge/module-changelog-master.xml` | reserved |
+| **rates** | `fineract-rates/src/main/resources/jpa/rates/db/changelog/tenant/module/rates/module-changelog-master.xml` | reserved |
+| **branch** | `fineract-branch/src/main/resources/db/changelog/tenant/module/branch/module-changelog-master.xml` | reserved |
+
+The reason each module owns a **disjoint numeric range** is the comment in `db.changelog-master.xml`:
+
+```xml fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml
+<!-- Add new module to the end of this modules list
+     (to keep the existing auto-increment identifiers) -->
+```
+
+Liquibase identifies a changeset by `id` + `author` + filename, and changing the include order would cause Liquibase to think previously-applied changesets are missing. The accounting module's master changelog spells out the reservation explicitly:
+
+```xml fineract-accounting/.../module-changelog-master.xml
+<!-- Sequence is starting from 3000 to make it easier to move
+     existing liquibase changesets here -->
+```
+
+The reservation scheme, summarized:
+
+| Range | Module |
+| --- | --- |
+| `0001_` … `0999_` | Module-local sequence (each module starts at `0001_`, lives under its own directory) |
+| `1001_` … | loan |
+| `2001_` … | savings |
+| `3000_` … | accounting (reserved) |
+| `5001_` … | progressive-loan |
+
+Module ranges with the leading digit map onto the per-module *position* in the master include list, not onto a single global table — `loan/parts/1001_*` and `loan-origination/parts/0001_*` will not collide because they live in different files with different paths.
+
+### Module changelog naming convention
+
+Every module follows the same convention:
+
+```text
+module-changelog-master.xml         ← the module's entry point, declared in db.changelog-master.xml
+parts/
+  NNNN_short_snake_case_summary.xml  ← one changeset file, one author, one logical change
+```
+
+A representative slice from `fineract-investor`:
+
+```xml fineract-investor/src/main/resources/db/changelog/tenant/module/investor/module-changelog-master.xml
+<include relativeToChangelogFile="true" file="parts/0001_initial_schema.xml"/>
+<include relativeToChangelogFile="true" file="parts/0002_asset_schemas.xml"/>
+<include relativeToChangelogFile="true" file="parts/0003_asset_schemas.xml"/>
+<include relativeToChangelogFile="true" file="parts/0004_change_purchase_price_ratio_type.xml"/>
+<include relativeToChangelogFile="true" file="parts/0005_add_sale_and_buyback_command.xml"/>
+<include relativeToChangelogFile="true" file="parts/0006_asset_schemas.xml"/>
+<include relativeToChangelogFile="true" file="parts/0007_add_external_asset_owner_transfer_details.xml"/>
+<include relativeToChangelogFile="true" file="parts/0008_add_mappings.xml"/>
+...
+<include relativeToChangelogFile="true" file="parts/0022_add_external_asser_owner_create_permission.xml"/>
+```
+
+Adding a new investor changelog means:
+
+1. Pick the next free integer (`0023_`).
+2. Drop a new XML file under `fineract-investor/src/main/resources/db/changelog/tenant/module/investor/parts/`.
+3. Append one new `<include>` line at the bottom of `module-changelog-master.xml`.
+4. Do **not** reorder existing includes.
+
+## The `custom_changelog` slot
+
+The master changelog leaves a deliberate gap for downstream distributions:
+
+```xml fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml
+<includeAll path="db/custom-changelog" errorIfMissingOrEmpty="false"
+            context="tenant_db AND !initial_switch AND custom_changelog"/>
+```
+
+Three things to notice:
+
+- It is an `includeAll`, not an `include` — Liquibase scans the directory and runs every file it finds, alphabetically.
+- `errorIfMissingOrEmpty="false"` means the directory does not need to exist. Stock Fineract leaves it empty.
+- The `custom_changelog` context is only set if the deployer opts in (e.g. via a `liquibase.contexts=tenant_db,custom_changelog` runtime setting). So even if you drop XML files in there, they will only run when you ask for them.
+
+This gives every fork / distribution a stable place to ship extra changesets — extra columns, extra reports, extra permissions — without modifying any file under `fineract-provider/`.
+
+## Properties passed to Liquibase
+
+`application.properties` forwards a slice of the `fineract.tenant.*` configuration into Liquibase as named parameters, which is how the per-tenant `0002_initial_data.xml` knows what default tenant to insert:
+
+```properties application.properties
+spring.liquibase.parameters.fineract.tenant.identifier=${fineract.tenant.identifier}
+spring.liquibase.parameters.fineract.tenant.description=${fineract.tenant.description}
+spring.liquibase.parameters.fineract.tenant.timezone=${fineract.tenant.timezone}
+spring.liquibase.parameters.fineract.tenant.schema-name=${fineract.tenant.name}
+spring.liquibase.parameters.fineract.tenant.host=${fineract.tenant.host}
+spring.liquibase.parameters.fineract.tenant.port=${fineract.tenant.port}
+spring.liquibase.parameters.fineract.tenant.username=${fineract.tenant.username}
+spring.liquibase.parameters.fineract.tenant.password=${fineract.tenant.password}
+spring.liquibase.parameters.fineract.tenant.parameters=${fineract.tenant.parameters}
+spring.liquibase.parameters.fineract.tenant.read-only-host=${fineract.tenant.read-only-host}
+spring.liquibase.parameters.fineract.tenant.read-only-port=${fineract.tenant.read-only-port}
+spring.liquibase.parameters.fineract.tenant.read-only-username=${fineract.tenant.read-only-username}
+spring.liquibase.parameters.fineract.tenant.read-only-password=${fineract.tenant.read-only-password}
+spring.liquibase.parameters.fineract.tenant.read-only-parameters=${fineract.tenant.read-only-parameters}
+spring.liquibase.parameters.fineract.tenant.read-only-name=${fineract.tenant.read-only-name}
+spring.liquibase.parameters.fineract.tenant.rounding-mode=${fineract.tenant.config.rounding-mode}
+```
+
+A changeset can reference any of these with the `${fineract.tenant.identifier}` syntax — Liquibase substitutes them before the SQL is generated.
+
+## Dialect-aware properties
+
+In addition to the per-tenant parameters above, the master changelog declares dialect-aware properties so the same XML covers MySQL/MariaDB and PostgreSQL:
+
+```xml fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml
+<property name="current_date"     value="CURDATE()"          context="mysql"/>
+<property name="current_date"     value="CURRENT_DATE"        context="postgresql"/>
+<property name="current_datetime" value="NOW()"/>
+<property name="uuid"             value="uuid()"              context="mysql"/>
+<property name="uuid"             value="uuid_generate_v4()"  context="postgresql"/>
+```
+
+Changesets reference `${current_date}`, `${current_datetime}`, and `${uuid}`, and Liquibase picks the correct dialect at runtime.
+
+## Run order, end to end
+
+Putting all of the above together, the order in which Liquibase applies things on a fresh PostgreSQL install (contexts: `tenant_store_db, initial_switch` then `tenant_db, initial_switch`, both with `postgresql`) is:
+
+1. **Tenant-store** — `tenant-store/initial-switch-changelog-tenant-store.xml` runs `parts/0001_initial_schema.xml` and `parts/0002_initial_data.xml`.
+2. **Tenant-store** — `tenant-store/changelog-tenant-store.xml` then runs parts 3 through 11.
+3. **Per-tenant** — `tenant/initial-switch-changelog-tenant.xml` runs the per-tenant `parts/0001_initial_schema.xml` and `parts/0002_initial_data.xml`.
+4. **Per-tenant** — `tenant/changelog-tenant.xml` runs parts 3 through 233 in order.
+5. **Modules** (in declared order) — loan, investor, savings, then the `custom-changelog` includeAll slot, then progressive-loan, loan-origination, command, working-capital-loan. Each module runs every entry in its own `module-changelog-master.xml`.
+6. **Per-tenant** — `tenant/final-changelog-tenant.xml` runs `parts/0146_add_final_constraints.xml`, sealing cross-module FK constraints.
+
+On a fresh install that never had Flyway you simply drop the `initial_switch` context; the same files are executed (changesets `1`/`2` of the initial-switch files are guarded by the context expression, so they no-op, and the regular `changelog-*.xml` files start at part 1).
+
+## Adding a new changelog
+
+The rules for new changesets, distilled:
+
+- For a **core tenant** change, append the next free `NNNN_short_name.xml` under `fineract-provider/src/main/resources/db/changelog/tenant/parts/` and add one `<include>` to `changelog-tenant.xml`.
+- For a **tenant-store** change, do the same under `tenant-store/parts/` and `changelog-tenant-store.xml`.
+- For a **module** change, append to the module's own `parts/` directory and `module-changelog-master.xml` — do not touch the top-level master.
+- For a **brand new module**, add one `<include file="db/changelog/tenant/module/<name>/module-changelog-master.xml" context="tenant_db AND !initial_switch"/>` at the **bottom** of the modules list in `db.changelog-master.xml` to preserve auto-increment identifiers.
+- For a **distribution-specific** change, drop the file under `db/custom-changelog/` on your classpath and set `custom_changelog` in your Liquibase context list.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Database overview" href="/database/overview" icon="database">
+    High-level overview: PostgreSQL / MariaDB / MySQL, the two-database model, and where every changelog lives.
+  </Card>
+  <Card title="Tenant vs. tenant-store" href="/database/tenant-vs-tenant-store" icon="layer-group">
+    The schemas Liquibase builds: `tenants`, `tenant_server_connections`, `timezones`, and the per-tenant business schema.
+  </Card>
+  <Card title="Legacy SQL and demo backups" href="/database/legacy-sql-and-demo-backups" icon="floppy-disk">
+    The `fineract-db/` directory: Flyway-era bootstrap and pre-made demo tenant dumps.
+  </Card>
+  <Card title="Runtime configuration" href="/overview/runtime-and-deployment" icon="gear">
+    `FINERACT_LIQUIBASE_ENABLED`, JDBC URLs, and the rest of the runtime knobs that gate Liquibase.
+  </Card>
+</CardGroup>

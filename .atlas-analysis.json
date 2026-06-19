@@ -1,24 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Apache Fineract",
+  "projectType": "api-service",
+  "projectName": "Apache Fineract",
+  "projectDescription": "Apache Fineract is an open-source core banking platform built on Java 21 and Spring Boot 3, structured as a multi-module Gradle monorepo that exposes a JAX-RS REST API for clients, loans, savings, accounting, and the surrounding microfinance workflows.",
   "theme": "maple",
-  "colors": {
-    "primary": "#c35696",
-    "light": "#1d5e8b",
-    "dark": "#faf6fa"
-  },
-  "favicon": "https://media.brand.dev/cbc27f91-fd3b-452d-89c7-5e7ded5150f3.jpg",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/apache/fineract"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/apache/fineract"
-    }
-  },
+  "primaryColor": "#c35696",
+  "lightColor": "#1d5e8b",
+  "darkColor": "#c35696",
   "navigation": {
     "tabs": [
       {
@@ -430,5 +417,73 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Spring Boot 3 monolith on Java 21 with embedded Tomcat (ServerApplication)",
+    "Multi-tenant data source routing via fineract.tenant.* properties",
+    "Liquibase-managed tenant and tenant-store schemas (db/changelog)",
+    "JAX-RS REST API exposed through Jersey (164 *ApiResource classes)",
+    "Command bus (fineract-command) with sync, async, audit, disruptor and JDBC store variants",
+    "Maker-checker workflow for write commands via commands/AuditsApiResource and MakercheckersApiResource",
+    "Loan domain: fineract-loan (cumulative interest model)",
+    "Progressive loan: fineract-progressive-loan with embeddable schedule generator",
+    "Working capital loan: fineract-working-capital-loan with dedicated COB steps",
+    "Loan origination: fineract-loan-origination (originators, enrichers, serialization)",
+    "Savings, fixed deposit, recurring deposit and share products (fineract-savings)",
+    "Accounting subsystem: GL accounts, journal entries, accruals, provisioning, financial activity",
+    "Charges (fineract-charge), taxes (fineract-tax), floating rates (fineract-rates)",
+    "Close of Business (fineract-cob) business-step framework with loan account locking",
+    "Investor / external asset owner module (fineract-investor) for loan sales",
+    "Background jobs registered via JobName enum and Quartz scheduler",
+    "Spring Batch partitioned jobs (e.g. Loan COB, NPA update)",
+    "Business events and external event producers (Kafka, ActiveMQ via docker-compose)",
+    "Document management with pluggable content stores (filesystem, S3) and detectors",
+    "Reports (Pentaho), Run Reports, Report Mailing Job, Ad-hoc Query, MIX taxonomy",
+    "SMS and Email campaigns with scheduler + gateway",
+    "Credit bureau integration (creditbureau)",
+    "Interoperation (Mojaloop) API resource",
+    "Survey & SPM (Social Performance Management) scorecard",
+    "Two-factor authentication (twofactor-tests project)",
+    "OAuth2 client/server support (oauth2-tests project)",
+    "fineract-client and fineract-client-feign generated SDKs",
+    "fineract-avro-schemas for external events",
+    "fineract-e2e-tests-core/runner Cucumber/Gherkin suite (~123 feature files)",
+    "Docker, docker-compose (PostgreSQL/MySQL/MariaDB/Kafka/ActiveMQ) and Kubernetes manifests",
+    "Custom module dynamic loading via custom/<company>/<category>/<module> directory layout",
+    "Bulk import (Excel populators + handlers) and templating engine",
+    "Resilience4j retry configuration per command type",
+    "Static weaving for EclipseLink JPA entities",
+    "fineract-validation custom Bean Validation constraints",
+    "fineract-doc Antora documentation modules",
+    "fineract-war traditional WAR packaging"
+  ],
+  "publicApiSurface": [
+    "fineract-provider/src/main/java/org/apache/fineract/ServerApplication.java",
+    "fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/boot/FineractWebApplicationConfiguration.java",
+    "fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/boot/FineractLiquibaseOnlyApplicationConfiguration.java",
+    "fineract-provider/src/main/resources/application.properties",
+    "fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml",
+    "POST /authentication (AuthenticationApiResource)",
+    "POST/GET /clients (ClientsApiResource)",
+    "POST/GET /loans (LoansApiResource)",
+    "POST /loans/{loanId}/transactions (LoanTransactionsApiResource)",
+    "POST/GET /loanproducts (LoanProductsApiResource)",
+    "POST/GET /savingsaccounts (SavingsAccountsApiResource)",
+    "POST/GET /savingsproducts (SavingsProductsApiResource)",
+    "POST /journalentries (JournalEntriesApiResource)",
+    "GET /glaccounts (GLAccountsApiResource)",
+    "POST /batches (BatchApiResource)",
+    "GET /jobs and POST /jobs/{jobId} (SchedulerJobApiResource)",
+    "GET /scheduler (SchedulerApiResource)",
+    "POST /externalevents (ExternalEventConfigurationApiResource)",
+    "POST /externalassetowners (ExternalAssetOwnersApiResource)",
+    "POST /cob/loan and /cob/workingcapitalloan (LoanCOBCatchUpApiResource, WorkingCapitalLoanCOBCatchUpApiResource)",
+    "POST /interoperation (InteropApiResource)",
+    "POST /makercheckers (MakercheckersApiResource)",
+    "POST /twofactor (TwoFactorApiResource)",
+    "fineract-client (OkHttp/Retrofit SDK)",
+    "fineract-client-feign (Feign-based SDK)",
+    "JobName enum (fineract-core JobName.java) — canonical list of background jobs",
+    "fineract-avro-schemas Avro definitions for external events"
+  ]
 }

@@ -1,0 +1,345 @@
+---
+title: "Environment Variables"
+description: "Reference of the FINERACT_* environment variables and Docker Compose variables that override Apache Fineract's application.properties at runtime."
+keywords: ["Apache Fineract", "environment variables", "FINERACT_", "Docker Compose", "configuration", "Spring Boot", "DRIVERCLASS_NAME"]
+---
+
+Apache Fineract is configured at runtime through Spring Boot property resolution: every key inside `application.properties` uses the `${ENV_VAR:default}` placeholder syntax, so setting an environment variable is the canonical way to override configuration without modifying the JAR or mounting a custom properties file. This page lists the `FINERACT_*` names that back the most common settings, plus the additional variables read by Fineract's Docker Compose definitions.
+
+**Source:** `fineract-provider/src/main/resources/application.properties`
+
+## How the mapping works
+
+When Spring Boot sees a property like:
+
+```properties
+server.port=${FINERACT_SERVER_PORT:8443}
+```
+
+…it resolves the value by, in order:
+
+1. Looking for the system property `FINERACT_SERVER_PORT`.
+2. Looking for the environment variable `FINERACT_SERVER_PORT` (Spring also accepts the relaxed-binding form `FINERACT_SERVER_PORT` ↔ `fineract.server-port`).
+3. Falling back to `8443`.
+
+That means you can supply any property either by its literal `${...}` name (as listed below) or by Spring Boot's relaxed-binding equivalent of the dotted property key (e.g. `FINERACT_MODE_READ_ENABLED` for `fineract.mode.read-enabled`).
+
+## Server & TLS
+
+| Variable | Default | Backs |
+| --- | --- | --- |
+| `FINERACT_SERVER_PORT` | `8443` | `server.port` |
+| `FINERACT_SERVER_SERVLET_CONTEXT_PATH` | `/fineract-provider` | `server.servlet.context-path` |
+| `FINERACT_SERVER_COMPRESSION_ENABLED` | `true` | `server.compression.enabled` |
+| `FINERACT_SERVER_SSL_ENABLED` | `true` | `server.ssl.enabled` |
+| `FINERACT_SERVER_SSL_KEY_STORE` | `classpath:keystore.jks` | `server.ssl.key-store` |
+| `FINERACT_SERVER_SSL_KEY_STORE_PASSWORD` | `openmf` | `server.ssl.key-store-password` |
+| `FINERACT_TIMEOUT_PER_SHUTDOWN` | `30s` | `spring.lifecycle.timeout-per-shutdown-phase` |
+| `FINERACT_SERVER_TOMCAT_ACCEPT_COUNT` | `100` | `server.tomcat.accept-count` |
+| `FINERACT_SERVER_TOMCAT_ACCESSLOG_ENABLED` | `false` | `server.tomcat.accesslog.enabled` |
+| `FINERACT_SERVER_TOMCAT_MAX_CONNECTIONS` | `8192` | `server.tomcat.max-connections` |
+| `FINERACT_SERVER_TOMCAT_MAX_HTTP_FORM_POST_SIZE` | `2MB` | `server.tomcat.max-http-form-post-size` |
+| `FINERACT_SERVER_TOMCAT_MAX_KEEP_ALIVE_REQUESTS` | `100` | `server.tomcat.max-keep-alive-requests` |
+| `FINERACT_SERVER_TOMCAT_THREADS_MAX` | `200` | `server.tomcat.threads.max` |
+| `FINERACT_SERVER_TOMCAT_THREADS_MIN_SPARE` | `10` | `server.tomcat.threads.min-spare` |
+| `FINERACT_SERVER_TOMCAT_MBEANREGISTRY_ENABLED` | `false` | `server.tomcat.mbeanregistry.enabled` |
+
+## Tenants registry datasource (Hikari)
+
+| Variable | Default | Backs |
+| --- | --- | --- |
+| `FINERACT_HIKARI_DRIVER_SOURCE_CLASS_NAME` | `org.mariadb.jdbc.Driver` | `spring.datasource.hikari.driverClassName` |
+| `FINERACT_HIKARI_JDBC_URL` | `jdbc:mariadb://localhost:3306/fineract_tenants` | `spring.datasource.hikari.jdbcUrl` |
+| `FINERACT_HIKARI_USERNAME` | `root` | `spring.datasource.hikari.username` |
+| `FINERACT_HIKARI_PASSWORD` | `mysql` | `spring.datasource.hikari.password` |
+| `FINERACT_HIKARI_MINIMUM_IDLE` | `3` | `spring.datasource.hikari.minimumIdle` |
+| `FINERACT_HIKARI_MAXIMUM_POOL_SIZE` | `10` | `spring.datasource.hikari.maximumPoolSize` |
+| `FINERACT_HIKARI_IDLE_TIMEOUT` | `60000` | `spring.datasource.hikari.idleTimeout` |
+| `FINERACT_HIKARI_CONNECTION_TIMEOUT` | `20000` | `spring.datasource.hikari.connectionTimeout` |
+| `FINERACT_HIKARI_TEST_QUERY` | `SELECT 1` | `spring.datasource.hikari.connectionTestquery` |
+| `FINERACT_HIKARI_AUTO_COMMIT` | `true` | `spring.datasource.hikari.autoCommit` |
+| `FINERACT_HIKARI_TRANSACTION_ISOLATION` | `TRANSACTION_REPEATABLE_READ` | `spring.datasource.hikari.transactionIsolation` |
+
+The driver-tuning `FINERACT_HIKARI_DS_PROPERTIES_*` variables map 1:1 to the entries in `spring.datasource.hikari.dataSourceProperties` and are listed in [Application Properties Reference](/configuration/application-properties#hikari-datasourceproperties-driver-tuning).
+
+## Default tenant database
+
+These configure the **default** tenant (used in the demo Docker stack and for first-time bootstrap):
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_DEFAULT_TENANTDB_HOSTNAME` | `localhost` |
+| `FINERACT_DEFAULT_TENANTDB_PORT` | `3306` |
+| `FINERACT_DEFAULT_TENANTDB_UID` | `root` |
+| `FINERACT_DEFAULT_TENANTDB_PWD` | `mysql` |
+| `FINERACT_DEFAULT_TENANTDB_CONN_PARAMS` | _(empty)_ |
+| `FINERACT_DEFAULT_TENANTDB_TIMEZONE` | `Asia/Kolkata` |
+| `FINERACT_DEFAULT_TENANTDB_IDENTIFIER` | `default` |
+| `FINERACT_DEFAULT_TENANTDB_NAME` | `fineract_default` |
+| `FINERACT_DEFAULT_TENANTDB_DESCRIPTION` | `Default Demo Tenant` |
+| `FINERACT_DEFAULT_TENANTDB_MASTER_PASSWORD` | `fineract` |
+| `FINERACT_DEFAULT_TENANTDB_ENCRYPTION` | `"AES/CBC/PKCS5Padding"` |
+| `FINERACT_DEFAULT_TENANTDB_RO_HOSTNAME` | _(empty)_ |
+| `FINERACT_DEFAULT_TENANTDB_RO_PORT` | _(empty)_ |
+| `FINERACT_DEFAULT_TENANTDB_RO_UID` | _(empty)_ |
+| `FINERACT_DEFAULT_TENANTDB_RO_PWD` | _(empty)_ |
+| `FINERACT_DEFAULT_TENANTDB_RO_CONN_PARAMS` | _(empty)_ |
+| `FINERACT_DEFAULT_TENANTDB_RO_NAME` | _(empty)_ |
+| `FINERACT_CONFIG_MIN_POOL_SIZE` | `-1` |
+| `FINERACT_CONFIG_MAX_POOL_SIZE` | `-1` |
+| `FINERACT_CONFIG_ROUNDING_MODE` | `6` (`HALF_EVEN`) |
+| `FINERACT_DEFAULT_MASTER_PASSWORD` | `fineract` |
+
+## Security
+
+### Basic auth, OAuth2, 2FA, HSTS
+
+| Variable | Default | Backs |
+| --- | --- | --- |
+| `FINERACT_SECURITY_BASICAUTH_ENABLED` | `true` | `fineract.security.basicauth.enabled` |
+| `FINERACT_SECURITY_OAUTH_ENABLED` | `false` | `fineract.security.oauth2.enabled` |
+| `FINERACT_SECURITY_2FA_ENABLED` | `false` | `fineract.security.2fa.enabled` |
+| `FINERACT_SECURITY_HSTS_ENABLED` | `false` | `fineract.security.hsts.enabled` |
+
+### CORS
+
+| Variable | Default | Backs |
+| --- | --- | --- |
+| `FINERACT_SECURITY_CORS_ENABLED` | `true` | `fineract.security.cors.enabled` |
+| `FINERACT_SECURITY_CORS_ALLOWED_ORIGIN_PATTERNS` | `*` | `…allowed-origin-patterns` |
+| `FINERACT_SECURITY_CORS_ALLOWED_METHODS` | `*` | `…allowed-methods` |
+| `FINERACT_SECURITY_CORS_ALLOWED_HEADERS` | `*` | `…allowed-headers` |
+| `FINERACT_SECURITY_CORS_EXPOSED_HEADERS` | `*` | `…exposed-headers` |
+| `FINERACT_SECURITY_CORS_ALLOW_CREDENTIALS` | `true` | `…allow-credentials` |
+
+### OAuth2 example client
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_SECURITY_OAUTH2_CLIENTS_FRONTEND_ID` | `frontend-client` |
+| `FINERACT_SECURITY_OAUTH2_CLIENTS_FRONTEND_SCOPES` | `read,write` |
+| `FINERACT_SECURITY_OAUTH2_CLIENTS_FRONTEND_GRANTS` | `authorization_code,refresh_token` |
+| `FINERACT_SECURITY_OAUTH2_CLIENTS_FRONTEND_REDIRECT` | `http://localhost:3000/callback` |
+| `FINERACT_SECURITY_OAUTH2_CLIENTS_FRONTEND_CONSENT` | `false` |
+
+## Instance mode
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_MODE_READ_ENABLED` | `true` |
+| `FINERACT_MODE_WRITE_ENABLED` | `true` |
+| `FINERACT_MODE_BATCH_WORKER_ENABLED` | `true` |
+| `FINERACT_MODE_BATCH_MANAGER_ENABLED` | `true` |
+
+See [Feature Toggles & Instance Mode](/configuration/feature-toggles-and-instance-mode).
+
+## Jobs & scheduling
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_NODE_ID` | `1` |
+| `FINERACT_JOB_STUCK_RETRY_THRESHOLD` | `5` |
+| `FINERACT_JOB_LOAN_COB_ENABLED` | `true` |
+| `FINERACT_JOB_JOURNAL_ENTRY_AGGREGATION_ENABLED` | `true` |
+| `FINERACT_JOB_JOURNAL_ENTRY_AGGREGATION_EXCLUDE_RECENT_N_DAYS` | `1` |
+| `FINERACT_JOB_JOURNAL_ENTRY_AGGREGATION_CHUNK_SIZE` | `2000` |
+| `LOAN_COB_CHUNK_SIZE` | `100` |
+| `LOAN_COB_PARTITION_SIZE` | `100` |
+| `LOAN_COB_THREAD_POOL_CORE_POOL_SIZE` | `5` |
+| `LOAN_COB_THREAD_POOL_MAX_POOL_SIZE` | `5` |
+| `LOAN_COB_THREAD_POOL_QUEUE_CAPACITY` | `20` |
+| `LOAN_COB_RETRY_LIMIT` | `5` |
+| `LOAN_COB_POLL_INTERVAL` | `500` |
+
+## Remote job message handler (JMS / Kafka)
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_SPRING_EVENTS_ENABLED` | `true` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_JMS_ENABLED` | `false` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_JMS_QUEUE_NAME` | `JMS-request-queue` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_JMS_BROKER_URL` | `tcp://127.0.0.1:61616` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_JMS_BROKER_USERNAME` | _(empty)_ |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_JMS_BROKER_PASSWORD` | _(empty)_ |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_ENABLED` | `false` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_TOPIC_NAME` | `job-topic` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_TOPIC_AUTO_CREATE` | `true` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_TOPIC_REPLICAS` | `1` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_TOPIC_PARTITIONS` | `10` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` |
+| `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_CONSUMER_GROUPID` | `fineract-consumer-group-id` |
+
+## External events
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_EXTERNAL_EVENTS_ENABLED` | `false` |
+| `FINERACT_EXTERNAL_EVENTS_PARTITION_SIZE` | `5000` |
+| `FINERACT_EVENT_TASK_EXECUTOR_CORE_POOL_SIZE` | `2` / `10` (jms) |
+| `FINERACT_EVENT_TASK_EXECUTOR_MAX_POOL_SIZE` | `25` / `100` (jms) |
+| `FINERACT_EVENT_TASK_EXECUTOR_QUEUE_CAPACITY` | `500` |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_ENABLED` | `false` |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_ASYNC_SEND_ENABLED` | `false` |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_QUEUE_NAME` | _(empty)_ |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_TOPIC_NAME` | _(empty)_ |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_BROKER_URL` | `tcp://127.0.0.1:61616` |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_BROKER_USERNAME` | _(empty)_ |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_BROKER_PASSWORD` | _(empty)_ |
+| `FINERACT_EXTERNAL_EVENTS_PRODUCER_JMS_PRODUCER_COUNT` | `1` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_ENABLED` | `false` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_TIMEOUT_IN_SECONDS` | `10` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_TOPIC_AUTO_CREATE` | `true` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_TOPIC_NAME` | `external-events` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_TOPIC_REPLICAS` | `1` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_TOPIC_PARTITIONS` | `10` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` |
+| `FINERACT_EXTERNAL_EVENTS_KAFKA_PRODUCER_EXTRA_PROPERTIES` | `linger.ms=10\|batch.size=16384` |
+
+## Content storage
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_CONTENT_REGEX_WHITELIST_ENABLED` | `true` |
+| `FINERACT_CONTENT_REGEX_WHITELIST` | PDF/Word/Excel/JPEG/PNG regex |
+| `FINERACT_CONTENT_MIME_WHITELIST_ENABLED` | `true` |
+| `FINERACT_CONTENT_MIME_WHITELIST` | PDF/Word/Excel/JPEG/PNG mimes |
+| `FINERACT_CONTENT_DEFAULT_BUFFER_SIZE` | `8192` |
+| `FINERACT_CONTENT_FILESYSTEM_ENABLED` | `true` |
+| `FINERACT_CONTENT_FILESYSTEM_ROOT_FOLDER` | `${user.home}/.fineract` |
+| `FINERACT_CONTENT_S3_ENABLED` | `false` |
+| `FINERACT_CONTENT_S3_BUCKET_NAME` | _(empty)_ |
+| `FINERACT_CONTENT_S3_ACCESS_KEY` | _(empty)_ |
+| `FINERACT_CONTENT_S3_SECRET_KEY` | _(empty)_ |
+| `FINERACT_CONTENT_S3_REGION` | _(empty)_ |
+| `FINERACT_CONTENT_S3_ENDPOINT` | _(empty)_ |
+| `FINERACT_CONTENT_S3_PATH_STYLE_ADDRESSING_ENABLED` | `false` |
+| `FINERACT_REPORT_EXPORT_S3_ENABLED` | `false` |
+| `FINERACT_REPORT_EXPORT_S3_BUCKET_NAME` | _(empty)_ |
+| `FINERACT_MULTIPART_FILE_SIZE` | `5MB` |
+| `FINERACT_MULTIPART_REQUEST_SIZE` | `10MB` |
+
+## Modules
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_MODULE_INVESTOR_ENABLED` | `true` |
+| `FINERACT_MODULE_LOAN_ORIGINATION_ENABLED` | `true` |
+
+## Loan transaction processors
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_CREOCORE_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_EARLY_REPAYMENT_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_MIFOS_STANDARD_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_HEAVENSFAMILY_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_INTEREST_PRINCIPAL_PENALTIES_FEES_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_PRINCIPAL_INTEREST_PENALTIES_FEES_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_RBI_INDIA_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_ADVANCED_PAYMENT_STRATEGY_ENABLED` | `true` |
+| `FINERACT_LOAN_TRANSACTIONPROCESSOR_ERROR_NOT_FOUND_FAIL` | `true` |
+| `FINERACT_LOAN_STATUS_CHANGE_HISTORY_STATUSES` | `NONE` |
+
+## Logging, sampling, tracing
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_LOGGING_JSON_ENABLED` | `false` |
+| `FINERACT_LOGGING_HTTP_CORRELATION_ID_ENABLED` | `false` |
+| `FINERACT_LOGGING_HTTP_CORRELATION_ID_HEADER_NAME` | `X-Correlation-ID` |
+| `FINERACT_CLIENT_IP_TRACKING_ENABLED` | `false` |
+| `FINERACT_STATEMENT_LOGGING_ENABLED` | `false` |
+| `FINERACT_SAMPLING_ENABLED` | `false` |
+| `FINERACT_SAMPLING_RATE` | `1000` |
+| `FINERACT_SAMPLED_CLASSES` | _(empty)_ |
+| `FINERACT_SAMPLING_RESET_PERIOD_IN_SEC` | `60` |
+| `FINERACT_IDEMPOTENCY_KEY_HEADER_NAME` | `Idempotency-Key` |
+| `FINERACT_INSECURE_HTTP_CLIENT` | `true` |
+| `FINERACT_CLIENT_CONNECT_TIMEOUT` | `30` |
+| `FINERACT_CLIENT_READ_TIMEOUT` | `30` |
+| `FINERACT_CLIENT_WRITE_TIMEOUT` | `30` |
+| `CONSOLE_LOG_PATTERN` | _(complex pattern, see `application.properties`)_ |
+
+## Actuator, metrics, tracing
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_MANAGEMENT_ENDPOINT_WEB_EXPOSURE_INCLUDE` | `health,info,prometheus` |
+| `FINERACT_MANAGEMENT_HEALTH_JMS_ENABLED` | `false` |
+| `FINERACT_MANAGEMENT_HEALTH_RATELIMITERS_ENABLED` | `false` |
+| `FINERACT_MANAGEMENT_TRACIING_ENABLED` | `false` |
+| `FINERACT_MANAGEMENT_METRICS_TAGS_APPLICATION` | `fineract` |
+| `FINERACT_MANAGEMENT_METRICS_DISTRIBUTION_HTTP_SERVER_REQUESTS` | `false` |
+| `FINERACT_MANAGEMENT_PROMETHEUS_ENABLED` | `false` |
+| `FINERACT_MANAGEMENT_OLTP_ENABLED` | `false` |
+| `FINERACT_MANAGEMENT_OLTP_METRICS_EXPORT_URL` | `http://tempo:4318/v1/traces` |
+| `FINERACT_MANAGEMENT_OLTP_METRICS_EXPORT_AGGREGATION_TEMPORALITY` | `cumulative` |
+| `FINERACT_MANAGEMENT_CLOUDWATCH_ENABLED` | `false` |
+| `FINERACT_MANAGEMENT_CLOUDWATCH_NAMESPACE` | `fineract` |
+| `FINERACT_MANAGEMENT_CLOUDWATCH_STEP` | `1m` |
+| `FINERACT_MANAGEMENT_CLOUDWATCH_REGION` | `us-east-1` |
+| `FINERACT_AWS_ENDPOINT` | _(empty)_ |
+| `FINERACT_AWS_REGION_STATIC` | `us-east-1` |
+| `FINERACT_AWS_CREDENTIALS_ACCESS_KEY` | _(empty)_ |
+| `FINERACT_AWS_CREDENTIALS_SECRET_KEY` | _(empty)_ |
+| `FINERACT_AWS_CREDENTIALS_INSTANCE_PROFILE` | `false` |
+| `FINERACT_AWS_CREDENTIALS_PROFILE_NAME` | _(empty)_ |
+| `FINERACT_AWS_CREDENTIALS_PROFILE_PATH` | _(empty)_ |
+| `FINERACT_AUTOCONFIGURE_EXCLUDE` | (excludes AWS auto-config) |
+
+## OpenAPI / Swagger
+
+| Variable | Default |
+| --- | --- |
+| `SPRINGDOC_API_DOCS_PATH` | `/api-docs` |
+| `SPRINGDOC_API_DOCS_ENABLED` | `true` |
+| `SPRINGDOC_SWAGGER_UI_ENABLED` | `true` |
+| `SPRINGDOC_USE_MANAGEMENT_PORT` | `false` |
+| `SPRINGDOC_SHOW_ACTUATOR` | `false` |
+
+## Command pipeline
+
+| Variable | Default |
+| --- | --- |
+| `FINERACT_COMMAND_JDBC_ENABLED` | `true` |
+| `FINERACT_COMMAND_JDBC_FILE_DEAD_LETTER_QUEUE_ENABLED` | `false` |
+| `FINERACT_COMMAND_JDBC_FILE_DEAD_LETTER_QUEUE_PATH` | `/tmp/fineract/dlq` |
+| `FINERACT_COMMAND_AUDIT_ENABLED` | `true` |
+| `FINERACT_COMMAND_PROCESSORS_AUDIT_PRE` | `true` |
+| `FINERACT_COMMAND_PROCESSORS_AUDIT_POST` | `true` |
+| `FINERACT_COMMAND_PROCESSORS_AUDIT_ERROR` | `true` |
+| `FINERACT_COMMAND_PROCESSORS_SERVLET_HEADER_PRE` | `true` |
+| `FINERACT_COMMAND_PROCESSORS_TIMESTAMP_PRE` | `true` |
+| `FINERACT_COMMAND_PROCESSORS_USERNAME_PRE` | `true` |
+
+## Resilience4j retry overrides
+
+Every `resilience4j.retry.instances.<name>.*` and `fineract.retry.instances.<name>.*` entry has matching environment variables of the form `FINERACT_<NAME_IN_SNAKE>_RETRY_*`. See [Resilience4j Retries](/configuration/resilience4j-retries) for the full catalogue.
+
+## Docker Compose variables
+
+The Fineract reference Docker Compose stack and the `apache/fineract` container set a small additional layer of environment variables that influence the JVM and the entrypoint scripts:
+
+| Variable | Purpose |
+| --- | --- |
+| `DRIVERCLASS_NAME` | JDBC driver class loaded by the bootstrap script (e.g. `org.mariadb.jdbc.Driver`). |
+| `JAVA_TOOL_OPTIONS` | Extra JVM flags appended to the launch command (heap, GC tuning, debug). |
+| `JAVA_OPTS` | Alternative path for extra JVM flags. |
+| `TZ` | Container timezone (recommended `UTC`; align with `FINERACT_DEFAULT_TENANTDB_TIMEZONE`). |
+| `SPRING_PROFILES_ACTIVE` | Activates Spring profiles, e.g. `liquibase-only` or `test`. |
+
+These three sets work together: the Compose stack exports `FINERACT_*` variables for application properties, the JVM-level variables tune the launcher, and `SPRING_PROFILES_ACTIVE` decides which auxiliary properties file (such as `application-liquibase-only.properties`) is layered on top of the baseline.
+
+## Tips
+
+<Tip>Always rely on environment variables for secrets — never check passwords or API keys into a properties file or container image.</Tip>
+
+<Warning>Setting `FINERACT_INSECURE_HTTP_CLIENT=true` (the default) lets outbound clients accept self-signed certificates. Disable it before going to production.</Warning>
+
+<Tip>Use the `SPRING_PROFILES_ACTIVE=liquibase-only` profile in an init-container to run schema migrations once at deploy time without keeping a Tomcat process alive.</Tip>
+
+## See also
+
+- [Application Properties Reference](/configuration/application-properties) — the dotted property keys.
+- [Resilience4j Retries](/configuration/resilience4j-retries) — retry-specific env vars.
+- [Feature Toggles & Instance Mode](/configuration/feature-toggles-and-instance-mode).

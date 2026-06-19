@@ -1,0 +1,337 @@
+---
+title: "Savings & Deposits REST API"
+sidebarTitle: "Savings & Deposits"
+description: "The Apache Fineract REST API for savings, fixed-deposit, recurring-deposit and share accounts: SavingsAccountsApiResource, SavingsAccountChargesApiResource, SavingsAccountTransactionsApiResource, SavingsProductsApiResource, FixedDepositAccountsApiResource, FixedDepositProductsApiResource, RecurringDepositAccountsApiResource, RecurringDepositProductsApiResource, ShareDividendApiResource, AccountsApiResource, ProductsApiResource, InterestRateChartsApiResource and InterestRateChartSlabsApiResource."
+---
+
+Apache Fineract treats savings accounts, fixed deposits, recurring deposits and share accounts as a family of related liabilities. They share a single base table (`m_savings_account`) and the same interest-posting / charge / transaction infrastructure — only their product definitions and lifecycle commands differ. The REST API mirrors that organisation: four account resources, four product resources, a shared share-dividend resource, two polymorphic dispatchers (`AccountsApiResource` / `ProductsApiResource`) used for share accounts and shared product look-ups, and the interest-rate-chart pair that drives the term-deposit yield curves.
+
+All paths sit under `/fineract-provider/api/v1` — see the [REST API Overview](/api/overview) for headers and JSON conventions.
+
+## Endpoint summary
+
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/savingsaccounts/template` | `SavingsAccountsApiResource.java` | Options for the new-savings-account form (clients/groups, products, fields). |
+| GET | `/v1/savingsaccounts` | `SavingsAccountsApiResource.java` | Paged list of savings accounts. |
+| POST | `/v1/savingsaccounts` | `SavingsAccountsApiResource.java` | Submit a savings application. |
+| POST | `/v1/savingsaccounts/gsim` | `SavingsAccountsApiResource.java` | Submit a Group Savings Individual Monitoring (GSIM) parent + children. |
+| GET | `/v1/savingsaccounts/{accountId}` | `SavingsAccountsApiResource.java` | One savings account (`?associations=all,transactions,charges,…`). |
+| POST | `/v1/savingsaccounts/{accountId}?command=…` | `SavingsAccountsApiResource.java` | State transitions: `approve`, `undoApproval`, `reject`, `withdrawnByApplicant`, `activate`, `close`, `assignSavingsOfficer`, `unassignSavingsOfficer`, `applyAnnualFees`, `calculateInterest`, `postInterest`, `block`, `unblock`, `blockDebit`, `unblockDebit`, `blockCredit`, `unblockCredit`, `holdAmount`, `releaseAmount`, `updateWithHoldTax`. |
+| PUT | `/v1/savingsaccounts/{accountId}` | `SavingsAccountsApiResource.java` | Modify a pending or active account. |
+| DELETE | `/v1/savingsaccounts/{accountId}` | `SavingsAccountsApiResource.java` | Delete a pending application. |
+| GET | `/v1/savingsaccounts/{savingsAccountId}/charges` | `SavingsAccountChargesApiResource.java` | List charges on the account. |
+| POST | `/v1/savingsaccounts/{savingsAccountId}/charges` | `SavingsAccountChargesApiResource.java` | Apply a charge. |
+| POST | `/v1/savingsaccounts/{savingsAccountId}/charges/{savingsAccountChargeId}?command=pay\|waive` | `SavingsAccountChargesApiResource.java` | Pay or waive a savings-account charge. |
+| GET | `/v1/savingsaccounts/{savingsId}/transactions/template?command=…` | `SavingsAccountTransactionsApiResource.java` | Template for `deposit`, `withdrawal`, `holdAmount`, `releaseAmount`, etc. |
+| POST | `/v1/savingsaccounts/{savingsId}/transactions?command=…` | `SavingsAccountTransactionsApiResource.java` | Execute a transaction: `deposit`, `withdrawal`, `holdAmount`, `releaseAmount`, `dividendPayout`. |
+| POST | `/v1/savingsaccounts/{savingsId}/transactions/{transactionId}?command=undo` | `SavingsAccountTransactionsApiResource.java` | Reverse a transaction. |
+| GET | `/v1/savingsaccounts/{savingsId}/transactions/search` | `SavingsAccountTransactionsApiResource.java` | Filtered transaction search. |
+| POST | `/v1/savingsaccounts/{savingsId}/transactions/query` | `SavingsAccountTransactionsApiResource.java` | Advanced JSON-predicate search. |
+| GET | `/v1/savingsproducts` | `SavingsProductsApiResource.java` | All savings products. |
+| POST | `/v1/savingsproducts` | `SavingsProductsApiResource.java` | Create a savings product. |
+| GET | `/v1/fixeddepositaccounts/{accountId}` | `FixedDepositAccountsApiResource.java` | One FD account. |
+| POST | `/v1/fixeddepositaccounts/{accountId}?command=…` | `FixedDepositAccountsApiResource.java` | `approve`, `activate`, `close`, `calculatePrematureAmount`, `prematureClose`. |
+| GET | `/v1/fixeddepositproducts` | `FixedDepositProductsApiResource.java` | All FD products. |
+| GET | `/v1/recurringdepositaccounts/{accountId}` | `RecurringDepositAccountsApiResource.java` | One RD account. |
+| POST | `/v1/recurringdepositaccounts/{accountId}?command=…` | `RecurringDepositAccountsApiResource.java` | `approve`, `activate`, `close`, `prematureClose`, `calculatePrematureAmount`. |
+| GET | `/v1/recurringdepositproducts` | `RecurringDepositProductsApiResource.java` | All RD products. |
+| GET | `/v1/shareproduct/{productId}/dividend` | `ShareDividendApiResource.java` | All dividend declarations for a share product. |
+| POST | `/v1/shareproduct/{productId}/dividend` | `ShareDividendApiResource.java` | Declare a dividend. |
+| GET | `/v1/accounts/{type}/{accountId}` | `AccountsApiResource.java` | Polymorphic account read (`type=share`). |
+| POST | `/v1/accounts/{type}` | `AccountsApiResource.java` | Polymorphic account create. |
+| GET | `/v1/products/{type}` | `ProductsApiResource.java` | Polymorphic product read (`type=share`). |
+| GET | `/v1/interestratecharts` | `InterestRateChartsApiResource.java` | All interest-rate charts. |
+| POST | `/v1/interestratecharts` | `InterestRateChartsApiResource.java` | Create a chart. |
+| GET | `/v1/interestratecharts/{chartId}/chartslabs` | `InterestRateChartSlabsApiResource.java` | Slab rows on a chart. |
+
+The complete list of methods on each resource is one `grep -n '@Path' <file>` away.
+
+## `SavingsAccountsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsAccountsApiResource.java`
+Class path: `@Path("/v1/savingsaccounts")`
+
+The savings counterpart of `LoansApiResource`. The POST against `/{accountId}` is the central dispatcher; the `?command=` table is:
+
+| `?command=` | Effect |
+| --- | --- |
+| `approve` | Move from Submitted to Approved. |
+| `undoApproval` | Revert approval. |
+| `reject` / `withdrawnByApplicant` | Terminate before activation. |
+| `activate` | Open the account, optionally with an opening balance. |
+| `close` | Close (with material-event journal entries). |
+| `assignSavingsOfficer` / `unassignSavingsOfficer` | Officer assignment. |
+| `applyAnnualFees` | Force annual-fee application. |
+| `calculateInterest` | Recompute accrued interest. |
+| `postInterest` | Post the accrued interest to the account balance. |
+| `block` / `unblock` | Full freeze. |
+| `blockDebit` / `unblockDebit` | One-way freeze (no withdrawals). |
+| `blockCredit` / `unblockCredit` | One-way freeze (no deposits). |
+| `holdAmount` | Place a hold (used by guarantor logic and external integrations). |
+| `releaseAmount` | Release a hold. |
+| `updateWithHoldTax` | Toggle withholding-tax on this account. |
+
+### GSIM (Group Savings Individual Monitoring)
+
+`POST /v1/savingsaccounts/gsim` creates a parent GSIM account alongside individual member accounts in one transactional payload. The matching update is `PUT /v1/savingsaccounts/gsim/{parentAccountId}`. Group-level commands go through `POST /v1/savingsaccounts/gsimcommands/{parentAccountId}`.
+
+## `SavingsAccountChargesApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsAccountChargesApiResource.java`
+Class path: `@Path("/v1/savingsaccounts/{savingsAccountId}/charges")`
+
+Mirrors `LoanChargesApiResource`. Lifecycle:
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/savingsaccounts/{savingsAccountId}/charges/template` | `retrieveTemplate` |
+| GET | `/v1/savingsaccounts/{savingsAccountId}/charges` | `retrieveAllSavingsAccountCharges` |
+| GET | `/v1/savingsaccounts/{savingsAccountId}/charges/{savingsAccountChargeId}` | `retrieveSavingsAccountCharge` |
+| POST | `/v1/savingsaccounts/{savingsAccountId}/charges` | `addSavingsAccountCharge` |
+| PUT | `/v1/savingsaccounts/{savingsAccountId}/charges/{savingsAccountChargeId}` | `updateSavingsAccountCharge` |
+| POST | `/v1/savingsaccounts/{savingsAccountId}/charges/{savingsAccountChargeId}?command=pay\|waive` | `payOrWaiveSavingsAccountCharge` |
+| DELETE | `/v1/savingsaccounts/{savingsAccountId}/charges/{savingsAccountChargeId}` | `deleteSavingsAccountCharge` |
+
+## `SavingsAccountTransactionsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsAccountTransactionsApiResource.java`
+Class path: `@Path("/v1/savingsaccounts")`
+
+Deposits, withdrawals, holds and overdraft transactions all flow through this resource. Like its loan counterpart it has both numeric-id and external-id mirror paths.
+
+| Method | Path | Handler | Notes |
+| --- | --- | --- | --- |
+| GET | `/v1/savingsaccounts/{savingsId}/transactions/template?command=…` | `retrieveTemplate` | Per-command template. |
+| GET | `/v1/savingsaccounts/{savingsId}/transactions/{transactionId}` | `retrieveOne` | One transaction. |
+| POST | `/v1/savingsaccounts/{savingsId}/transactions?command=…` | `transaction` | Dispatcher: `deposit`, `withdrawal`, `holdAmount`, `releaseAmount`, `dividendPayout`. |
+| POST | `/v1/savingsaccounts/{savingsId}/transactions/{transactionId}?command=undo` | `adjustTransaction` | Reverse. |
+| GET | `/v1/savingsaccounts/{savingsId}/transactions/search` | `searchTransactions` | Date / type / amount filter. |
+| POST | `/v1/savingsaccounts/{savingsId}/transactions/query` | `advancedQuery` | JSON predicate. |
+
+Every shape also exists with `external-id/{savingsExternalId}` and `external-id/{transactionExternalId}` substitutions.
+
+## `SavingsProductsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsProductsApiResource.java`
+Class path: `@Path("/v1/savingsproducts")`
+
+Plain CRUD over `m_savings_product`. The product definition declares default interest rate, posting period, charge-applicability, accounting rule and GL mappings.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/v1/savingsproducts` | `create` |
+| GET | `/v1/savingsproducts` | `retrieveAll` |
+| GET | `/v1/savingsproducts/template` | `retrieveTemplate` |
+| GET | `/v1/savingsproducts/{productId}` | `retrieveOne` |
+| PUT | `/v1/savingsproducts/{productId}` | `update` |
+| DELETE | `/v1/savingsproducts/{productId}` | `delete` |
+
+The accounting payload (`fundSourceAccountId`, `savingsControlAccountId`, `incomeFromFeeAccountId`, `incomeFromInterestId`, `interestOnSavingsAccountId`, `paymentChannelToFundSourceMappings`) mirrors the loan-product shape — see [Loan Products](/api/loan-products).
+
+## Fixed Deposits — `FixedDepositAccountsApiResource` & `FixedDepositProductsApiResource`
+
+Files:
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/FixedDepositAccountsApiResource.java`
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/FixedDepositProductsApiResource.java`
+
+`@Path("/v1/fixeddepositaccounts")` and `@Path("/v1/fixeddepositproducts")`.
+
+Fixed-deposit accounts extend the savings model with a maturity date and an attached interest-rate chart. Account lifecycle commands:
+
+| `?command=` on `/v1/fixeddepositaccounts/{accountId}` | Effect |
+| --- | --- |
+| `approve` / `undoApproval` | Approval flow. |
+| `reject` / `withdrawnByApplicant` | Pre-activation termination. |
+| `activate` | Place the term deposit. |
+| `close` | Normal closure at maturity. |
+| `prematureClose` | Early withdrawal (uses `calculatePrematureAmount` preview to compute interest claw-back). |
+
+The `GET /v1/fixeddepositaccounts/calculate-fd-interest?productId=…&principal=…&depositPeriod=…` endpoint returns the maturity amount for any combination of product / principal / term — handy for UI calculators.
+
+Bulk download/upload templates exist for both account creation and transactions.
+
+The product resource is a plain CRUD identical in shape to `SavingsProductsApiResource`, with extra fields for `minDepositTerm`, `maxDepositTerm`, `preClosurePenalInterest`, the deposit-period range options, and the attached `chartId`.
+
+## Recurring Deposits — `RecurringDepositAccountsApiResource` & `RecurringDepositProductsApiResource`
+
+Files:
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/RecurringDepositAccountsApiResource.java`
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/RecurringDepositProductsApiResource.java`
+
+`@Path("/v1/recurringdepositaccounts")` and `@Path("/v1/recurringdepositproducts")`.
+
+Recurring deposits add a periodic mandatory deposit on top of the FD model. The lifecycle is the same as FD plus the recurring-deposit-specific commands (`updateDepositAmount`, `applyAnnualFees`). Transaction creation goes through `RecurringDepositAccountTransactionsApiResource` (`POST /v1/recurringdepositaccounts/{recurringDepositAccountId}/transactions?command=deposit`).
+
+## `ShareDividendApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/shareproducts/api/ShareDividendApiResource.java`
+Class path: `@Path("/v1/shareproduct/{productId}/dividend")`
+
+A small CRUD against `m_dividends`. Share accounts and share products themselves are served through the polymorphic dispatchers below.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/shareproduct/{productId}/dividend` | `retrieveAll` |
+| GET | `/v1/shareproduct/{productId}/dividend/{dividendId}` | `retrieveDividendDetails` |
+| POST | `/v1/shareproduct/{productId}/dividend` | `createDividendDetail` |
+| PUT | `/v1/shareproduct/{productId}/dividend/{dividendId}` | `updateDividendDetail` |
+| DELETE | `/v1/shareproduct/{productId}/dividend/{dividendId}` | `deleteDividendDetail` |
+
+Posting a dividend allocates per-shareholder amounts based on holdings at the record date and queues per-account journal entries on payout.
+
+## Polymorphic dispatchers — `AccountsApiResource` & `ProductsApiResource`
+
+Files:
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/accounts/api/AccountsApiResource.java`
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/products/api/ProductsApiResource.java`
+
+`@Path("/v1/accounts/{type}")` and `@Path("/v1/products/{type}")`.
+
+These two resources host the **share account** and **share product** endpoints (and any future account/product type that opts into the polymorphic shell). The `{type}` placeholder is resolved against a `ProductTypeService`; today it accepts `share`.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/accounts/{type}/template` | `template` |
+| GET | `/v1/accounts/{type}/{accountId}` | `retrieveAccount` |
+| GET | `/v1/accounts/{type}` | `retrieveAllAccounts` |
+| POST | `/v1/accounts/{type}` | `createAccount` |
+| POST | `/v1/accounts/{type}/{accountId}` | `handleCommands` |
+| PUT | `/v1/accounts/{type}/{accountId}` | `updateAccount` |
+| GET | `/v1/products/{type}` | `retrieveAllProducts` |
+| POST | `/v1/products/{type}` | `createProduct` |
+| PUT | `/v1/products/{type}/{productId}` | `updateProduct` |
+
+The `handleCommands` POST is the dispatcher; for `type=share` it accepts `approve`, `undoApproval`, `reject`, `activate`, `close`, `applyAdditionalShares`, `approveAdditionalShares`, `rejectAdditionalShares`, `redeemShares`, `approveRedeemShares`.
+
+## Interest-rate charts — `InterestRateChartsApiResource` & `InterestRateChartSlabsApiResource`
+
+Files:
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/interestratechart/api/InterestRateChartsApiResource.java`
+- `fineract-provider/src/main/java/org/apache/fineract/portfolio/interestratechart/api/InterestRateChartSlabsApiResource.java`
+
+`@Path("/v1/interestratecharts")` and `@Path("/v1/interestratecharts/{chartId}/chartslabs")`.
+
+Interest-rate charts are how FD and RD products express their yield curves. A chart has a validity window and is composed of *slabs* — `{ from-period, to-period, rate, currencyCode, incentive[] }`. Slabs can carry per-`{client-type, gender, age, attendance, joining-date}` incentives that override the base rate.
+
+CRUD pair:
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/interestratecharts/template` | `template` |
+| GET | `/v1/interestratecharts` | `retrieveAll` |
+| GET | `/v1/interestratecharts/{chartId}` | `retrieveOne` |
+| POST | `/v1/interestratecharts` | `create` |
+| PUT | `/v1/interestratecharts/{chartId}` | `update` |
+| DELETE | `/v1/interestratecharts/{chartId}` | `delete` |
+| GET | `/v1/interestratecharts/{chartId}/chartslabs/template` | `template` |
+| GET | `/v1/interestratecharts/{chartId}/chartslabs` | `retrieveAll` |
+| GET | `/v1/interestratecharts/{chartId}/chartslabs/{chartSlabId}` | `retrieveOne` |
+| POST | `/v1/interestratecharts/{chartId}/chartslabs` | `create` |
+| PUT | `/v1/interestratecharts/{chartId}/chartslabs/{chartSlabId}` | `update` |
+| DELETE | `/v1/interestratecharts/{chartId}/chartslabs/{chartSlabId}` | `delete` |
+
+The chart is bound to the product via `chartId` on the product create/update payload. At account activation the platform snapshots the active slab into the account so subsequent chart changes do not retroactively change existing deposits.
+
+## Permissions
+
+| Permission | Endpoints |
+| --- | --- |
+| `READ_SAVINGSACCOUNT`, `CREATE_SAVINGSACCOUNT`, `UPDATE_SAVINGSACCOUNT`, `DELETE_SAVINGSACCOUNT`, `APPROVE_SAVINGSACCOUNT`, `APPROVALUNDO_SAVINGSACCOUNT`, `REJECT_SAVINGSACCOUNT`, `WITHDRAW_SAVINGSACCOUNT`, `ACTIVATE_SAVINGSACCOUNT`, `CLOSE_SAVINGSACCOUNT`, `DEPOSIT_SAVINGSACCOUNT`, `WITHDRAWAL_SAVINGSACCOUNT`, `CALCULATEINTEREST_SAVINGSACCOUNT`, `POSTINTEREST_SAVINGSACCOUNT`, `ADJUSTTRANSACTION_SAVINGSACCOUNT`, `HOLDAMOUNT_SAVINGSACCOUNT`, `RELEASEAMOUNT_SAVINGSACCOUNT`, `BLOCK_SAVINGSACCOUNT`, `UNBLOCK_SAVINGSACCOUNT`, `BLOCKCREDIT_SAVINGSACCOUNT`, `UNBLOCKCREDIT_SAVINGSACCOUNT`, `BLOCKDEBIT_SAVINGSACCOUNT`, `UNBLOCKDEBIT_SAVINGSACCOUNT` | `SavingsAccountsApiResource` & `SavingsAccountTransactionsApiResource`. |
+| `READ_SAVINGSCHARGE`, `CREATE_SAVINGSCHARGE`, `UPDATE_SAVINGSCHARGE`, `DELETE_SAVINGSCHARGE`, `PAY_SAVINGSCHARGE`, `WAIVE_SAVINGSCHARGE` | `SavingsAccountChargesApiResource`. |
+| `READ_SAVINGSPRODUCT`, `CREATE_SAVINGSPRODUCT`, `UPDATE_SAVINGSPRODUCT`, `DELETE_SAVINGSPRODUCT` | `SavingsProductsApiResource`. |
+| `READ_FIXEDDEPOSITACCOUNT`, `CREATE_FIXEDDEPOSITACCOUNT`, `UPDATE_FIXEDDEPOSITACCOUNT`, `APPROVE_FIXEDDEPOSITACCOUNT`, `ACTIVATE_FIXEDDEPOSITACCOUNT`, `CLOSE_FIXEDDEPOSITACCOUNT`, `PREMATURECLOSE_FIXEDDEPOSITACCOUNT` | `FixedDepositAccountsApiResource`. |
+| `READ_FIXEDDEPOSITPRODUCT`, `CREATE_FIXEDDEPOSITPRODUCT`, `UPDATE_FIXEDDEPOSITPRODUCT`, `DELETE_FIXEDDEPOSITPRODUCT` | `FixedDepositProductsApiResource`. |
+| `READ_RECURRINGDEPOSITACCOUNT`, `CREATE_RECURRINGDEPOSITACCOUNT`, `UPDATE_RECURRINGDEPOSITACCOUNT`, `APPROVE_RECURRINGDEPOSITACCOUNT`, `ACTIVATE_RECURRINGDEPOSITACCOUNT`, `CLOSE_RECURRINGDEPOSITACCOUNT`, `PREMATURECLOSE_RECURRINGDEPOSITACCOUNT` | `RecurringDepositAccountsApiResource`. |
+| `READ_RECURRINGDEPOSITPRODUCT`, `CREATE_RECURRINGDEPOSITPRODUCT`, `UPDATE_RECURRINGDEPOSITPRODUCT`, `DELETE_RECURRINGDEPOSITPRODUCT` | `RecurringDepositProductsApiResource`. |
+| `READ_SHAREACCOUNT`, `CREATE_SHAREACCOUNT`, `APPROVE_SHAREACCOUNT`, `ACTIVATE_SHAREACCOUNT`, `REDEEMSHARES_SHAREACCOUNT`, `APPLYADDITIONALSHARES_SHAREACCOUNT` | `AccountsApiResource` with `type=share`. |
+| `READ_SHAREPRODUCT`, `CREATE_SHAREPRODUCT`, `UPDATE_SHAREPRODUCT`, `DIVIDEND_SHAREPRODUCT` | `ProductsApiResource` and `ShareDividendApiResource`. |
+| `READ_INTERESTRATECHART`, `CREATE_INTERESTRATECHART`, `UPDATE_INTERESTRATECHART`, `DELETE_INTERESTRATECHART` | `InterestRateChartsApiResource` & `InterestRateChartSlabsApiResource`. |
+
+## Common parameters
+
+The list endpoints share filtering and paging conventions:
+
+| Parameter | Purpose |
+| --- | --- |
+| `clientId`, `groupId` | Owner scope. |
+| `productId` | Product filter. |
+| `status` | `all`, `active`, `pending`, `closed`, `matured`, `prematureClosed`. |
+| `accountNo`, `externalId` | Direct lookups. |
+| `associations` | `all`, `transactions`, `charges`, `linkedAccount`, `transactionsAsOf`, `interestPostingHistory`. |
+| `paged=true`, `offset`, `limit`, `orderBy`, `sortOrder` | Pagination. |
+
+Date-range parameters use the standard Fineract convention: `fromDate`, `toDate`, `dateFormat`, `locale` — the last two are mandatory whenever a date param is present.
+
+## Worked example — open and operate a savings account
+
+```bash
+TENANT='Fineract-Platform-TenantId: default'
+HDR='Content-Type: application/json'
+
+# 1. Submit application
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/savingsaccounts \
+  -d '{
+    "clientId": 4711, "productId": 1,
+    "externalId": "SAV-4711-01",
+    "submittedOnDate": "01 April 2024",
+    "dateFormat": "dd MMMM yyyy", "locale": "en"
+  }'
+# → { "savingsId": 821 }
+
+# 2. Approve, activate, then deposit
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/savingsaccounts/821?command=approve' \
+  -d '{ "approvedOnDate": "01 April 2024", "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/savingsaccounts/821?command=activate' \
+  -d '{ "activatedOnDate": "01 April 2024", "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/savingsaccounts/821/transactions?command=deposit' \
+  -d '{ "transactionDate": "02 April 2024", "transactionAmount": 5000, "paymentTypeId": 1,
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+# 3. Place a hold (e.g. for a guaranteed loan)
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/savingsaccounts/821?command=holdAmount' \
+  -d '{ "transactionAmount": 1000, "transactionDate": "10 April 2024",
+        "reasonForBlock": "Guarantor hold for loan 911",
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+```
+
+## Worked example — fixed deposit with interest preview
+
+```bash
+# 1. Preview maturity amount
+curl -k -u admin:password -H "$TENANT" \
+  'https://localhost:8443/fineract-provider/api/v1/fixeddepositaccounts/calculate-fd-interest?productId=2&principal=10000&depositPeriod=12&depositPeriodFrequencyId=2&locale=en'
+
+# 2. Submit the FD application
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/fixeddepositaccounts \
+  -d '{ "clientId": 4711, "productId": 2,
+        "submittedOnDate": "01 April 2024",
+        "depositAmount": 10000, "depositPeriod": 12,
+        "depositPeriodFrequencyId": 2,
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+# 3. Approve, activate
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/fixeddepositaccounts/13?command=approve' \
+  -d '{ "approvedOnDate": "01 April 2024", "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/fixeddepositaccounts/13?command=activate' \
+  -d '{ "activatedOnDate": "01 April 2024", "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+```
+
+## Related domain documents
+
+- `savings/` — JPA entities, status enums and interest-calculation engine.
+- [Accounting](/api/accounting) — `JournalEntriesApiResource` and the GL accounts referenced by every savings product mapping.
+- [Loan Products](/api/loan-products) — same shape for `paymentChannelToFundSourceMappings`.
+- [Clients & Groups](/api/clients-and-groups) — owner of every savings/FD/RD/share account.
+- `portfolio/account-transfers-and-standing-instructions.mdx` — the `AccountTransfersApiResource` that moves money between savings and loan accounts.

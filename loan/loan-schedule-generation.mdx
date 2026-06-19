@@ -1,0 +1,245 @@
+---
+title: "Loan Schedule Generation Pipeline in Apache Fineract"
+sidebarTitle: "Schedule Generation"
+description: "How Apache Fineract turns LoanApplicationTerms into a LoanScheduleModel — the factory, cumulative flat and declining-balance generators, plus holiday handling."
+---
+
+Schedule generation is the calculation layer that turns a loan application into a list of installments. In Apache Fineract it lives under [`fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/`](https://github.com/apache/fineract/tree/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule). The package is split into three layers — `domain/` (interfaces, generators and the in-memory model), `data/` (DTOs returned to read APIs) and `service/` (calculation and persistence services).
+
+The same generators are called at three different moments in a loan's life: when the application is submitted (preview), when the loan is disbursed (persisted as `LoanRepaymentScheduleInstallment` rows) and whenever a re-schedule, interest pause or rate change requires re-computation.
+
+## Inputs: `LoanApplicationTerms`
+
+[`LoanApplicationTerms`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanApplicationTerms.java) is the single argument every generator takes. It is the *unflattened* view of everything needed to produce a schedule:
+
+- Currency, principal and (optional) net disbursal amount.
+- Interest configuration — nominal rate, period type, [`InterestMethod`](/loan/loan-product#interest-and-amortization-methods), [`InterestCalculationPeriodMethod`](/loan/loan-product#interest-and-amortization-methods), partial-period flag.
+- Repayment configuration — `repayEvery`, `repaymentPeriodFrequencyType`, `numberOfRepayments`, `expectedDisbursementDate`, `repaymentsStartingFromDate`.
+- Amortization — [`AmortizationMethod`](/loan/loan-product#interest-and-amortization-methods) and grace settings (`graceOnPrincipalPayment`, `graceOnInterestPayment`, `graceOnInterestCharged`, `recurringMoratoriumOnPrincipalPeriods`).
+- Calendar — `DaysInMonthType`, `DaysInYearType` (with `DaysInYearCustomStrategyType`), `Calendar`, `CalendarHistoryDataWrapper`, `CalendarInstance`.
+- Variations — a `LoanTermVariationsDataWrapper` carrying date / EMI / interest-rate changes built up from rescheduling and from product configuration.
+- Disbursement tranches — `List<DisbursementData>` for multi-disbursement loans.
+- Recalculation, down-payment and capitalized-income / buy-down-fee strategy hints carried over from `LoanProduct`.
+
+A second argument, [`HolidayDetailDTO`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/data/HolidayDetailDTO.java), carries the holiday list, working-day rules and `RepaymentRescheduleType` enum value used to shift due dates that fall on a holiday or non-working day.
+
+## The contract
+
+```java
+// fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanScheduleGenerator.java
+public interface LoanScheduleGenerator {
+
+    LoanScheduleModel generate(MathContext mc, LoanApplicationTerms loanApplicationTerms,
+            Set<LoanCharge> loanCharges, HolidayDetailDTO holidayDetailDTO);
+
+    LoanScheduleDTO rescheduleNextInstallments(MathContext mc, LoanApplicationTerms loanApplicationTerms, Loan loan,
+            HolidayDetailDTO holidayDetailDTO, LoanRepaymentScheduleTransactionProcessor processor,
+            LocalDate rescheduleFrom);
+
+    OutstandingAmountsDTO calculatePrepaymentAmount(MonetaryCurrency currency, LocalDate onDate,
+            LoanApplicationTerms loanApplicationTerms, MathContext mc, Loan loan, HolidayDetailDTO holidayDetailDTO,
+            LoanRepaymentScheduleTransactionProcessor processor);
+
+    Money getPeriodInterestTillDate(@NotNull LoanRepaymentScheduleInstallment installment, @NotNull LocalDate targetDate);
+}
+```
+
+Four entry points:
+
+- `generate(...)` — initial schedule, returns the in-memory [`LoanScheduleModel`](#loanschedulemodel).
+- `rescheduleNextInstallments(...)` — replays the schedule from a given date, used by re-aging, re-amortization, interest pause and term-variation flows.
+- `calculatePrepaymentAmount(...)` — what does it cost the borrower to close on `onDate`?
+- `getPeriodInterestTillDate(...)` — pro-rated interest up to a given date, used by accrual jobs.
+
+## Factory selection
+
+`LoanScheduleGeneratorFactory` is a one-method strategy lookup:
+
+```java
+// fineract-loan/.../loanschedule/domain/LoanScheduleGeneratorFactory.java
+public interface LoanScheduleGeneratorFactory {
+    LoanScheduleGenerator create(LoanScheduleType loanScheduleType, InterestMethod interestMethod);
+}
+```
+
+The default implementation [`DefaultLoanScheduleGeneratorFactory`](https://github.com/apache/fineract/blob/develop/fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/DefaultLoanScheduleGeneratorFactory.java) lives in `fineract-provider` because progressive loans are wired in via `fineract-progressive-loan`:
+
+```java
+@Component
+@RequiredArgsConstructor
+public class DefaultLoanScheduleGeneratorFactory implements LoanScheduleGeneratorFactory {
+
+    private final ProgressiveLoanScheduleGenerator progressiveLoanScheduleGenerator;
+    private final CumulativeFlatInterestLoanScheduleGenerator cumulativeFlatInterestLoanScheduleGenerator;
+    private final CumulativeDecliningBalanceInterestLoanScheduleGenerator cumulativeDecliningBalanceInterestLoanScheduleGenerator;
+
+    @Override
+    public LoanScheduleGenerator create(final LoanScheduleType loanScheduleType, final InterestMethod interestMethod) {
+        return switch (loanScheduleType) {
+            case CUMULATIVE -> cumulativeLoanScheduleGenerator(interestMethod);
+            case PROGRESSIVE -> progressiveLoanScheduleGenerator;
+        };
+    }
+
+    private LoanScheduleGenerator cumulativeLoanScheduleGenerator(final InterestMethod interestMethod) {
+        return switch (interestMethod) {
+            case FLAT -> cumulativeFlatInterestLoanScheduleGenerator;
+            case DECLINING_BALANCE -> cumulativeDecliningBalanceInterestLoanScheduleGenerator;
+            case INVALID -> null;
+        };
+    }
+}
+```
+
+The selection key is the pair `(LoanScheduleType, InterestMethod)`, both copied from the [`LoanProduct`](/loan/loan-product) at submit time. Progressive loans always return the single `ProgressiveLoanScheduleGenerator` (it does its own period-by-period math regardless of interest method).
+
+```mermaid
+flowchart LR
+    LP[LoanProduct.loanScheduleType<br/>+ interestMethod]
+    F[LoanScheduleGeneratorFactory]
+    F2[DefaultLoanScheduleGeneratorFactory]
+    Flat[CumulativeFlatInterestLoanScheduleGenerator]
+    Decl[CumulativeDecliningBalanceInterestLoanScheduleGenerator]
+    Prog[ProgressiveLoanScheduleGenerator<br/>(fineract-progressive-loan)]
+    LAT[LoanApplicationTerms]
+    LSM[LoanScheduleModel]
+    INST[LoanRepaymentScheduleInstallment<br/>rows on m_loan_repayment_schedule]
+
+    LP --> F
+    F --> F2
+    F2 -- CUMULATIVE + FLAT --> Flat
+    F2 -- CUMULATIVE + DECLINING_BALANCE --> Decl
+    F2 -- PROGRESSIVE --> Prog
+    LAT --> Flat
+    LAT --> Decl
+    LAT --> Prog
+    Flat --> LSM
+    Decl --> LSM
+    Prog --> LSM
+    LSM --> INST
+```
+
+## Cumulative generators
+
+Both cumulative generators extend [`AbstractCumulativeLoanScheduleGenerator`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/AbstractCumulativeLoanScheduleGenerator.java), which owns the iteration loop over periods, charge integration and grace handling. Each subclass implements one hook — `calculatePrincipalInterestComponentsForPeriod(...)` — that produces a [`PrincipalInterest`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/PrincipalInterest.java) value object for that one period.
+
+### `CumulativeFlatInterestLoanScheduleGenerator`
+
+Flat interest distributes a fixed total interest amount evenly across periods (subject to amortization tweaks for the last period).
+
+```java
+// fineract-loan/.../loanschedule/domain/CumulativeFlatInterestLoanScheduleGenerator.java
+@Component
+public class CumulativeFlatInterestLoanScheduleGenerator extends AbstractCumulativeLoanScheduleGenerator {
+
+    @Override
+    public PrincipalInterest calculatePrincipalInterestComponentsForPeriod(...) {
+        final PrincipalInterest result = loanApplicationTerms.calculateTotalInterestForPeriod(...);
+        Money interestForThisInstallment = result.interest();
+        Money principalForThisInstallment = loanApplicationTerms.calculateTotalPrincipalForPeriod(
+                calculator, outstandingBalance, periodNumber, mc, interestForThisInstallment);
+
+        principalForThisInstallment = loanApplicationTerms.adjustPrincipalIfLastRepaymentPeriod(
+                principalForThisInstallment, totalCumulativePrincipalToDate, periodNumber);
+        interestForThisInstallment = loanApplicationTerms.adjustInterestIfLastRepaymentPeriod(
+                interestForThisInstallment, totalCumulativeInterestToDate, totalInterestDueForLoan, periodNumber);
+
+        return new PrincipalInterest(principalForThisInstallment, interestForThisInstallment,
+                result.interestPaymentDueToGrace());
+    }
+}
+```
+
+### `CumulativeDecliningBalanceInterestLoanScheduleGenerator`
+
+Declining balance recomputes interest from the outstanding principal each period. The class-level Javadoc captures the two amortization variants exactly:
+
+> Declining balance can be amortized in two ways at present:
+> 1. Equal principal payments — the principal component is fixed and interest is calculated from the outstanding balance, so total payment differs every period.
+> 2. Equal installments — total payment is fixed (Excel-like `pmt`), interest is computed from the outstanding balance, and the principal slice is total minus interest.
+
+Both subclasses delegate scheduled-date math to a shared collaborator (`ScheduledDateGenerator`) and APR / period math to `PaymentPeriodsInOneYearCalculator`.
+
+## Scheduled-date generation and calendars
+
+`ScheduledDateGenerator` (default impl [`DefaultScheduledDateGenerator`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/DefaultScheduledDateGenerator.java)) produces the candidate installment due dates from `LoanApplicationTerms`, then asks two collaborators to adjust them:
+
+- **`Calendar`** + **`CalendarInstance`** — meeting calendars (weekly, monthly, etc.) tied to centers/groups. Drives the base recurrence using iCal4j `Recur`.
+- **Holiday / working-day services** — [`HolidayUtil`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/organisation/holiday/service/HolidayUtil.java) and [`WorkingDaysUtil`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/organisation/workingdays/service/WorkingDaysUtil.java) read the `HolidayDetailDTO` and a `RepaymentRescheduleType` to decide whether a due date is moved to the next working day, kept on the holiday, or extended by the holiday length.
+
+This separation means the math generators do not have to know anything about working-day rules.
+
+## Outputs: `LoanScheduleModel` & `LoanScheduleModelPeriod`
+
+`LoanScheduleModel` is the in-memory, *non-persistent* result.
+
+```java
+// fineract-loan/.../loanschedule/domain/LoanScheduleModel.java
+/** Domain representation of a Loan Schedule (not used for persistence) */
+@Getter
+public final class LoanScheduleModel {
+    private final List<LoanScheduleModelPeriod> periods;
+    private final CurrencyData currency;
+    private final int loanTermInDays;
+    private final Money totalPrincipalDisbursed;
+    private final BigDecimal totalPrincipalExpected;
+    private final BigDecimal totalPrincipalPaid;
+    private final BigDecimal totalInterestCharged;
+    private final BigDecimal totalFeeChargesCharged;
+    private final BigDecimal totalPenaltyChargesCharged;
+    private final BigDecimal totalRepaymentExpected;
+    private final BigDecimal totalOutstanding;
+}
+```
+
+Each `LoanScheduleModelPeriod` is one row of the schedule:
+
+```java
+public interface LoanScheduleModelPeriod {
+    LoanSchedulePeriodData toData();
+    boolean isRepaymentPeriod();
+    boolean isDownPaymentPeriod();
+    Integer periodNumber();
+    LocalDate periodFromDate();
+    LocalDate periodDueDate();
+    BigDecimal principalDue();
+    BigDecimal interestDue();
+    BigDecimal feeChargesDue();
+    BigDecimal penaltyChargesDue();
+    boolean isRecalculatedInterestComponent();
+    // ...
+}
+```
+
+There are three concrete implementations: [`LoanScheduleModelRepaymentPeriod`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanScheduleModelRepaymentPeriod.java) for repayment rows, [`LoanScheduleModelDisbursementPeriod`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanScheduleModelDisbursementPeriod.java) for the disbursement marker and [`LoanScheduleModelDownPaymentPeriod`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/data/LoanScheduleModelDownPaymentPeriod.java) for auto down-payments.
+
+The persisted form is [`LoanRepaymentScheduleInstallment`](/loan/repayment-schedule-installments) — see that page for the field-by-field map.
+
+## Service layer
+
+The `service/` subpackage owns the orchestration:
+
+- [`LoanScheduleCalculationPlatformService`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/service/LoanScheduleCalculationPlatformService.java) — read-side preview of a schedule from API input.
+- [`LoanScheduleWritePlatformService`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/service/LoanScheduleWritePlatformService.java) — write-side, used by command handlers to persist generated schedules.
+- [`LoanScheduleHistoryReadPlatformService`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/service/LoanScheduleHistoryReadPlatformService.java) / [`LoanScheduleHistoryWritePlatformService`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/service/LoanScheduleHistoryWritePlatformService.java) — snapshot the schedule into [`LoanRepaymentScheduleHistory`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanRepaymentScheduleHistory.java) whenever a reschedule rewrites the live installments.
+
+## Re-schedule, re-age, interest pause
+
+`rescheduleNextInstallments(...)` is the same code path the rescheduling APIs use. It accepts a `rescheduleFrom` date (and an optional `rescheduleTill`), recomputes only the affected tail of the schedule, and returns a [`LoanScheduleDTO`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/data/LoanScheduleDTO.java) carrying both the new `LoanScheduleModel` and any [`LoanRepaymentScheduleHistory`](https://github.com/apache/fineract/blob/develop/fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/LoanRepaymentScheduleHistory.java) snapshot rows needed for audit.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Repayment Schedule Installments" icon="list-ol" href="/loan/repayment-schedule-installments">
+    The persisted form of `LoanScheduleModelPeriod`.
+  </Card>
+  <Card title="Loan Product" icon="cube" href="/loan/loan-product">
+    Source of `(LoanScheduleType, InterestMethod)` that picks the generator.
+  </Card>
+  <Card title="Transactions & Charges" icon="receipt" href="/loan/loan-transaction-and-charge">
+    Transactions apply to the schedule the generators build.
+  </Card>
+  <Card title="Loan Aggregate" icon="layer-group" href="/loan/loan-aggregate">
+    Aggregate that stores the generated installments.
+  </Card>
+</CardGroup>

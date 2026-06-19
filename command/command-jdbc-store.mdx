@@ -1,0 +1,518 @@
+---
+title: "JDBC Command Store — Durable m_command Table & DAO"
+sidebarTitle: "JDBC Store"
+description: "How fineract-command-jdbc persists Command envelopes into m_command via Spring Data JDBC, MapStruct, JSON converters, retries, and file dead-letter queue."
+---
+
+The `fineract-command-jdbc` module supplies the durable backing store for the
+new command bus SPI in Apache Fineract. It implements `CommandStore` against a
+`m_command` table managed by Liquibase, with Spring Data JDBC repositories,
+MapStruct mappers, Jackson JSON converters, a Resilience4j retry on writes,
+and a file dead-letter queue for catastrophic failures. This page walks every
+file under `fineract-command-jdbc/src/main/java/org/apache/fineract/command/jdbc/`
+and the changelog under `src/main/resources/db/changelog/`.
+
+## Package layout
+
+```
+fineract-command-jdbc/src/main/java/org/apache/fineract/command/jdbc/
+├── JdbcCommandProperties.java
+├── starter/
+│   └── JdbcCommandAutoConfiguration.java
+└── store/
+    ├── JdbcCommandStore.java
+    ├── converter/
+    │   ├── JsonNodeReadingConverter.java
+    │   └── JsonNodeWritingConverter.java
+    ├── domain/
+    │   ├── CommandEntity.java
+    │   └── CommandRepository.java
+    └── mapping/
+        ├── CommandJsonMapper.java
+        └── CommandMapper.java
+```
+
+Liquibase changelog under `src/main/resources/db/changelog/tenant/module/command/`:
+
+```
+module-changelog-master.xml
+parts/
+├── 0001_command_init.xml
+└── 0002_command_fix_structure.xml
+```
+
+Auto-configuration import:
+
+```
+fineract-command-jdbc/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+└── org.apache.fineract.command.jdbc.starter.JdbcCommandAutoConfiguration
+```
+
+## `JdbcCommandProperties` — `fineract.command.jdbc.*`
+
+```java
+// fineract-command-jdbc/.../command/jdbc/JdbcCommandProperties.java
+@ConfigurationProperties(prefix = "fineract.command.jdbc")
+public final class JdbcCommandProperties implements Serializable {
+
+    @Builder.Default private Boolean enabled = false;
+    @Builder.Default private Boolean fileDeadLetterQueueEnabled = false;
+    @Builder.Default private String  fileDeadLetterQueuePath = "/tmp/fineract/dlq";
+}
+```
+
+| Property                                                          | Default               | Purpose                                              |
+|-------------------------------------------------------------------|-----------------------|------------------------------------------------------|
+| `fineract.command.jdbc.enabled`                                     | `false`               | Master switch — enables `JdbcCommandStore`.          |
+| `fineract.command.jdbc.file-dead-letter-queue-enabled`              | `false`               | If the JDBC write fails after retries, dump JSON to disk. |
+| `fineract.command.jdbc.file-dead-letter-queue-path`                 | `/tmp/fineract/dlq`   | Folder; created at startup.                          |
+
+## The schema — `m_command`
+
+The table is created by two Liquibase changesets. The first
+(`0001_command_init.xml`) creates the bare bones:
+
+```xml
+<!-- fineract-command-jdbc/.../parts/0001_command_init.xml (PostgreSQL branch) -->
+<createTable tableName="m_command">
+    <column autoIncrement="true" name="id" type="bigint" remarks="Internal ID">
+        <constraints nullable="false" primaryKey="true"/>
+    </column>
+    <column name="created_at" type="timestamp with time zone"/>
+    <column name="command_id" type="uuid"/>
+    <column name="tenant_id" type="varchar(255)"/>
+    <column name="username" type="varchar(255)"/>
+    <column name="payload" type="text"/>
+</createTable>
+```
+
+The MySQL variant in the same file uses `datetime` instead of `timestamp with
+time zone`. There's a temporary MySQL table called `command` that's later
+renamed.
+
+`0002_command_fix_structure.xml` evolves the table into its current shape:
+
+```xml
+<!-- fineract-command-jdbc/.../parts/0002_command_fix_structure.xml -->
+<renameTable oldTableName="command" newTableName="m_command"/>
+<addColumn tableName="m_command">
+    <column name="updated_at" type="timestamp with time zone"/>
+    <column name="executed_at" type="timestamp with time zone"/>
+    <column name="approved_at" type="timestamp with time zone"/>
+    <column name="rejected_at" type="timestamp with time zone"/>
+</addColumn>
+
+<renameColumn tableName="m_command" oldColumnName="username"
+              newColumnName="initiated_by_username" columnDataType="varchar(255)"/>
+<renameColumn tableName="m_command" oldColumnName="payload"
+              newColumnName="request" columnDataType="text"/>
+
+<addColumn tableName="m_command">
+    <column name="idempotency_key" type="varchar(255)"/>
+    <column name="executed_by_username" type="varchar(255)"/>
+    <column name="approved_by_username" type="varchar(255)"/>
+    <column name="rejected_by_username" type="varchar(255)"/>
+    <column name="ip_address" type="varchar(255)"/>
+    <column name="state" type="varchar(255)"/>
+    <column name="response" type="text"/>
+    <column name="error" type="text"/>
+</addColumn>
+
+<createIndex tableName="m_command" indexName="m_command_idempotency_key_index">
+    <column name="idempotency_key"/>
+</createIndex>
+```
+
+The final layout matches the JPA-free entity (Spring Data JDBC) in
+`CommandEntity`:
+
+| Column                   | Type                       | Mirrors `Command<T>` field |
+|--------------------------|----------------------------|----------------------------|
+| `id`                     | `bigint` (auto)            | `commandId`                |
+| `created_at`             | `timestamp with time zone` | `createdAt`                |
+| `updated_at`             | `timestamp with time zone` | `updatedAt`                |
+| `executed_at`            | `timestamp with time zone` | `executedAt`               |
+| `approved_at`            | `timestamp with time zone` | `approvedAt`               |
+| `rejected_at`            | `timestamp with time zone` | `rejectedAt`               |
+| `initiated_by_username`  | `varchar(255)`             | `initiatedByUsername`      |
+| `executed_by_username`   | `varchar(255)`             | `executedByUsername`       |
+| `approved_by_username`   | `varchar(255)`             | `approvedByUsername`       |
+| `rejected_by_username`   | `varchar(255)`             | `rejectedByUsername`       |
+| `idempotency_key`        | `varchar(255)` + index     | `idempotencyKey`           |
+| `state`                  | `varchar(255)`             | `CommandState` enum name   |
+| `error`                  | `text`                     | `error`                    |
+| `ip_address`             | `varchar(255)`             | `ipAddress`                |
+| `request`                | `text` (JSON)              | `payload` (request side)   |
+| `response`               | `text` (JSON)              | mapper's `response`        |
+
+## `CommandEntity` — Spring Data JDBC mapping
+
+```java
+// fineract-command-jdbc/.../store/domain/CommandEntity.java
+@Getter @Setter @ToString
+@FieldNameConstants
+@Table("m_command")
+public class CommandEntity implements Serializable {
+
+    @Id
+    @Column("id")
+    private Long id;
+
+    @Column("created_at")            private Instant createdAt;
+    @Column("updated_at")            private Instant updatedAt;
+    @Column("executed_at")           private Instant executedAt;
+    @Column("approved_at")           private Instant approvedAt;
+    @Column("rejected_at")           private Instant rejectedAt;
+
+    @Column("initiated_by_username") private String  initiatedByUsername;
+    @Column("executed_by_username")  private String  executedByUsername;
+    @Column("approved_by_username")  private String  approvedByUsername;
+    @Column("rejected_by_username")  private String  rejectedByUsername;
+
+    @Column("idempotency_key")       private String  idempotencyKey;
+    @Column("state")                 private CommandState state;
+    @Column("error")                 private String  error;
+    @Column("ip_address")            private String  ipAddress;
+
+    @Column("request")               private JsonNode request;
+    @Column("response")              private JsonNode response;
+}
+```
+
+Important details:
+
+- **Spring Data JDBC**, not JPA. `@org.springframework.data.annotation.Id`,
+  `@org.springframework.data.relational.core.mapping.Table` and `@Column`.
+- The `request` and `response` columns are typed `JsonNode`. The converters
+  (below) bridge `text ↔ JsonNode` so the database column stays a plain
+  `TEXT` (Liquibase did not switch to `jsonb` to stay portable).
+- No version column — there's no optimistic locking; `JdbcCommandStore.store`
+  saves blind.
+
+## `CommandRepository` — Spring Data JDBC repository
+
+```java
+// fineract-command-jdbc/.../store/domain/CommandRepository.java
+public interface CommandRepository extends ListCrudRepository<CommandEntity, Long>,
+                                            QueryByExampleExecutor<CommandEntity> {
+
+    Optional<CommandEntity> findOneByIdempotencyKey(String idempotencyKey);
+}
+```
+
+`ListCrudRepository` is the modern flavour of `CrudRepository` returning
+`List` rather than `Iterable`. `QueryByExampleExecutor` is what enables
+filter-by-Example queries (e.g. find all by state). The single derived query
+covers idempotency lookups.
+
+## JSON converters
+
+```java
+// fineract-command-jdbc/.../store/converter/JsonNodeReadingConverter.java
+@Component
+@ReadingConverter
+public class JsonNodeReadingConverter implements Converter<String, JsonNode> {
+
+    private final ObjectMapper mapper;
+
+    @SneakyThrows
+    @Override
+    public JsonNode convert(String source) {
+        return mapper.readTree(source);
+    }
+}
+```
+
+A parallel `JsonNodeWritingConverter` produces `JsonNode → String`. They are
+registered into Spring Data JDBC's `JdbcCustomConversions` in
+`JdbcCommandAutoConfiguration`:
+
+```java
+// fineract-command-jdbc/.../starter/JdbcCommandAutoConfiguration.java
+@AutoConfiguration
+@EnableConfigurationProperties(JdbcCommandProperties.class)
+@ComponentScan("org.apache.fineract.command.jdbc.store")
+@ConditionalOnProperty(value = "fineract.command.jdbc.enabled", havingValue = "true")
+public class JdbcCommandAutoConfiguration {
+
+    @Bean
+    JdbcCustomConversions customConversions(JsonNodeReadingConverter jsonNodeReadingConverter,
+                                            JsonNodeWritingConverter jsonNodeWritingConverter) {
+        return new JdbcCustomConversions(List.of(jsonNodeReadingConverter, jsonNodeWritingConverter));
+    }
+}
+```
+
+## `CommandJsonMapper` — payload ↔ `JsonNode`
+
+```java
+// fineract-command-jdbc/.../store/mapping/CommandJsonMapper.java
+@Component
+public final class CommandJsonMapper {
+
+    private final ObjectMapper mapper;
+
+    public <T> T map(JsonNode source) {
+        if (source == null) { return null; }
+        var canonicalName = source.get(COMMAND_JSON_CLASS_ATTRIBUTE).asText();
+        try {
+            return (T) mapper.convertValue(source, Class.forName(canonicalName));
+        } catch (Exception e) {
+            log.error("Error while mapping json node", e);
+        }
+        return null;
+    }
+
+    public JsonNode map(Object source) {
+        if (source == null) { return null; }
+        var json = mapper.convertValue(source, ObjectNode.class);
+        json.set(COMMAND_JSON_CLASS_ATTRIBUTE, new TextNode(source.getClass().getCanonicalName()));
+        return json;
+    }
+}
+```
+
+`COMMAND_JSON_CLASS_ATTRIBUTE` is `"@class"` (from `CommandConstants`).
+
+- **Write side** — serialise the request/response object to a Jackson
+  `ObjectNode`, then inject `"@class": "com.foo.Bar"`. The string is the
+  payload's canonical class name.
+- **Read side** — pull the `@class` attribute out and call `Class.forName(...)`
+  to know what to deserialise into. This is how `JdbcCommandStore.getRequestById(...)`
+  returns a strongly typed object without the caller passing a `Class<T>`.
+
+<Warning>
+  `Class.forName(...)` against an arbitrary classname is a classic deserialisation
+  hazard. Only enable `fineract.command.jdbc.enabled=true` when the
+  `m_command.request` and `m_command.response` columns are trusted (i.e. only
+  the application itself writes them).
+</Warning>
+
+## `CommandMapper` — MapStruct entity ↔ envelope
+
+```java
+// fineract-command-jdbc/.../store/mapping/CommandMapper.java
+@Mapper(componentModel = SPRING, injectionStrategy = CONSTRUCTOR,
+        uses = { CommandJsonMapper.class })
+public interface CommandMapper {
+
+    @Mapping(source = "commandId",          target = "id")
+    @Mapping(source = "createdAt",          target = "createdAt")
+    @Mapping(source = "updatedAt",          target = "updatedAt")
+    @Mapping(source = "executedAt",         target = "executedAt")
+    @Mapping(source = "approvedAt",         target = "approvedAt")
+    @Mapping(source = "rejectedAt",         target = "rejectedAt")
+    @Mapping(source = "initiatedByUsername", target = "initiatedByUsername")
+    @Mapping(source = "executedByUsername",  target = "executedByUsername")
+    @Mapping(source = "approvedByUsername",  target = "approvedByUsername")
+    @Mapping(source = "rejectedByUsername",  target = "rejectedByUsername")
+    @Mapping(source = "payload",            target = "request")
+    @Mapping(source = "ipAddress",          target = "ipAddress")
+    @Mapping(source = "idempotencyKey",     target = "idempotencyKey")
+    @Mapping(source = "error",              target = "error")
+    @Mapping(ignore = true,                 target = "state")
+    @Mapping(ignore = true,                 target = "response")
+    CommandEntity map(Command source);
+
+    @Mapping(source = "source.payload",   target = "request")
+    @Mapping(source = "response",         target = "response")
+    @Mapping(ignore = true,               target = "state")
+    CommandEntity map(Command source, Object response);
+
+    @InheritInverseConfiguration
+    Command map(CommandEntity source);
+}
+```
+
+Key callouts:
+
+- **MapStruct** generates the implementation at compile time.
+- `uses = { CommandJsonMapper.class }` makes the `Object → JsonNode` and
+  `JsonNode → Object` conversions automatic.
+- `state` is intentionally ignored in both directions — the caller
+  (`JdbcCommandStore.store`) sets it explicitly.
+- The two-argument `map(source, response)` overload is what saves a response
+  alongside the request once the handler returns.
+
+## `JdbcCommandStore` — the `CommandStore` implementation
+
+```java
+// fineract-command-jdbc/.../store/JdbcCommandStore.java
+@Component
+@ConditionalOnMissingBean(value = CommandStore.class, ignored = JdbcCommandStore.class)
+public class JdbcCommandStore implements CommandStore {
+
+    private final CommandMapper          mapper;
+    private final CommandRepository      repository;
+    private final ObjectMapper           objectMapper;
+    private final JdbcCommandProperties  properties;
+
+    @Override
+    public <T> T getRequestById(Long id) {
+        return (T) repository.findById(id).map(CommandEntity::getRequest)
+                .map(json -> objectMapper.convertValue(json,
+                        forName(json.get(COMMAND_JSON_CLASS_ATTRIBUTE).asText())))
+                .orElse(null);
+    }
+    /* getResponseById, getStateById, getRequestByKey, getResponseByKey, getStateByKey
+       follow the same shape, querying by id or idempotency_key. */
+
+    @Override
+    @Retry(name = "commandStore", fallbackMethod = "fallback")
+    public void store(Command<?> command, Object response, CommandState state) {
+        final var commandEntity = isNull(response) ? mapper.map(command) : mapper.map(command, response);
+
+        if (state != null) {
+            commandEntity.setState(state);
+        }
+
+        repository.save(commandEntity);
+
+        command.setCommandId(commandEntity.getId());
+    }
+
+    void fallback(Command<?> command, Object response, CommandState state, Throwable t) throws Exception {
+        if (Boolean.TRUE.equals(properties.getFileDeadLetterQueueEnabled())) {
+            write(command);
+        }
+    }
+
+    @EventListener(ApplicationStartedEvent.class)
+    void onStartup() {
+        try {
+            var created = Path.of(properties.getFileDeadLetterQueuePath()).toFile().mkdirs();
+            log.info("Created command dead-letter queue: {} ({})",
+                    properties.getFileDeadLetterQueuePath(), created);
+        } catch (Exception e) {
+            log.error("Unable to initialize command dead-letter queue:", e);
+        }
+    }
+
+    @SneakyThrows
+    private Class<?> forName(String clazz) { return Class.forName(clazz); }
+
+    private void write(Command<?> command) throws IOException {
+        var file = Path.of(properties.getFileDeadLetterQueuePath(),
+                command.getCreatedAt().toEpochMilli() + "-"
+                        + Optional.ofNullable(command.getIdempotencyKey())
+                                  .orElseGet(() -> UUID.randomUUID().toString())
+                        + ".json").toFile();
+        FileUtils.write(file, objectMapper.writeValueAsString(command), UTF_8);
+    }
+}
+```
+
+Two important behaviours:
+
+1. **Resilience4j `@Retry(name = "commandStore", fallbackMethod = "fallback")`**.
+   If the JDBC write throws (e.g. connection blip), Resilience4j retries with
+   the policy bound to the `commandStore` name (see your
+   `resilience4j.retry.instances.commandStore.*` properties). After exhaustion,
+   `fallback(command, response, state, throwable)` runs.
+2. **File dead-letter queue.** The fallback writes the full `Command<?>`
+   envelope (with payload but no response) to
+   `${fileDeadLetterQueuePath}/<epochMs>-<idempotencyKey|uuid>.json`. This is
+   the safety net so a temporary DB outage doesn't silently lose audit
+   records.
+
+3. **`command.setCommandId(commandEntity.getId())`** — after a successful save,
+   the autogenerated id is mirrored back onto the in-memory envelope so the
+   `@After` hook can stamp `executedAt`/`updatedAt` and call `store(...)` again
+   with the same id.
+
+## Sequence — the full audit write
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Hook as AuditCommandHook<br/>(Before/After/Error)
+    participant Store as JdbcCommandStore
+    participant Mapper as CommandMapper<br/>(+ CommandJsonMapper)
+    participant Repo as CommandRepository
+    participant DB as m_command
+    participant FS as DLQ folder
+
+    Hook->>Store: store(command, response, state)
+    Store->>Mapper: map(command [, response])
+    Mapper->>Mapper: CommandJsonMapper:<br/>payload → JsonNode + @class
+    Mapper-->>Store: CommandEntity
+    Store->>Store: commandEntity.setState(state)
+    alt JDBC write OK
+        Store->>Repo: save(commandEntity)
+        Repo->>DB: INSERT/UPDATE
+        Store->>Store: command.setCommandId(entity.id)
+        Store-->>Hook: void
+    else JDBC write fails
+        Store->>Repo: save (throws)
+        loop Resilience4j retry
+            Store->>Repo: save again
+        end
+        Store->>Store: fallback(command, response, state, t)
+        opt fileDeadLetterQueueEnabled
+            Store->>FS: write &lt;ts&gt;-&lt;key&gt;.json
+        end
+        Store--xHook: exception (or silent if DLQ wrote)
+    end
+```
+
+## Idempotency replay using `m_command.idempotency_key`
+
+```java
+@Override
+public CommandState getStateByKey(String key) {
+    return repository.findOneByIdempotencyKey(key)
+            .map(CommandEntity::getState)
+            .orElse(UNKNOWN);
+}
+```
+
+Combined with `getResponseByKey(...)`, a future dispatcher could short-circuit
+a replay before invoking the handler. Today, this lookup is exposed on
+`CommandStore` but is not yet used by the synchronous dispatcher in
+`fineract-command/implementation/SynchronousCommandDispatcher.java`.
+
+The provider-side stack does its own equivalent (against
+`m_portfolio_command_source.idempotency_key`) — see
+[Command Implementation](/command/command-implementation#idempotency-replay).
+
+## Source-of-truth role
+
+Within the new SPI, `m_command` is intended to be:
+
+- **The persistent record** of every dispatched command, including its
+  payload, response, state, and timestamps.
+- **The replay log** — `getRequestById(...)` returns the original typed
+  payload, so a future replay tool can re-dispatch on the bus.
+- **The idempotency index** — `m_command_idempotency_key_index` makes
+  point-lookups by key cheap.
+
+The older provider-side audit trail in `m_portfolio_command_source` has the
+same role today; the new table is the migration target.
+
+## File map
+
+| Path                                                                                            | Purpose                                            |
+|-------------------------------------------------------------------------------------------------|----------------------------------------------------|
+| `JdbcCommandProperties.java`                                                                    | `fineract.command.jdbc.*` props                    |
+| `starter/JdbcCommandAutoConfiguration.java`                                                     | Auto-config gate + `JdbcCustomConversions` bean    |
+| `store/JdbcCommandStore.java`                                                                   | `CommandStore` implementation with retry + DLQ     |
+| `store/converter/JsonNodeReadingConverter.java`                                                 | `String → JsonNode` Spring `@ReadingConverter`     |
+| `store/converter/JsonNodeWritingConverter.java`                                                 | `JsonNode → String` Spring `@WritingConverter`     |
+| `store/domain/CommandEntity.java`                                                               | Spring Data JDBC `@Table("m_command")` entity      |
+| `store/domain/CommandRepository.java`                                                           | `ListCrudRepository` + `findOneByIdempotencyKey`   |
+| `store/mapping/CommandJsonMapper.java`                                                          | Object ↔ `JsonNode` with `@class` discriminator    |
+| `store/mapping/CommandMapper.java`                                                              | MapStruct entity ↔ envelope mapper                 |
+| `db/changelog/tenant/module/command/parts/0001_command_init.xml`                                | Initial Liquibase table                            |
+| `db/changelog/tenant/module/command/parts/0002_command_fix_structure.xml`                       | Lifecycle columns, rename, idempotency index       |
+| `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`               | Spring Boot auto-registration                      |
+
+## What's next
+
+- [Command Audit Hooks](/command/command-audit) — the hooks that drive
+  `CommandStore.store(...)`.
+- [Command Core SPI](/command/command-core) — the `CommandStore` interface
+  this module implements.
+- [Maker-Checker & Audits](/command/maker-checker-and-audits) — the older
+  `m_portfolio_command_source`-backed audit trail and its REST surface.
+- [Command Implementation](/command/command-implementation) — how
+  idempotency replay decisions are made today.

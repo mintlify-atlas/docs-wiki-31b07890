@@ -1,0 +1,315 @@
+---
+title: "Internal-Only REST API"
+sidebarTitle: "Internal-Only"
+description: "The Apache Fineract internal REST API surface — Close-of-Business support, loan-account locks, external-event maintenance, audit reads, configuration overrides and instance-mode toggle: InternalCOBApiResource, InternalLoanAccountLockApiResource, InternalExternalEventsApiResource, InternalLoanInformationApiResource, InternalSavingsAccountInformationApiResource, InternalClientInformationApiResource, InternalConfigurationsApiResource, InternalProgressiveLoanApiResource, InternalWorkingCapitalLoanApiResource and InstanceModeApiResource."
+---
+
+Apache Fineract ships a tier of endpoints whose URLs begin with `/v1/internal/...`. They exist so the test harness and operations team can drive the platform's internals deterministically — fast-forward a loan's COB date, lock a loan account so a worker thread can process it without contention, wipe all stored external events between test runs, peek at audit columns, and force a global-configuration value without going through validation. **None of these endpoints are meant for production traffic.** Several of them are gated by the `test` Spring profile and by `FineractProperties.fineract.mode` so they cannot be reached on a production deployment.
+
+All endpoints live under `/fineract-provider/api/v1` — see the [REST API Overview](/api/overview).
+
+## Endpoint summary
+
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/internal/cob/partitions/{partitionSize}` | `InternalCOBApiResource.java` | Inspect how the COB partitioner would shard the loans for a partition size. |
+| POST | `/v1/internal/cob/fast-forward-cob-date-of-loan/{loanId}` | `InternalCOBApiResource.java` | Move a loan's `last_closed_business_date` forward without running COB. |
+| POST | `/v1/internal/cob/loan-reprocess/{loanId}` | `InternalCOBApiResource.java` | Force a transaction-reprocess on one loan. |
+| POST | `/v1/internal/loans/{loanId}/place-lock/{lockOwner}` | `InternalLoanAccountLockApiResource.java` | Acquire a loan-account lock for a named owner (simulates COB worker contention). |
+| GET | `/v1/internal/externalevents` | `InternalExternalEventsApiResource.java` | Dump every persisted external event. |
+| DELETE | `/v1/internal/externalevents` | `InternalExternalEventsApiResource.java` | Wipe every persisted external event. |
+| GET | `/v1/internal/loan/{loanId}/audit` | `InternalLoanInformationApiResource.java` | Audit columns (created/modified) of a loan. |
+| GET | `/v1/internal/loan/{loanId}/transaction/{transactionId}/audit` | `InternalLoanInformationApiResource.java` | Audit columns of a single loan transaction. |
+| GET | `/v1/internal/loan/status/{statusId}` | `InternalLoanInformationApiResource.java` | All loan ids in a given status. |
+| GET | `/v1/internal/loan/{loanId}/advanced-payment-allocation-rules` | `InternalLoanInformationApiResource.java` | Snapshot the advanced-payment allocation matrix on the loan. |
+| GET | `/v1/internal/loan/maxTransactionDateOfActiveLoan` | `InternalLoanInformationApiResource.java` | Latest transaction date across all active loans. |
+| GET | `/v1/internal/savingsaccounts/status/{statusId}` | `InternalSavingsAccountInformationApiResource.java` | All savings account ids in a given status. |
+| GET | `/v1/internal/client/{clientId}/audit` | `InternalClientInformationApiResource.java` | Audit columns of a client. |
+| PUT | `/v1/internal/configurations/name/{configName}/value/{configValue}` | `InternalConfigurationsApiResource.java` | Set a global configuration to an exact value, bypassing validation. |
+| GET | `/v1/internal/loan/progressive/{loanId}/model` | `InternalProgressiveLoanApiResource.java` | Inspect the progressive-loan emi calculation model. |
+| POST | `/v1/internal/loan/progressive/{loanId}/model` | `InternalProgressiveLoanApiResource.java` | Replace the progressive-loan model (test only). |
+| DELETE | `/v1/internal/loan/progressive/{loanId}/model` | `InternalProgressiveLoanApiResource.java` | Wipe the cached progressive model. |
+| POST | `/v1/internal/working-capital-loans/{loanId}/amortization-schedule` | `InternalWorkingCapitalLoanApiResource.java` | Regenerate the amortization schedule. |
+| POST | `/v1/internal/working-capital-loans/{loanId}/activate` | `InternalWorkingCapitalLoanApiResource.java` | Force-activate a working-capital loan. |
+| POST | `/v1/internal/working-capital-loans/{loanId}/generate-next-delinquency-period` | `InternalWorkingCapitalLoanApiResource.java` | Step the delinquency-period clock forward. |
+| POST | `/v1/internal/working-capital-loans/{loanId}/internalMakePayment` | `InternalWorkingCapitalLoanApiResource.java` | Make a payment skipping all eligibility checks. |
+| PUT | `/v1/instance-mode` | `InstanceModeApiResource.java` | Switch the running node between `READ_ONLY`, `WRITE_ONLY`, `BATCH_ONLY`, `READ_AND_WRITE`. |
+
+## `InternalCOBApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/cob/api/InternalCOBApiResource.java`
+Class path: `@Path("/v1/internal/cob")`
+
+Three endpoints used by Close-of-Business integration tests and by operators who need to surgically unstick a stuck loan.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/internal/cob/partitions/{partitionSize}` | `getCobPartitions` |
+| POST | `/v1/internal/cob/fast-forward-cob-date-of-loan/{loanId}` | `updateLoanCobLastDate` |
+| POST | `/v1/internal/cob/loan-reprocess/{loanId}` | `loanReprocess` |
+
+The fast-forward endpoint is the canonical way to "skip" COB for a loan in a UAT environment — set the loan's last-closed-business-date to today without actually running accruals, charges, delinquency or external events. Use sparingly.
+
+## `InternalLoanAccountLockApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/cob/api/InternalLoanAccountLockApiResource.java`
+Class path: `@Path("/v1/internal/loans")`
+
+Loan-account locks (`m_loan_account_locks`) are the contention primitive used by the COB worker pool — a loan being processed gets a row in the lock table that prevents other workers from picking it up. The endpoint lets a test scenario simulate a lock from a named owner so the rest of the pipeline can be exercised.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/v1/internal/loans/{loanId}/place-lock/{lockOwner}` | `placeLockOnLoanAccount` |
+
+The matching production-facing resource is `LoanAccountLockApiResource` (no `internal` prefix) — that one provides read-only inspection of the lock state.
+
+## `InternalExternalEventsApiResource`
+
+File: `fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/api/InternalExternalEventsApiResource.java`
+Class path: `@Path("/v1/internal/externalevents")`
+
+External business events that have been published are persisted in `m_external_event` until the configured sink acknowledges them. The two endpoints below let an integration test inspect and clear the queue.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/internal/externalevents` | `getAllExternalEvents` |
+| DELETE | `/v1/internal/externalevents` | `deleteAllExternalEvents` |
+
+The publishing pipeline itself is configured through `ExternalEventConfigurationApiResource` — see [External Assets & Investor](/api/external-assets-and-investor).
+
+## `InternalLoanInformationApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/InternalLoanInformationApiResource.java`
+Class path: `@Path("/v1/internal/loan")`
+
+Read-only access to columns the public Loan API hides — most importantly the `created_*` / `last_modified_*` audit columns used by the integration-test framework to assert ordering, and the advanced-payment-allocation matrix the public loan response only summarises.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/internal/loan/{loanId}/audit` | `getLoanAuditFields` |
+| GET | `/v1/internal/loan/{loanId}/transaction/{transactionId}/audit` | `getLoanTransactionAuditFields` |
+| GET | `/v1/internal/loan/status/{statusId}` | `getLoansByStatus` |
+| GET | `/v1/internal/loan/{loanId}/advanced-payment-allocation-rules` | `getAdvancedPaymentAllocationRulesOfLoan` |
+| GET | `/v1/internal/loan/maxTransactionDateOfActiveLoan` | `getMaxTransactionDateOfActiveLoans` |
+
+`getMaxTransactionDateOfActiveLoans` is used by integration tests to advance the business date deterministically — they set the simulated clock to one day past the latest transaction.
+
+## `InternalSavingsAccountInformationApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/InternalSavingsAccountInformationApiResource.java`
+Class path: `@Path("/v1/internal/savingsaccounts")`
+
+Mirrors `InternalLoanInformationApiResource` but for savings accounts.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/internal/savingsaccounts/status/{statusId}` | `getSavingsAccountsByStatus` |
+
+## `InternalClientInformationApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/InternalClientInformationApiResource.java`
+Class path: `@Path("/v1/internal/client")`
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/internal/client/{clientId}/audit` | `getClientAuditFields` |
+
+## `InternalConfigurationsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/api/InternalConfigurationsApiResource.java`
+Class path: `@Path("/v1/internal/configurations")`
+
+The public `GlobalConfigurationApiResource` validates writes against `c_configuration`'s definition (string vs number vs date vs boolean). This internal endpoint side-steps the validation — useful when a test needs a forbidden combination, or when an operator needs to set a value the validation logic incorrectly rejects.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| PUT | `/v1/internal/configurations/name/{configName}/value/{configValue}` | `updateGlobalConfiguration` |
+
+The path parameters carry both the name and the value; there is no request body.
+
+## `InternalProgressiveLoanApiResource`
+
+File: `fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/service/InternalProgressiveLoanApiResource.java`
+Class path: `@Path("v1/internal/loan/progressive")` (note: no leading slash in the class-level @Path string — Jersey normalises).
+
+The progressive-loan schedule generator maintains an *EMI model* in `m_loan_progressive_model` that captures the canonical interest curve. This internal resource lets tests read, replace and delete the cached model so they can probe the regenerator in isolation.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/internal/loan/progressive/{loanId}/model` | `fetchModel` |
+| POST | `/v1/internal/loan/progressive/{loanId}/model` | `updateModel` |
+| DELETE | `/v1/internal/loan/progressive/{loanId}/model` | `deleteModel` |
+
+## `InternalWorkingCapitalLoanApiResource`
+
+File: `fineract-working-capital-loan/src/main/java/org/apache/fineract/portfolio/workingcapitalloan/api/InternalWorkingCapitalLoanApiResource.java`
+Class path: `@Path("v1/internal/working-capital-loans")`.
+
+Working-capital loans are a separate schedule type with its own delinquency model. This resource exposes the maintenance hooks the integration tests need: regenerate the amortization schedule, force-activate, step the delinquency-period clock, and make payments without the normal eligibility checks.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/v1/internal/working-capital-loans/{loanId}/amortization-schedule` | `generateAmortizationSchedule` |
+| POST | `/v1/internal/working-capital-loans/{loanId}/activate` | `activateLoan` |
+| POST | `/v1/internal/working-capital-loans/{loanId}/generate-next-delinquency-period` | `generateNextDelinquencyPeriod` |
+| POST | `/v1/internal/working-capital-loans/{loanId}/internalMakePayment` | `payment` |
+
+## `InstanceModeApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/instancemode/api/InstanceModeApiResource.java`
+Class path: `@Path("/v1/instance-mode")`
+
+The instance-mode toggle is the runtime equivalent of the `FineractProperties.fineract.mode.*` startup flags — at deployment time you can stamp a node as `READ_ONLY`, `WRITE_ONLY`, `BATCH_ONLY`, or `READ_AND_WRITE`. The filter `FineractInstanceModeApiFilter` consults the mode on every request and refuses non-matching verbs with a `403`. This endpoint lets you change the mode live.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| PUT | `/v1/instance-mode` | `changeMode` |
+
+The PUT body:
+
+```json
+{ "readEnabled": true, "writeEnabled": false, "batchWorkerEnabled": false, "batchManagerEnabled": false }
+```
+
+Use cases include flipping a node read-only ahead of a deployment, or peeling a worker off the request hot-path for emergency batch work.
+
+## Gating and safety
+
+Most internal resources include a runtime guard so they cannot accidentally serve production traffic. The pattern looks like this:
+
+```java
+// fineract-provider/.../infrastructure/configuration/api/InternalConfigurationsApiResource.java
+@Path("/v1/internal/configurations")
+@Component
+public class InternalConfigurationsApiResource {
+    // …
+    private void validateRequest() {
+        if (!fineractProperties.getMode().isWriteEnabled()) {
+            throw new ForbiddenException("Internal endpoints are not available in read-only mode");
+        }
+    }
+}
+```
+
+Operators should additionally restrict the `/v1/internal/*` URL space at the load-balancer level (firewall rule, mTLS-only, internal subnet) and require a dedicated permission grant rather than `ALL_FUNCTIONS`.
+
+## Patterns to know
+
+### Audit-field shape
+
+Every `audit` endpoint returns the four standard audit columns:
+
+```json
+{
+  "createdBy": 1,
+  "createdOn": 1714060800000,
+  "lastModifiedBy": 1,
+  "lastModifiedOn": 1714152000000
+}
+```
+
+The values are epoch-millis, derived from `AbstractAuditableWithUTCDateTimeCustom` in `fineract-core/.../infrastructure/core/domain/`. Integration tests use these to assert command ordering — the `lastModifiedOn` on a loan must be strictly greater than the `lastModifiedOn` on its transactions.
+
+### Status-by-id endpoints
+
+`GET /v1/internal/loan/status/{statusId}` and `GET /v1/internal/savingsaccounts/status/{statusId}` are *list-of-ids* endpoints. They return a JSON array of primary keys, **not** full entities — the caller is expected to follow up with regular public reads for any rows of interest. The status ids follow the enums in `LoanStatus` (`fineract-loan/.../portfolio/loanaccount/domain/LoanStatus.java`) and `SavingsAccountStatusType` (`fineract-core/.../portfolio/savings/`).
+
+| Loan status id | Meaning |
+| --- | --- |
+| `100` | Submitted and pending approval. |
+| `200` | Approved. |
+| `300` | Active. |
+| `400` | Withdrawn by applicant. |
+| `500` | Rejected. |
+| `600` | Closed (obligations met). |
+| `601` | Written-off. |
+| `602` | Closed-rescheduled. |
+| `700` | Overpaid. |
+
+| Savings status id | Meaning |
+| --- | --- |
+| `100` | Submitted and pending approval. |
+| `200` | Approved. |
+| `300` | Active. |
+| `400` | Withdrawn by applicant. |
+| `500` | Rejected. |
+| `600` | Closed. |
+| `700` | Pre-mature closed. |
+| `800` | Matured. |
+
+### COB partitioning
+
+`GET /v1/internal/cob/partitions/{partitionSize}` is invaluable when diagnosing a stuck Close-of-Business run. It returns the same partition keys the `LoanCOBPartitioner` would produce for that partition size — given the current set of active loans, exactly which loan-id ranges would each worker process.
+
+The response shape is:
+
+```json
+{
+  "partitions": [
+    { "partitionId": 0, "loanIds": [101, 102, 105, ...] },
+    { "partitionId": 1, "loanIds": [201, 202, ...] }
+  ]
+}
+```
+
+Comparing the output with what's actually being processed in `m_loan_account_locks` is the fastest way to spot a lock leak.
+
+### Reprocessing a single loan
+
+`POST /v1/internal/cob/loan-reprocess/{loanId}` runs a single loan through the same transaction-reprocessing pipeline COB would. Use this when a hand-edited schedule needs to be normalised, when accrual rows have drifted, or after a manual database fix.
+
+## Configuring the internal access profile
+
+The default Spring profile (`production`) **disables** every internal resource by failing the `validateRequest()` guard or by not registering the bean at all. To enable them in a dev sandbox set:
+
+```properties
+# application.properties or environment
+fineract.mode.read-enabled=true
+fineract.mode.write-enabled=true
+fineract.mode.batch-worker-enabled=true
+fineract.mode.batch-manager-enabled=true
+
+spring.profiles.active=test
+```
+
+The `test` profile also wires `MockBusinessDate` (`fineract-core/.../businessdate/`), letting the integration suite advance the platform's clock without sleeping.
+
+## Authoring conventions
+
+When adding a new internal endpoint, follow the existing pattern:
+
+1. Place it under `…/api/Internal*ApiResource.java` and prefix its class-level `@Path` with `/v1/internal/`.
+2. Make the bean conditional: `@ConditionalOnProperty(value = "fineract.mode.write-enabled", havingValue = "true")` (or read for read-only paths).
+3. Bypass the public command bus where appropriate — internal endpoints usually call write services directly so command-source rows do not pollute production tables.
+4. Document the endpoint in this page and in the test suite that consumes it.
+
+## Worked example — fast-forwarding COB
+
+```bash
+# 1. Spin up a tenant in test mode
+export TENANT='Fineract-Platform-TenantId: default'
+
+# 2. See what partitions COB would produce
+curl -k -u admin:password -H "$TENANT" \
+  https://localhost:8443/fineract-provider/api/v1/internal/cob/partitions/100
+
+# 3. Fast-forward one loan past today so its COB doesn't fire tonight
+curl -k -u admin:password -H "$TENANT" -H 'Content-Type: application/json' \
+  -X POST https://localhost:8443/fineract-provider/api/v1/internal/cob/fast-forward-cob-date-of-loan/4711 \
+  -d '{ "cobDate": "30 April 2024", "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+# 4. Inspect audit fields before running an assertion
+curl -k -u admin:password -H "$TENANT" \
+  https://localhost:8443/fineract-provider/api/v1/internal/loan/4711/audit
+```
+
+## Related domain documents
+
+- `cob/` — Close-of-Business orchestration, lock semantics, partitioner.
+- `progressive-loan/` — the progressive schedule generator and its EMI model.
+- `working-capital-loan/` — working-capital schedule and delinquency rules.
+- `runtime/` — instance-mode profiles and Fineract startup options.
+- `events/` — external-event persistence used by `InternalExternalEventsApiResource`.
+- [Configuration & Jobs](/api/configuration-and-jobs) — the public-facing counterpart of `InternalConfigurationsApiResource`.
+- [Loans](/api/loans) — the public loan endpoints whose audit columns the internal reads expose.
+- [Savings & Deposits](/api/savings-and-deposits) — the public savings endpoints whose status ids match the internal status reads.

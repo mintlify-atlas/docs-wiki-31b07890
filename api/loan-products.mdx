@@ -1,0 +1,308 @@
+---
+title: "Loan Products REST API"
+sidebarTitle: "Loan Products"
+description: "The Apache Fineract REST API for loan-product definitions: LoanProductsApiResource and LoanProductsDetailsApiResource. Covers product creation, accounting rules, payment-channel-to-fund-source mappings, charges, fees, and term variation."
+---
+
+A **loan product** is the template every individual loan in Apache Fineract is instantiated from. It binds together a currency, schedule generator, interest model, repayment strategy, accounting type, eligible charges, GL accounts and payment-channel-to-fund-source mappings. The REST API for product authoring is small — only two `*ApiResource` classes — but the JSON payload is one of the largest in the platform, easily hundreds of fields when fully specified.
+
+This page lists the public endpoints under `/fineract-provider/api/v1/loanproducts` (see [REST API Overview](/api/overview)) and points at the source files where the full Swagger response schemas are defined.
+
+## Endpoint summary
+
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/loanproducts/template` | `LoanProductsApiResource.java` | All option lists needed to render the new-product form: currencies, charges, funds, payment types, GL accounts, repayment strategies, interest types, amortization types, delinquency buckets, etc. |
+| GET | `/v1/loanproducts` | `LoanProductsApiResource.java` | List every loan product visible to the authenticated user. |
+| GET | `/v1/loanproducts/{productId}` | `LoanProductsApiResource.java` | Full product definition including accounting mappings and term variations. |
+| GET | `/v1/loanproducts/external-id/{externalProductId}` | `LoanProductsApiResource.java` | Same as above by tenant-supplied external id. |
+| POST | `/v1/loanproducts` | `LoanProductsApiResource.java` | Create a loan product. |
+| PUT | `/v1/loanproducts/{productId}` | `LoanProductsApiResource.java` | Update a loan product (mutable fields only). |
+| PUT | `/v1/loanproducts/external-id/{externalProductId}` | `LoanProductsApiResource.java` | Update by external id. |
+| GET | `/v1/loanproducts/basic-details` | `LoanProductsDetailsApiResource.java` | Lightweight list (id, name, currency, status) for picker UIs. |
+
+The two resources together cover every loan-product call the system supports — there is no `DELETE` because retiring a product is done via state (`status` column) rather than deletion.
+
+## `LoanProductsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanproduct/api/LoanProductsApiResource.java`
+Class path: `@Path("/v1/loanproducts")`
+
+The full set of method-level routes is:
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/v1/loanproducts` | `createLoanProduct` |
+| GET | `/v1/loanproducts` | `retrieveAllLoanProducts` |
+| GET | `/v1/loanproducts/template` | `retrieveTemplate` |
+| GET | `/v1/loanproducts/{productId}` | `retrieveLoanProductDetails` |
+| PUT | `/v1/loanproducts/{productId}` | `updateLoanProduct` |
+| GET | `/v1/loanproducts/external-id/{externalProductId}` | `retrieveLoanProductDetails` |
+| PUT | `/v1/loanproducts/external-id/{externalProductId}` | `updateLoanProduct` |
+
+### What the JSON looks like
+
+The request body is wide. The key blocks (defined in `LoanProductsApiResourceSwagger.PostLoanProductsRequest`) are:
+
+```json
+{
+  "name": "Group loan - flat 24 months",
+  "shortName": "GL24",
+  "currencyCode": "USD",
+  "digitsAfterDecimal": 2,
+  "principal": 1000,
+  "numberOfRepayments": 24,
+  "repaymentEvery": 1,
+  "repaymentFrequencyType": 2,                // 0=days 1=weeks 2=months
+  "interestRatePerPeriod": 1.5,
+  "interestRateFrequencyType": 2,
+  "amortizationType": 1,                      // 0=equal-principal 1=equal-installments
+  "interestType": 1,                          // 0=declining 1=flat
+  "interestCalculationPeriodType": 1,         // 0=daily 1=same-as-repayment
+  "transactionProcessingStrategyCode": "principal-interest-penalties-fees-order-strategy",
+  "accountingRule": 3,                        // 1=none 2=cash 3=accrual-periodic 4=accrual-upfront
+  "fundSourceAccountId": 41,
+  "loanPortfolioAccountId": 14,
+  "interestOnLoanAccountId": 33,
+  "incomeFromFeeAccountId": 37,
+  "incomeFromPenaltyAccountId": 38,
+  "writeOffAccountId": 35,
+  "overpaymentLiabilityAccountId": 49,
+  "paymentChannelToFundSourceMappings": [
+    { "paymentTypeId": 1, "fundSourceAccountId": 42 },
+    { "paymentTypeId": 2, "fundSourceAccountId": 43 }
+  ],
+  "feeToIncomeAccountMappings":     [ { "chargeId": 21, "incomeAccountId": 37 } ],
+  "penaltyToIncomeAccountMappings": [ { "chargeId": 22, "incomeAccountId": 38 } ],
+  "charges":  [ { "id": 21 }, { "id": 22 } ],
+  "delinquencyBucketId": 4,
+  "isInterestRecalculationEnabled": false,
+  "holdGuaranteeFunds": false,
+  "locale": "en"
+}
+```
+
+#### Payment-channel-to-fund-source mappings
+
+These are sub-objects, not their own REST resource. They tell the platform "for repayments received over payment-type X, post the cash leg against GL account Y". They are stored in `m_product_loan_payment_type_to_gl_account_mapping` and are projected into the response under `paymentChannelToFundSourceMappings`. The Swagger model exposes them as `LoanProductsApiResourceSwagger.GetLoanProductsProductIdResponse.GetLoanPaymentChannelToFundSourceMappings`.
+
+To update them, send the full mapping list inside `PUT /v1/loanproducts/{productId}` — the platform diff-applies (add / update / remove) based on the `paymentTypeId` key.
+
+#### Charge mappings
+
+Two other mapping blocks live next to payment channels:
+
+- `feeToIncomeAccountMappings` — overrides the default income-from-fees GL per charge.
+- `penaltyToIncomeAccountMappings` — overrides the default income-from-penalties GL per charge.
+
+These hook into the journal-entry generation done by `LoanAccountingProcessorForCash` / `LoanAccountingProcessorForAccrual` in `fineract-accounting`.
+
+### Template endpoint
+
+`GET /v1/loanproducts/template` is the workhorse for the new-product UI. With no parameters it returns every option list (currencies, charges, funds, payment types, repayment strategies, accounting types, etc.). With `?isProductMixTemplate=true` it returns only the data needed by `ProductMixApiResource` (`fineract-provider/.../portfolio/loanproduct/productmix/api/`). The result is large — expect 50–150 kB JSON depending on tenant size.
+
+### Update semantics
+
+The `PUT` is **partial**. Only fields present in the body are written. The deserializer is `LoanProductDataValidator` — it rejects illegal transitions (e.g. you cannot change currency once any loan exists against the product). Accounting fields are protected: switching `accountingRule` once the product has booked journal entries is forbidden.
+
+### External-id mirror
+
+The `external-id/{externalProductId}` paths are a 1-to-1 mirror of the numeric-id paths and resolve via `m_product_loan.external_id`. They return the same JSON envelopes.
+
+## `LoanProductsDetailsApiResource`
+
+File: `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanproduct/api/LoanProductsDetailsApiResource.java`
+Class path: `@Path("/v1/loanproducts")`
+
+A single extra GET providing a slim listing — id, name, short name, currency, status — without the heavy term/accounting payload. It is the canonical endpoint for product picklists in dashboards.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loanproducts/basic-details` | `fetchProducts` |
+
+The two resources share the same class-level path; Jersey dispatches by the sub-path uniqueness (`/basic-details` vs `/{productId}` etc.) at runtime.
+
+## Related Swagger models
+
+The hand-curated request/response classes live alongside the resource at:
+
+- `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanproduct/api/LoanProductsApiResourceSwagger.java` — full DTOs (`PostLoanProductsRequest`, `PutLoanProductsProductIdRequest`, `GetLoanProductsResponse`, `GetLoanProductsProductIdResponse`, `GetLoanProductsTemplateResponse`).
+
+Use that file as the authoritative reference for every individual field, defaults and enumerations.
+
+## Common pitfalls
+
+- **`dateFormat` / `locale`** must be present on every date field (e.g. `interestRateDifferentialOption`, `startDate`).
+- **`charges`** is the list of *applicable* charges — not the charges already applied to a specific loan. Loans pick from this set when they apply charges via `LoanChargesApiResource`.
+- **`delinquencyBucketId`** must reference an existing bucket; see [Loans → Delinquency](/api/loans#delinquencyapiresource).
+- **Term variations** (`allowVariableInstallments`, `minimumGap`, `maximumGap`) only take effect when paired with the variable-installments add-on; the schedule generator is selected by `LoanScheduleType` on the product.
+- The `transactionProcessingStrategyCode` value is a logical code, not the row id of the strategy. Acceptable values are listed in `LoanRepaymentScheduleTransactionProcessorFactory` (`fineract-loan/.../portfolio/loanaccount/domain/transactionprocessor/`).
+
+## Accounting rule deep-dive
+
+The single most important field on a loan product is `accountingRule`. Every other field that mentions a GL account is conditionally required based on this integer:
+
+| `accountingRule` | Name | Required GL fields | Optional GL fields |
+| --- | --- | --- | --- |
+| `1` | **NONE** | (none) | (none) — no journal entries are produced for any loan transaction. |
+| `2` | **CASH** | `fundSourceAccountId`, `loanPortfolioAccountId`, `incomeFromFeeAccountId`, `incomeFromPenaltyAccountId`, `incomeFromInterestId`, `writeOffAccountId`, `overpaymentLiabilityAccountId` | `transfersInSuspenseAccountId`, `goodwillCreditAccountId`, `incomeFromRecoveryAccountId`. |
+| `3` | **ACCRUAL_PERIODIC** | All CASH fields plus `receivableInterestAccountId`, `receivableFeeAccountId`, `receivablePenaltyAccountId` | `incomeFromChargeOffInterestAccountId`, `incomeFromChargeOffFeesAccountId`, `incomeFromChargeOffPenaltyAccountId`. |
+| `4` | **ACCRUAL_UPFRONT** | Same as `ACCRUAL_PERIODIC` | Same. |
+
+The mapping between transaction type and which GL pair is touched is implemented in `LoanAccountingProcessorForCash.java` and `LoanAccountingProcessorForAccrual.java` in `fineract-accounting`. Switching `accountingRule` once a loan has booked any journal entry is rejected by `LoanProductDataValidator.validateAccountingRule()`.
+
+### Charge-off and write-off accounts
+
+Charge-off introduces a second classification of "income". When `incomeFromChargeOffInterestAccountId` (and friends) is set, the accrual processor diverts further accruals from the standard income account into the charge-off income account once the loan is charged off via `?command=chargeOff`. This lets accounting separate performing-income from charge-off-income in the trial balance.
+
+`writeOffAccountId` (and the matching strategy on the product) is used when a loan is fully written off via `LoanTransactionsApiResource` `?command=writeoff`. The processor debits the write-off expense account and credits the loan-portfolio account.
+
+## Field-by-field reference for `POST /v1/loanproducts`
+
+### Identity
+
+- `name` *(required)* — unique within tenant; up to 100 chars.
+- `shortName` *(required)* — exactly 4 chars; used in account-number generation if the `account-number-preferences` configuration references it.
+- `description` — optional long description.
+- `fundId` — link to `FundsApiResource`.
+- `currencyCode` *(required)* — ISO-4217, must be in the tenant's allowed set (see `CurrenciesApiResource`).
+- `digitsAfterDecimal`, `inMultiplesOf` — currency display rules.
+- `installmentAmountInMultiplesOf` — round installments to this multiple.
+
+### Schedule
+
+- `principal`, `minPrincipal`, `maxPrincipal` — default and bounds.
+- `numberOfRepayments`, `minNumberOfRepayments`, `maxNumberOfRepayments`.
+- `repaymentEvery`, `repaymentFrequencyType` — `0`=days, `1`=weeks, `2`=months. With `repaymentFrequencyNthDayType` and `repaymentFrequencyDayOfWeekType` for monthly-on-nth-weekday.
+- `interestRatePerPeriod`, `minInterestRatePerPeriod`, `maxInterestRatePerPeriod`, `interestRateFrequencyType`.
+- `amortizationType` — `0`=equal principal, `1`=equal installments.
+- `interestType` — `0`=declining balance, `1`=flat.
+- `interestCalculationPeriodType` — `0`=daily, `1`=same as repayment period.
+- `transactionProcessingStrategyCode` — see the strategy table below.
+- `loanScheduleType` — `CUMULATIVE` (default), `PROGRESSIVE`, `WORKING_CAPITAL`.
+- `loanScheduleProcessingType` — `HORIZONTAL` (default) or `VERTICAL`.
+
+### Grace and arrears
+
+- `graceOnPrincipalPayment`, `graceOnInterestPayment`, `graceOnInterestCharged`.
+- `graceOnArrearsAgeing` — days before a missed installment counts as overdue.
+- `overdueDaysForNPA` — days to flag the loan non-performing.
+
+### Interest recalculation (declining-balance only)
+
+- `isInterestRecalculationEnabled` — master switch.
+- `interestRecalculationCompoundingMethod` — `0`=none, `1`=interest, `2`=fees, `3`=fees & interest.
+- `rescheduleStrategyMethod` — what to do when re-amortising: reduce installments, reduce installment amount, reschedule next repayments.
+- `recalculationRestFrequencyType`, `recalculationRestFrequencyInterval` — period to apply recalculation.
+- `preClosureInterestCalculationStrategy` — till-pre-close-date or till-rest-frequency-date.
+
+### Multi-disburse
+
+- `multiDisburseLoan` — enable tranche disbursement.
+- `maxTrancheCount`, `outstandingLoanBalance`, `disallowExpectedDisbursements`.
+- `disbursements` — array of expected tranches with their dates and amounts.
+
+### Down-payment and capitalisation (progressive)
+
+- `enableDownPayment`, `disbursedAmountPercentageForDownPayment`, `enableAutoRepaymentForDownPayment`.
+- `enableInstallmentLevelDelinquency` — installment-by-installment dunning.
+- `enableIncomeCapitalization`, `incomeCapitalizationCalculationType`, `incomeCapitalizationStrategy`.
+- `enableBuyDownFee` — buy-down-fee module.
+
+### Charges and rate floors
+
+- `charges` — array of `{ id }`.
+- `floatingRatesId`, `interestRateDifferential`, `minDifferentialLendingRate`, `defaultDifferentialLendingRate`, `maxDifferentialLendingRate` — for floating-rate products (`FloatingRatesApiResource` administers the rate curves).
+
+### Configurable attributes
+
+- `allowAttributeOverrides` — sub-object that enables overrides per loan: `amortizationType`, `interestType`, `transactionProcessingStrategyCode`, `interestCalculationPeriodType`, `inArrearsTolerance`, `repaymentEvery`, `graceOnPrincipalAndInterestPayment`, `graceOnArrearsAgeing`.
+
+### Lifecycle
+
+- `startDate`, `closeDate` — product validity window.
+- `useBorrowerCycle`, `principalVariationsForBorrowerCycle`, `interestRateVariationsForBorrowerCycle`, `numberOfRepaymentVariationsForBorrowerCycle` — increase limits for repeat borrowers.
+
+## Transaction-processing strategy codes
+
+The `transactionProcessingStrategyCode` field is one of:
+
+| Code | Strategy |
+| --- | --- |
+| `mifos-standard-strategy` | The default. Order: penalties → fees → interest → principal. |
+| `principal-interest-penalties-fees-order-strategy` | Principal → interest → penalties → fees. |
+| `interest-principal-penalties-fees-order-strategy` | Interest → principal → penalties → fees. |
+| `heavensfamily-strategy` | Heavens-family (penalties last). |
+| `creocore-strategy` | CreoCore order. |
+| `rbi-india-strategy` | RBI compliance order. |
+| `early-repayment-strategy` | Apply early payments to the next installment first. |
+| `advanced-payment-allocation-strategy` | Use the per-product allocation matrix (set via `paymentAllocation`). |
+| `due-penalty-fee-interest-principal-in-advance-principal-penalty-fee-interest-strategy` | Long-form custom order. |
+
+The full registry is `LoanRepaymentScheduleTransactionProcessorFactory` (`fineract-loan/.../portfolio/loanaccount/domain/transactionprocessor/factory/`).
+
+## Advanced payment allocation
+
+When `transactionProcessingStrategyCode = "advanced-payment-allocation-strategy"`, the loan product additionally requires a `paymentAllocation` block — an ordered list per transaction type telling the processor how to split a payment across `IN_ADVANCE_PRINCIPAL`, `IN_ADVANCE_INTEREST`, `IN_ADVANCE_PENALTY`, `IN_ADVANCE_FEE`, `DUE_PRINCIPAL`, `DUE_INTEREST`, `DUE_PENALTY`, `DUE_FEE`, `PAST_DUE_PRINCIPAL`, `PAST_DUE_INTEREST`, `PAST_DUE_PENALTY`, `PAST_DUE_FEE`. Each row also picks a *future installment allocation rule* — `NEXT_INSTALLMENT`, `LAST_INSTALLMENT`, `REAMORTIZATION`, `REAGE`.
+
+The snapshot is queryable via the public response under `paymentAllocation` and the internal `InternalLoanInformationApiResource.getAdvancedPaymentAllocationRulesOfLoan` endpoint — see [Internal-Only](/api/internal-only).
+
+## Worked example
+
+```bash
+curl -k -u admin:password \
+  -H 'Fineract-Platform-TenantId: default' \
+  -H 'Content-Type: application/json' \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/loanproducts' \
+  -d '{
+    "name": "Microbusiness loan - declining 12m",
+    "shortName": "MB12",
+    "currencyCode": "USD",
+    "digitsAfterDecimal": 2,
+    "principal": 1000, "minPrincipal": 100, "maxPrincipal": 5000,
+    "numberOfRepayments": 12,
+    "repaymentEvery": 1, "repaymentFrequencyType": 2,
+    "interestRatePerPeriod": 2.5, "interestRateFrequencyType": 2,
+    "amortizationType": 1, "interestType": 0,
+    "interestCalculationPeriodType": 1,
+    "transactionProcessingStrategyCode": "advanced-payment-allocation-strategy",
+    "loanScheduleType": "PROGRESSIVE",
+    "loanScheduleProcessingType": "HORIZONTAL",
+    "accountingRule": 3,
+    "fundSourceAccountId": 41, "loanPortfolioAccountId": 14,
+    "interestOnLoanAccountId": 33, "incomeFromFeeAccountId": 37,
+    "incomeFromPenaltyAccountId": 38, "writeOffAccountId": 35,
+    "overpaymentLiabilityAccountId": 49,
+    "receivableInterestAccountId": 45, "receivableFeeAccountId": 46,
+    "receivablePenaltyAccountId": 47,
+    "delinquencyBucketId": 4,
+    "paymentAllocation": [ /* … omitted for brevity … */ ],
+    "locale": "en"
+  }'
+```
+
+The response is the canonical `CommandProcessingResult`:
+
+```json
+{ "resourceId": 7, "loanProductId": 7, "commandId": 124711 }
+```
+
+## Schema reference
+
+- `m_product_loan` — the product itself.
+- `m_product_loan_charge` — eligible charges.
+- `m_product_loan_payment_type_to_gl_account_mapping` — the payment-channel-to-fund-source mappings shown in the JSON.
+- `m_product_loan_fee_to_gl_account_mapping`, `m_product_loan_penalty_to_gl_account_mapping` — charge-specific income overrides.
+- `m_product_loan_variations_borrower_cycle` — borrower-cycle variations on principal, interest and term.
+- `m_product_loan_configurable_attributes` — toggles for the per-loan override flags.
+
+## Related domain documents
+
+- The [Loans REST API](/api/loans) page consumes `productId` on every new application.
+- The [Loan Transactions REST API](/api/loan-transactions) page describes the transaction-processing strategy in action.
+- The [Accounting](/api/accounting) page documents how the GL account ids referenced in product mappings are administered.
+- The [Configuration & Jobs](/api/configuration-and-jobs) page describes how `m_code` / `m_code_value` provide the option lists (eligible charges, payment types) the template endpoint returns.
+- The internal product-mix matrix is exposed via `ProductMixApiResource` (`fineract-provider/.../portfolio/loanproduct/productmix/api/`).
+- `progressive-loan/` and `working-capital-loan/` modules host the alternate schedule generators picked via `loanScheduleType`.
+- `rates/` — floating-rate curves consumed via `floatingRatesId`.
+- `tax/` — tax groups attached to interest via `interestTaxComponentId`.

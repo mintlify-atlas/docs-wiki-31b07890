@@ -1,0 +1,311 @@
+---
+title: "Loans REST API"
+sidebarTitle: "Loans"
+description: "The Apache Fineract REST API for loan accounts: LoansApiResource, BulkLoansApiResource, LoansPointInTimeApiResource, LoanScheduleApiResource, LoanDisbursementDetailApiResource, GuarantorsApiResource, LoanCollateralManagementApiResource, RescheduleLoansApiResource and DelinquencyApiResource."
+---
+
+The loan account is the heaviest aggregate in Apache Fineract. The REST API surface that drives it is split into nine cooperating resources: the master `LoansApiResource`, the bulk-loan-officer reassignment endpoint, a point-in-time read API used by external-asset reporting, schedule preview, disbursement-tranche management, guarantors, collateral, rescheduling, and the delinquency taxonomy. Together they expose every operation a credit officer or back-office user can perform on a loan, all under the `/fineract-provider/api/v1` prefix described in the [REST API Overview](/api/overview).
+
+Loan **transactions** (repayments, write-offs, waivers, adjustments) live on their own resource and are documented in [Loan Transactions](/api/loan-transactions).
+
+## Endpoint summary
+
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/loans/template` | `LoansApiResource.java` | Templates: products, charges, schedule options for the new-loan UI. |
+| GET | `/v1/loans` | `LoansApiResource.java` | Paged search (`?associations=…`, `?status=…`, `?accountNo=…`, …). |
+| GET | `/v1/loans/{loanId}` | `LoansApiResource.java` | One loan with optional associations (`repaymentSchedule`, `transactions`, `charges`, `collateral`, `guarantors`, `multiDisburseDetails`, `notes`). |
+| GET | `/v1/loans/external-id/{loanExternalId}` | `LoansApiResource.java` | Same, addressed by `externalId`. |
+| POST | `/v1/loans` | `LoansApiResource.java` | Submit application (`?command=calculateLoanSchedule` for preview-only). |
+| POST | `/v1/loans/{loanId}?command=…` | `LoansApiResource.java` | State transitions: `approve`, `undoApproval`, `disburse`, `disburseToSavings`, `undoDisbursal`, `reject`, `withdrawnByApplicant`, `assignLoanOfficer`, `unassignLoanOfficer`, `recoverGuarantees`, `markAsFraud`, `forceClose`, `forceCloseFromDelinquency`. |
+| PUT | `/v1/loans/{loanId}` | `LoansApiResource.java` | Modify a pending or active loan. |
+| DELETE | `/v1/loans/{loanId}` | `LoansApiResource.java` | Delete a submitted-and-pending application. |
+| PUT | `/v1/loans/{loanId}/approved-amount` | `LoansApiResource.java` | Amend the approved amount. |
+| GET | `/v1/loans/{loanId}/approved-amount` | `LoansApiResource.java` | History of approved-amount changes. |
+| PUT | `/v1/loans/{loanId}/available-disbursement-amount` | `LoansApiResource.java` | Cap remaining tranche amount on multi-disburse loans. |
+| GET | `/v1/loans/{loanId}/delinquencytags` | `LoansApiResource.java` | Audit trail of delinquency-bucket transitions for one loan. |
+| GET | `/v1/loans/{loanId}/delinquency-actions` | `LoansApiResource.java` | List delinquency actions (`pause`, `resume`). |
+| POST | `/v1/loans/{loanId}/delinquency-actions` | `LoansApiResource.java` | Pause / resume delinquency-clock for a loan. |
+| POST | `/v1/loans/{loanId}/schedule` | `LoanScheduleApiResource.java` | Compute or persist a variable installment schedule. |
+| GET | `/v1/loans/{loanId}/disbursements/{disbursementId}` | `LoanDisbursementDetailApiResource.java` | One disbursement tranche detail. |
+| PUT | `/v1/loans/{loanId}/disbursements/{disbursementId}` | `LoanDisbursementDetailApiResource.java` | Move the date of a future tranche. |
+| PUT | `/v1/loans/{loanId}/disbursements/editDisbursements` | `LoanDisbursementDetailApiResource.java` | Bulk add/delete tranches on a multi-disburse loan. |
+| GET | `/v1/loans/loanreassignment/template` | `BulkLoansApiResource.java` | Officers, offices and date options for bulk reassignment. |
+| POST | `/v1/loans/loanreassignment` | `BulkLoansApiResource.java` | Reassign many loans to a new loan officer in one call. |
+| GET | `/v1/loans/at-date/{loanId}?date=…` | `LoansPointInTimeApiResource.java` | Reconstruct a loan as it appeared on a historical date. |
+| POST | `/v1/loans/at-date/search` | `LoansPointInTimeApiResource.java` | Bulk point-in-time read for asset-owner export. |
+| GET | `/v1/loans/{loanId}/guarantors` | `GuarantorsApiResource.java` | List guarantors (with savings holds). |
+| POST | `/v1/loans/{loanId}/guarantors` | `GuarantorsApiResource.java` | Add a guarantor. |
+| GET | `/v1/loan-collateral-management/{collateralId}` | `LoanCollateralManagementApiResource.java` | Loan-collateral lookup. |
+| DELETE | `/v1/loan-collateral-management/{id}` | `LoanCollateralManagementApiResource.java` | Release loan-collateral. |
+| POST | `/v1/rescheduleloans` | `RescheduleLoansApiResource.java` | Create a reschedule request. |
+| POST | `/v1/rescheduleloans/{scheduleId}?command=approve\|reject` | `RescheduleLoansApiResource.java` | Approve or reject a reschedule request. |
+| GET | `/v1/delinquency/ranges` | `DelinquencyApiResource.java` | List delinquency ranges (DPD bands). |
+| GET | `/v1/delinquency/buckets` | `DelinquencyApiResource.java` | List delinquency buckets attached to products. |
+
+For the complete endpoint list inside each resource, open the source file and run `grep -n '@Path\|@Operation'`.
+
+## `LoansApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoansApiResource.java`
+Class path: `@Path("/v1/loans")`
+
+This is the largest resource in the codebase. It owns the loan lifecycle (submit → approve → disburse → repay → close), application modification, the loan-state dispatcher, and the two newer 2024+ verticals: **approved-amount versioning** and **delinquency actions**.
+
+The state-transition dispatcher is the central piece of logic — every POST against `/v1/loans/{loanId}` looks at `?command=` and routes to a different command handler:
+
+```java
+// fineract-provider/.../portfolio/loanaccount/api/LoansApiResource.java
+@POST
+@Path("{loanId}")
+public String stateTransitions(@PathParam("loanId") final Long loanId,
+        @QueryParam("command") final String commandParam,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    CommandWrapper commandRequest = null;
+    if (is(commandParam, "reject"))                commandRequest = builder.rejectLoanApplication(loanId).build();
+    else if (is(commandParam, "withdrawnByApplicant")) commandRequest = builder.withdrawLoanApplication(loanId).build();
+    else if (is(commandParam, "approve"))          commandRequest = builder.approveLoanApplication(loanId).build();
+    else if (is(commandParam, "disburse"))         commandRequest = builder.disburseLoanApplication(loanId).build();
+    else if (is(commandParam, "disburseToSavings"))commandRequest = builder.disburseLoanToSavingsApplication(loanId).build();
+    else if (is(commandParam, "undoApproval"))     commandRequest = builder.undoLoanApplicationApproval(loanId).build();
+    else if (is(commandParam, "undoDisbursal"))    commandRequest = builder.undoLoanApplicationDisbursal(loanId).build();
+    else if (is(commandParam, "assignLoanOfficer"))commandRequest = builder.assignLoanOfficer(loanId).build();
+    else if (is(commandParam, "unassignLoanOfficer")) commandRequest = builder.unassignLoanOfficer(loanId).build();
+    else if (is(commandParam, "recoverGuarantees")) commandRequest = builder.recoverFromGuarantor(loanId).build();
+    else if (is(commandParam, "markAsFraud"))      commandRequest = builder.markAsFraud(loanId).build();
+    else if (is(commandParam, "forceClose"))       commandRequest = builder.forceCloseLoan(loanId).build();
+    // …
+}
+```
+
+Every command above has a corresponding `*CommandHandler` bean under `fineract-provider/.../portfolio/loanaccount/handler/`. The handlers all delegate to `LoanWritePlatformService` or `LoanApplicationWritePlatformService` for the actual mutations.
+
+### External-id mirror
+
+Every numeric-id POST has an `external-id/{loanExternalId}` twin that resolves the loan via `m_loan.external_id` before dispatching to the same command handler. This is invaluable for integrations that mint their own primary keys upstream.
+
+### Approved-amount versioning
+
+`PUT /v1/loans/{loanId}/approved-amount` records each change in `m_loan_approved_amount_history` so the change history can be reported. The matching `GET` returns the full audit list. This is enforced by `LoanApprovedAmountHistoryRepository` in `fineract-loan`.
+
+### Delinquency actions
+
+The `/{loanId}/delinquency-actions` endpoints let you pause and resume the delinquency clock for one loan — typically for grace periods or pre-litigation holds. The action types are `PAUSE` and `RESUME`. They are persisted to `m_loan_delinquency_action` and consumed by the COB delinquency tasks.
+
+## `BulkLoansApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/BulkLoansApiResource.java`
+Class path: `@Path("/v1/loans/loanreassignment")`
+
+A two-method resource. The `GET /template` returns the available loan officers and date format hints; the POST takes a JSON envelope with `fromLoanOfficerId`, `toLoanOfficerId`, `officeId`, `assignmentDate` and a `loans` array.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/loanreassignment/template` | `loanReassignmentTemplate` |
+| POST | `/v1/loans/loanreassignment` | `loanReassignment` |
+
+## `LoansPointInTimeApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/pointintime/LoansPointInTimeApiResource.java`
+Class path: `@Path("/v1/loans/at-date")`
+
+A 2024 addition that reconstructs a loan as it appeared on an arbitrary past date by replaying its journal entries and transactions. Used heavily by `fineract-investor` and external accounting integrations to attest "this is what we held on day X".
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/at-date/{loanId}?date=…` | `retrieveLoanPointInTime` |
+| GET | `/v1/loans/at-date/external-id/{loanExternalId}?date=…` | `retrieveLoanPointInTimeByExternalId` |
+| POST | `/v1/loans/at-date/search` | `retrieveLoansPointInTime` |
+| POST | `/v1/loans/at-date/search/external-id` | `retrieveLoansPointInTimeByExternalIds` |
+
+The POST search forms take a body of `{ "date": "…", "loanIds": [ … ] }` (or `loanExternalIds`) so a single round trip can rebuild many loans at once.
+
+## `LoanScheduleApiResource`
+
+File: `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanScheduleApiResource.java`
+Class path: `@Path("/v1/loans/{loanId}/schedule")`
+
+Single endpoint, shared by the **variable installments** add-on. With `?command=calculateLoanSchedule` it returns a preview; without the query param it persists the variable schedule against the loan.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/v1/loans/{loanId}/schedule` | `calculateLoanScheduleOrSubmitVariableSchedule` |
+
+The handler reads `LoanScheduleType` from the loan product to decide between the standard, variable, progressive, and working-capital schedule generators. See `LoanScheduleGeneratorFactory` in `fineract-loan` for the dispatch.
+
+## `LoanDisbursementDetailApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanDisbursementDetailApiResource.java`
+Class path: `@Path("/v1/loans/{loanId}/disbursements")`
+
+Multi-disburse loans persist their expected tranches into `m_loan_disbursement_detail`. This resource lets you reschedule a single tranche, add or delete tranches in bulk, or read one back.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/disbursements/{disbursementId}` | `retriveDetail` |
+| PUT | `/v1/loans/{loanId}/disbursements/{disbursementId}` | `updateDisbursementDate` |
+| PUT | `/v1/loans/{loanId}/disbursements/editDisbursements` | `addAndDeleteDisbursementDetail` |
+
+## `GuarantorsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/guarantor/api/GuarantorsApiResource.java`
+Class path: `@Path("/v1/loans/{loanId}/guarantors")`
+
+Guarantors can be an existing client, an external party, or a self-guarantee with a savings account hold. The `accounts/template` endpoint returns the savings accounts of the candidate guarantor so the UI can pick the source of the on-hold amount.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/guarantors/template` | `newGuarantorTemplate` |
+| GET | `/v1/loans/{loanId}/guarantors` | `retrieveGuarantorDetails` |
+| GET | `/v1/loans/{loanId}/guarantors/{guarantorId}` | `retrieveGuarantorDetails` |
+| POST | `/v1/loans/{loanId}/guarantors` | `createGuarantor` |
+| PUT | `/v1/loans/{loanId}/guarantors/{guarantorId}` | `updateGuarantor` |
+| DELETE | `/v1/loans/{loanId}/guarantors/{guarantorId}` | `deleteGuarantor` |
+| GET | `/v1/loans/{loanId}/guarantors/accounts/template` | `accountsTemplate` |
+| GET | `/v1/loans/{loanId}/guarantors/downloadtemplate` | `getGuarantorTemplate` |
+| POST | `/v1/loans/{loanId}/guarantors/uploadtemplate` | `postGuarantorTemplate` |
+
+Savings holds are recorded as `DepositAccountOnHoldFundTransaction` rows — see the resource in `fineract-provider/.../savings/api/DepositAccountOnHoldFundTransactionsApiResource.java`.
+
+## `LoanCollateralManagementApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/collateralmanagement/api/LoanCollateralManagementApiResource.java`
+Class path: `@Path("/v1/loan-collateral-management")`
+
+Reads and releases the loan-side collateral records. Note that **adding** collateral happens via `POST /v1/loans/{loanId}/collaterals` on the legacy `CollateralsApiResource` (`fineract-provider/.../portfolio/collateral/api/`); the new `loan-collateral-management` resource is the modern client-collateral-aware path. See `portfolio/collateral-management.mdx` for the data model.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loan-collateral-management/{collateralId}` | `getLoanCollateral` |
+| DELETE | `/v1/loan-collateral-management/{id}` | `deleteLoanCollateral` |
+
+## `RescheduleLoansApiResource`
+
+File: `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/rescheduleloan/api/RescheduleLoansApiResource.java`
+Class path: `@Path("/v1/rescheduleloans")`
+
+Reschedule requests are first-class entities in `m_loan_reschedule_request`. The create endpoint produces a Pending request; an Approve POST commits the new schedule. The dispatcher form `POST /v1/rescheduleloans/{scheduleId}?command=approve|reject` is the way to act on a pending request.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/rescheduleloans/template` | `retrieveTemplate` |
+| GET | `/v1/rescheduleloans` | `retrieveAllRescheduleRequest` |
+| GET | `/v1/rescheduleloans/{scheduleId}` | `readLoanRescheduleRequest` |
+| POST | `/v1/rescheduleloans` | `createLoanRescheduleRequest` |
+| POST | `/v1/rescheduleloans/{scheduleId}?command=…` | `updateLoanRescheduleRequest` |
+
+## `DelinquencyApiResource`
+
+File: `fineract-loan/src/main/java/org/apache/fineract/portfolio/delinquency/api/DelinquencyApiResource.java`
+Class path: `@Path("/v1/delinquency")`
+
+Delinquency configuration is **two-level**: *ranges* are DPD bands (e.g. 1–30, 31–60), and *buckets* are ordered collections of ranges that products bind to. A loan rolls through bucket positions as days-past-due grow; the position drives provisioning, reporting and dunning workflows.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/delinquency/ranges` | `getDelinquencyRanges` |
+| GET | `/v1/delinquency/ranges/{delinquencyRangeId}` | `getDelinquencyRange` |
+| POST | `/v1/delinquency/ranges` | `createDelinquencyRange` |
+| PUT | `/v1/delinquency/ranges/{delinquencyRangeId}` | `updateDelinquencyRange` |
+| DELETE | `/v1/delinquency/ranges/{delinquencyRangeId}` | `deleteDelinquencyRange` |
+| GET | `/v1/delinquency/buckets/template` | `getTemplate` |
+| GET | `/v1/delinquency/buckets` | `getDelinquencyBuckets` |
+| GET | `/v1/delinquency/buckets/{delinquencyBucketId}` | `getDelinquencyBucket` |
+| POST | `/v1/delinquency/buckets` | `createDelinquencyBucket` |
+| PUT | `/v1/delinquency/buckets/{delinquencyBucketId}` | `updateDelinquencyBucket` |
+| DELETE | `/v1/delinquency/buckets/{delinquencyBucketId}` | `deleteDelinquencyBucket` |
+
+The actual delinquency-clock evaluation happens during COB — see the `LoanDelinquencyDomainServiceImpl` and the `Loan delinquency classification` job.
+
+## Permissions
+
+Loan endpoints are gated by fine-grained permissions in `m_permission`. The most important rows:
+
+| Permission | Granted for |
+| --- | --- |
+| `READ_LOAN` | All `GET /v1/loans*` and `GET /v1/rescheduleloans*`. |
+| `CREATE_LOAN` | `POST /v1/loans`. |
+| `UPDATE_LOAN` | `PUT /v1/loans/{loanId}` (modify application). |
+| `DELETE_LOAN` | `DELETE /v1/loans/{loanId}`. |
+| `APPROVE_LOAN` / `UNDO_LOAN` / `APPROVALUNDO_LOAN` | `POST /v1/loans/{loanId}?command=approve|undoApproval`. |
+| `DISBURSE_LOAN` / `DISBURSALUNDO_LOAN` | `POST /v1/loans/{loanId}?command=disburse|disburseToSavings|undoDisbursal`. |
+| `REJECT_LOAN`, `WITHDRAW_LOAN` | Pre-activation termination. |
+| `UPDATELOANOFFICER_LOAN`, `REMOVELOANOFFICER_LOAN`, `BULKREASSIGN_LOAN` | Officer assignment. |
+| `FORECLOSURE_LOAN` | `?command=foreclosure`. |
+| `MARKASFRAUD_LOAN` | `?command=markAsFraud`. |
+| `CREATE_DELINQUENCY_BUCKET`, `UPDATE_DELINQUENCY_BUCKET`, `DELETE_DELINQUENCY_BUCKET` | `DelinquencyApiResource`. |
+| `CREATE_RESCHEDULELOAN`, `APPROVE_RESCHEDULELOAN`, `REJECT_RESCHEDULELOAN` | `RescheduleLoansApiResource`. |
+| `CREATE_GUARANTOR`, `UPDATE_GUARANTOR`, `DELETE_GUARANTOR` | `GuarantorsApiResource`. |
+
+`ALL_FUNCTIONS` is the superuser bypass; `ALL_FUNCTIONS_READ` covers every `READ_*`. Maker-checker, when enabled globally, adds `CHECKER_<PERMISSION>` rows that approve queued commands.
+
+## Worked example — full submit-to-disbursement flow
+
+```bash
+TENANT='Fineract-Platform-TenantId: default'
+HDR='Content-Type: application/json'
+
+# 1. Submit
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/loans \
+  -d '{
+    "clientId": 4711, "productId": 7,
+    "principal": 1000, "loanTermFrequency": 12,
+    "loanTermFrequencyType": 2,
+    "numberOfRepayments": 12, "repaymentEvery": 1,
+    "repaymentFrequencyType": 2,
+    "interestRatePerPeriod": 2.5,
+    "interestType": 0, "amortizationType": 1,
+    "interestCalculationPeriodType": 1,
+    "transactionProcessingStrategyCode": "mifos-standard-strategy",
+    "expectedDisbursementDate": "01 April 2024",
+    "submittedOnDate": "20 March 2024",
+    "dateFormat": "dd MMMM yyyy", "locale": "en"
+  }'
+# → { "loanId": 911, "resourceId": 911 }
+
+# 2. Approve
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST "https://localhost:8443/fineract-provider/api/v1/loans/911?command=approve" \
+  -d '{ "approvedOnDate": "25 March 2024", "approvedLoanAmount": 1000,
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+# 3. Disburse
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST "https://localhost:8443/fineract-provider/api/v1/loans/911?command=disburse" \
+  -d '{ "actualDisbursementDate": "01 April 2024", "paymentTypeId": 1,
+        "transactionAmount": 1000,
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+# 4. Read back with associations
+curl -k -u admin:password -H "$TENANT" \
+  'https://localhost:8443/fineract-provider/api/v1/loans/911?associations=all'
+```
+
+## Common query parameters on `GET /v1/loans`
+
+| Parameter | Purpose |
+| --- | --- |
+| `accountNo`, `externalId` | Direct lookup; do not combine with paging. |
+| `clientId`, `groupId` | Scope to a borrower. |
+| `officeId` | Office-hierarchy scope. |
+| `loanOfficerId` | Per-officer portfolio view. |
+| `status` | One of `all`, `active`, `pending`, `approved`, `disbursed`, `closedObligationsMet`, `writeoff`, `rescheduled`, `overpaid`. |
+| `productId` | Single-product filter. |
+| `associations` | Comma-separated: `all`, `repaymentSchedule`, `transactions`, `originalSchedule`, `charges`, `collateral`, `guarantors`, `notes`, `multiDisburseDetails`, `linkedAccount`, `meeting`, `delinquentDetails`. |
+| `exclude` | Inverse of `associations`. |
+| `fields` | Comma-separated list to project only specific top-level keys. |
+| `paged=true`, `offset`, `limit`, `orderBy`, `sortOrder` | Pagination. |
+| `sqlSearch` | Legacy free-form predicate (escape carefully; prefer `ClientSearchV2ApiResource` over this). |
+
+## Related domain documents
+
+- `portfolio/clients.mdx` — the customer aggregate behind every loan.
+- `portfolio/groups.mdx` — group/GLIM lending.
+- `portfolio/collateral-management.mdx` — collateral data model.
+- `progressive-loan/` and `working-capital-loan/` — schedule generators wired in via `LoanScheduleType`.
+- `cob/` — the Close-of-Business jobs that consume the delinquency tables and run accruals.
+- [Loan Products](/api/loan-products) — the product definition referenced by every loan application.
+- [Loan Transactions](/api/loan-transactions) — what to do with the loan once it is disbursed.
+- [Loans → Internal-Only](/api/internal-only) — fast-forward, lock and audit endpoints used by the integration tests.

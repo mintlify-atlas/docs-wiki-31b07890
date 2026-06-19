@@ -1,0 +1,302 @@
+---
+title: "Resilience4j Retries"
+description: "How Apache Fineract uses Resilience4j to make the command pipeline, scheduled jobs and JDBC command store robust against transient JPA/optimistic-locking failures."
+keywords: ["Apache Fineract", "Resilience4j", "retry", "circuit breaker", "configuration", "OptimisticLockException", "command store", "JDBC"]
+---
+
+Apache Fineract uses [Resilience4j](https://resilience4j.readme.io/) to make its command pipeline, scheduled jobs and JDBC command store robust against transient database errors — primarily optimistic-locking failures from concurrent JPA writes. The retry policy for each "instance" lives entirely in `application.properties` under the `resilience4j.retry.instances.<name>.*` (or `fineract.retry.instances.<name>.*`) namespace, which means you can tune the behaviour for production without rebuilding the JAR.
+
+**Source:** `fineract-provider/src/main/resources/application.properties`
+
+## Why retries matter for a multi-user financial system
+
+Apache Fineract is intentionally optimistic about database concurrency. Banking workflows generate dense contention on a small number of "hot" rows — the most recently disbursed loan, the savings account being repeatedly debited for fees, the journal-entry sequence — and pessimistic row locks would serialise those operations across all users. By favouring optimistic locking plus automatic retries, Fineract trades a tiny amount of latency on contended writes for vastly higher overall throughput.
+
+The configuration on this page is the knob that controls that trade-off. Default values are safe and rarely need adjustment; the per-instance granularity is provided so that operators with a measurable contention hotspot can lean on that one instance without affecting the rest of the system.
+
+## What is retried (and why)
+
+The classes of failures these retries handle are deterministic and well-known: when two transactions race for the same row in the database (e.g. two payments hitting the same loan), one of them is rejected with an `OptimisticLockException`. Re-running the same operation usually succeeds because the contended row has been freed. Fineract therefore registers a retry policy on every command that performs JPA writes likely to contend.
+
+The standard list of exceptions that trigger a retry (across all instances) is:
+
+- `org.springframework.dao.ConcurrencyFailureException`
+- `org.eclipse.persistence.exceptions.OptimisticLockException`
+- `jakarta.persistence.OptimisticLockException`
+- `org.springframework.orm.jpa.JpaOptimisticLockingFailureException`
+
+The top-level `executeCommand` retry additionally retries on:
+
+- `org.apache.fineract.infrastructure.core.exception.IdempotentCommandProcessUnderProcessingException`
+
+This last one is raised when an idempotent command sees its previous attempt still in flight; retrying lets the original finish and returns its result.
+
+## Anatomy of a retry instance
+
+Each named retry instance has the same shape:
+
+```properties
+resilience4j.retry.instances.<name>.max-attempts=3
+resilience4j.retry.instances.<name>.wait-duration=1s
+resilience4j.retry.instances.<name>.enable-exponential-backoff=true
+resilience4j.retry.instances.<name>.exponential-backoff-multiplier=2
+resilience4j.retry.instances.<name>.retryExceptions=org.springframework.dao.ConcurrencyFailureException,…
+```
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `max-attempts` | Total attempts including the first. `3` means "1 try + up to 2 retries". | `3` |
+| `wait-duration` | Pause before the second attempt. | `1s` |
+| `enable-exponential-backoff` | If `true`, every subsequent attempt waits `wait-duration × multiplier^(attempt-1)`. | `true` |
+| `exponential-backoff-multiplier` | Geometric factor for the backoff. With the defaults: 1s, 2s, 4s, … | `2` |
+| `retryExceptions` | Comma-separated FQCNs that count as retryable. | the four JPA exceptions listed above |
+
+With default values the wall-clock retry budget is roughly: attempt 1, wait 1s, attempt 2, wait 2s, attempt 3 — about 3 seconds in the worst case per command.
+
+## Command pipeline & top-level retry
+
+`fineract-provider` exposes two flavours of the same property namespace:
+
+- `fineract.retry.instances.executeCommand.*` — wraps `CommandProcessingService#executeCommand`. This is the outermost retry that protects the synchronous command pipeline (`maker-checker`, validation, JPA write, audit).
+- `resilience4j.retry.instances.<name>.*` — used for every individual command handler and for the asynchronous JDBC command store.
+
+| Property | Default | Env var |
+| --- | --- | --- |
+| `fineract.retry.instances.executeCommand.max-attempts` | `3` | `FINERACT_COMMAND_PROCESSING_RETRY_MAX_ATTEMPTS` |
+| `fineract.retry.instances.executeCommand.wait-duration` | `1s` | `FINERACT_COMMAND_PROCESSING_RETRY_WAIT_DURATION` |
+| `fineract.retry.instances.executeCommand.enable-exponential-backoff` | `true` | `FINERACT_COMMAND_PROCESSING_RETRY_ENABLE_EXPONENTIAL_BACKOFF` |
+| `fineract.retry.instances.executeCommand.exponential-backoff-multiplier` | `2` | `FINERACT_COMMAND_PROCESSING_RETRY_EXPONENTIAL_BACKOFF_MULTIPLIER` |
+| `fineract.retry.instances.executeCommand.retryExceptions` | the 4 JPA exceptions + `IdempotentCommandProcessUnderProcessingException` | `FINERACT_COMMAND_PROCESSING_RETRY_EXCEPTIONS` |
+
+## JDBC command store
+
+The JDBC command store is the durable queue used by the asynchronous command pipeline. It writes a row per command before any business logic runs, allowing in-flight commands to survive a JVM crash. Because it is hit by every command, it has its own retry instance:
+
+| Property | Default | Env var |
+| --- | --- | --- |
+| `resilience4j.retry.instances.commandStore.max-attempts` | `3` | `FINERACT_COMMAND_STORE_RETRY_MAX_ATTEMPTS` |
+| `resilience4j.retry.instances.commandStore.wait-duration` | `1s` | `FINERACT_COMMAND_STORE_RETRY_WAIT_DURATION` |
+| `resilience4j.retry.instances.commandStore.enable-exponential-backoff` | `true` | `FINERACT_COMMAND_STORE_RETRY_ENABLE_EXPONENTIAL_BACKOFF` |
+| `resilience4j.retry.instances.commandStore.exponential-backoff-multiplier` | `2` | `FINERACT_COMMAND_STORE_RETRY_EXPONENTIAL_BACKOFF_MULTIPLIER` |
+| `resilience4j.retry.instances.commandStore.retryExceptions` | the 4 JPA exceptions | `FINERACT_COMMAND_STORE_RETRY_EXCEPTIONS` |
+
+If the retry budget is exhausted, the failing command is either routed to the optional file-based dead-letter queue (`fineract.command.jdbc.file-dead-letter-queue-enabled`) or surfaced to the caller as a 500.
+
+## Scheduled-job retries
+
+A few scheduled jobs (the kind orchestrated by Spring Batch) have their own instances:
+
+| Instance | Purpose |
+| --- | --- |
+| `processJobDetailForExecution` | Wraps the job-engine call that picks the next job detail and dispatches it. |
+| `recalculateInterest` | Wraps the per-loan interest recalculation worker. |
+| `postInterest` | Wraps the per-loan / per-savings interest posting worker. |
+| `commandBusinessDateUpdate` | Wraps the business-date update command. |
+| `commandCacheSwitch` | Wraps cache-switch commands. |
+
+Each instance follows the standard shape (`max-attempts=3`, `wait-duration=1s`, `enable-exponential-backoff=true`, `exponential-backoff-multiplier=2`). The env-var prefix is `FINERACT_PROCESS_<INSTANCE>_RETRY_*` for the job processors and `FINERACT_COMMAND_<DOMAIN>_<ACTION>_RETRY_*` for command handlers.
+
+## Per-command-handler retries
+
+These instances wrap individual write handlers so a single failed handler does not bubble back to the caller until the retry budget is exhausted. Defaults are always `max-attempts=3, wait-duration=1s, enable-exponential-backoff=true, multiplier=2`.
+
+### Currencies & external events configuration
+
+- `commandCurrencyUpdate` — `FINERACT_COMMAND_CURRENCY_UPDATE_RETRY_*`
+- `commandExternalEventConfigurationUpdate` — `FINERACT_COMMAND_EXTERNAL_EVENT_CONFIGURATION_UPDATE_RETRY_*`
+
+### Notes
+
+- `commandNoteCreate` — `FINERACT_COMMAND_NOTE_CREATE_RETRY_*`
+- `commandNoteUpdate` — `FINERACT_COMMAND_NOTE_UPDATE_RETRY_*`
+- `commandNoteDelete` — `FINERACT_COMMAND_NOTE_DELETE_RETRY_*`
+
+### Documents
+
+- `commandDocumentCreate` — `FINERACT_COMMAND_DOCUMENT_CREATE_RETRY_*`
+- `commandDocumentUpdate` — `FINERACT_COMMAND_DOCUMENT_UPDATE_RETRY_*`
+- `commandDocumentDelete` — `FINERACT_COMMAND_DOCUMENT_DELETE_RETRY_*`
+
+### Images
+
+- `commandImageCreate` — `FINERACT_COMMAND_IMAGE_CREATE_RETRY_*`
+- `commandImageDelete` — `FINERACT_COMMAND_IMAGE_DELETE_RETRY_*`
+
+### Payment types
+
+- `commandPaymentTypeCreate` — `FINERACT_COMMAND_PAYMENT_TYPE_CREATE_RETRY_*`
+- `commandPaymentTypeUpdate` — `FINERACT_COMMAND_PAYMENT_TYPE_UPDATE_RETRY_*`
+- `commandPaymentTypeDelete` — `FINERACT_COMMAND_PAYMENT_TYPE_DELETE_RETRY_*`
+
+### MIX taxonomy
+
+- `commandMixTaxonomyMappingUpdate` — `FINERACT_COMMAND_MIX_TAXONOMY_MAPPING_UPDATE_RETRY_*`
+
+### Interest rate charts
+
+- `commandInterestRateChartCreate` — `FINERACT_COMMAND_INTEREST_RATE_CHART_CREATE_RETRY_*`
+- `commandInterestRateChartUpdate` — `FINERACT_COMMAND_INTEREST_RATE_CHART_UPDATE_RETRY_*`
+- `commandInterestRateChartDelete` — `FINERACT_COMMAND_INTEREST_RATE_CHART_DELETE_RETRY_*`
+- `commandInterestRateChartSlabsCreate` — `FINERACT_COMMAND_INTEREST_RATE_CHART_SLABS_CREATE_RETRY_*`
+- `commandInterestRateChartSlabsUpdate` — `FINERACT_COMMAND_INTEREST_RATE_CHART_SLABS_UPDATE_RETRY_*`
+- `commandInterestRateChartSlabsDelete` — `FINERACT_COMMAND_INTEREST_RATE_CHART_SLABS_DELETE_RETRY_*`
+
+### Staff
+
+- `commandStaffCreate` — `FINERACT_COMMAND_STAFF_CREATE_RETRY_*`
+- `commandStaffUpdate` — `FINERACT_COMMAND_STAFF_UPDATE_RETRY_*`
+- `commandStaffUpload` — `FINERACT_COMMAND_STAFF_UPLOAD_RETRY_*`
+
+### Meetings
+
+- `commandMeetingCreate` — `FINERACT_COMMAND_MEETING_CREATE_RETRY_*`
+- `commandMeetingUpdate` — `FINERACT_COMMAND_MEETING_UPDATE_RETRY_*`
+- `commandMeetingDelete` — `FINERACT_COMMAND_MEETING_DELETE_RETRY_*`
+- `commandMeetingAttendanceUpdate` — `FINERACT_COMMAND_MEETING_ATTENDANCE_UPDATE_RETRY_*`
+
+### Client collateral
+
+- `commandClientCollateralCreate` — `FINERACT_COMMAND_CLIENT_COLLATERAL_CREATE_RETRY_*`
+- `commandClientCollateralUpdate` — `FINERACT_COMMAND_CLIENT_COLLATERAL_UPDATE_RETRY_*`
+- `commandClientCollateralDelete` — `FINERACT_COMMAND_CLIENT_COLLATERAL_DELETE_RETRY_*`
+
+### Hooks
+
+- `commandHookCreate` — `FINERACT_COMMAND_HOOK_CREATE_RETRY_*`
+- `commandHookUpdate` — `FINERACT_COMMAND_HOOK_UPDATE_RETRY_*`
+- `commandHookDelete` — `FINERACT_COMMAND_HOOK_DELETE_RETRY_*`
+
+### Templates
+
+- `commandTemplateCreate` — `FINERACT_COMMAND_TEMPLATE_CREATE_RETRY_*`
+- `commandTemplateUpdate` — `FINERACT_COMMAND_TEMPLATE_UPDATE_RETRY_*`
+- `commandTemplateDelete` — `FINERACT_COMMAND_TEMPLATE_DELETE_RETRY_*`
+
+## Disabling retries for a specific instance
+
+Set `max-attempts=1` for the instance — Resilience4j will then perform a single attempt and never retry. For example, to disable retries on `commandDocumentDelete`:
+
+```properties
+resilience4j.retry.instances.commandDocumentDelete.max-attempts=1
+```
+
+…or via environment variable:
+
+```
+FINERACT_COMMAND_DOCUMENT_DELETE_RETRY_MAX_ATTEMPTS=1
+```
+
+## Why JPA optimistic locking?
+
+Apache Fineract uses EclipseLink as its JPA provider and most write-heavy entities (`Loan`, `LoanTransaction`, `SavingsAccount`, `JournalEntry`, …) carry a `@Version` column. When two threads load the same entity, modify it, and try to flush, EclipseLink throws `OptimisticLockException` on the second flush because the version number does not match what is currently in the database. This is the price of avoiding pessimistic row locks at the database level — those would serialise writes globally and devastate throughput.
+
+The retries on this page exist to absorb that one specific failure mode. Because optimistic locking is fast (no row lock held across the user's think time) and the retry is cheap (a re-read plus a re-flush) the combination usually outperforms pessimistic locking even under heavy contention. The headline tunables — `max-attempts=3`, `wait-duration=1s`, `multiplier=2` — were chosen to absorb up to three concurrent writers without disrupting throughput.
+
+## Operational tuning recipes
+
+A few concrete adjustments that are sometimes useful in production:
+
+**Recipe — absorb a 5-attempt burst during nightly COB.**
+
+```bash
+FINERACT_PROCESS_JOB_DETAIL_RETRY_MAX_ATTEMPTS=5
+FINERACT_PROCESS_RECALCULATE_INTEREST_RETRY_MAX_ATTEMPTS=5
+FINERACT_PROCESS_POST_INTEREST_RETRY_MAX_ATTEMPTS=5
+```
+
+Useful when overnight contention on the journal-entry sequence causes COB to bail too early.
+
+**Recipe — faster failure for the synchronous API.**
+
+```bash
+FINERACT_COMMAND_PROCESSING_RETRY_MAX_ATTEMPTS=2
+FINERACT_COMMAND_PROCESSING_RETRY_WAIT_DURATION=200ms
+```
+
+If clients have aggressive HTTP timeouts and you'd rather propagate the failure quickly than burn the retry budget.
+
+**Recipe — broaden the retry exception list for a custom data store.**
+
+```bash
+FINERACT_COMMAND_STORE_RETRY_EXCEPTIONS=org.springframework.dao.ConcurrencyFailureException,org.springframework.dao.CannotAcquireLockException,com.mycompany.MyTransientDbException
+```
+
+Add transient driver exceptions if you have a custom adapter and the default JPA list does not cover them.
+
+## End-to-end picture
+
+When a write request hits Fineract the layered retries combine like Russian dolls:
+
+1. The outer `executeCommand` retry (`fineract.retry.instances.executeCommand`) wraps the entire synchronous command pipeline (validation, maker-checker, business logic, JPA flush, audit).
+2. Inside the pipeline, individual handlers (e.g. `commandNoteCreate`, `commandLoanRepayment`) may have their own retry instances under the `resilience4j.retry.instances.*` namespace.
+3. When the asynchronous JDBC command-store is used, every database write to the `m_portfolio_command_source` table goes through the `commandStore` retry instance.
+4. Scheduled jobs run their per-step worker through one of the job-related instances (`processJobDetailForExecution`, `recalculateInterest`, `postInterest`).
+
+Because the retries are JPA-aware (they recognise `OptimisticLockException` and friends) and the underlying transaction has been rolled back by the time the retry runs, each attempt operates on fresh entity state — there is no risk of stale-entity poisoning across attempts.
+
+## Observability
+
+When `management.health.ratelimiters.enabled=true` and `management.endpoints.web.exposure.include` includes `health`, Resilience4j contributes its own health indicators. The Micrometer integration also exposes per-instance counters under the `resilience4j_retry_calls_total` metric (with tags `name=<instance>`, `kind=successful_without_retry|successful_with_retry|failed_with_retry|failed_without_retry`) so you can graph how often the system actually retries.
+
+If you see large numbers of `failed_with_retry` for a single instance you have a contention hotspot — investigate whether the underlying transaction can be shortened, or whether the operation should be made asynchronous.
+
+## Configuration vs Java annotations
+
+The retry policies are configured entirely by property — there is no `@Retryable` annotation in the Fineract source. Resilience4j discovers the policies through Spring Boot auto-configuration and binds them by `name`. A command handler is wrapped in a retry by referencing the instance name via Spring's `RetryRegistry` or, more commonly, through the `@Retry(name = "<instance>")` annotation provided by the `resilience4j-spring-boot3` starter.
+
+This means **renaming an instance** in `application.properties` (or its env-var override) without updating the corresponding `@Retry(name=...)` in code will silently turn the retry off — Resilience4j will fall back to a default no-retry policy. Always rename in both places, or stick to overriding the existing names.
+
+The same approach is used for circuit breakers (when configured) and rate limiters — Fineract relies on configuration-driven discovery throughout.
+
+## Tuning advice
+
+<Tip>If you see a steady trickle of `OptimisticLockException` in production at low concurrency, the defaults are fine — the system self-heals. Only tune up `max-attempts` if you have measured a real spike of contention and the failure mode is genuinely transient.</Tip>
+
+<Warning>Do **not** add long-lived exceptions (network timeouts, `ConstraintViolationException`, validation errors) to `retryExceptions`. Retrying a non-transient failure burns the retry budget and slows your callers.</Warning>
+
+<Tip>Per-instance overrides also mean you can be conservative globally (e.g. `executeCommand` with 5 attempts) while keeping individual leaf handlers at the default 3 — the worst-case latency is the product of the budgets, not their sum.</Tip>
+
+## Custom exception lists per instance
+
+While the default exception list is shared across instances, several handlers ship with custom lists. For example, `executeCommand` adds `IdempotentCommandProcessUnderProcessingException` so that an in-flight idempotent command is retried until its original processor finishes. Some downstream handlers omit it because they cannot be invoked through the idempotent pathway.
+
+When you override `retryExceptions` via env var the **entire** list is replaced — there is no merging. Always copy the existing default list and append (or remove) entries.
+
+A safe override pattern is:
+
+```bash
+FINERACT_COMMAND_NOTE_CREATE_RETRY_EXCEPTIONS=\
+org.springframework.dao.ConcurrencyFailureException,\
+org.eclipse.persistence.exceptions.OptimisticLockException,\
+jakarta.persistence.OptimisticLockException,\
+org.springframework.orm.jpa.JpaOptimisticLockingFailureException,\
+com.mycompany.MyTransientException
+```
+
+## FAQ
+
+**Why are there so many per-handler retry instances?** Each handler is a separate Resilience4j retry "subject" so you can change one without affecting the others. If you need a single uniform policy, set the same env values for all of them — there is no global override.
+
+**Can I add new exception types?** Yes — set the `retryExceptions` property (or the equivalent `FINERACT_*_RETRY_EXCEPTIONS` env var) to a comma-separated list of fully-qualified class names. The list completely replaces the default; it is not additive.
+
+**What happens after the last attempt fails?** The exception propagates out of the retry. For the synchronous pipeline that becomes an HTTP 5xx; for the asynchronous JDBC pipeline the row is left in a failed state and (optionally) written to the file-based dead-letter queue.
+
+**Are these retries idempotent-safe?** Yes — they are designed for exceptions thrown before any side effect happens. JPA optimistic locking rolls back the transaction before throwing, so retrying re-runs the unit of work cleanly.
+
+**Can I disable all retries at once?** There is no single switch; you would have to set `max-attempts=1` for each instance. In practice it is rarely useful — the retries handle real, recurring race conditions.
+
+## How to tell whether a retry is firing
+
+Three quick checks:
+
+1. **Logs.** When the `executeCommand` or any handler retries, EclipseLink logs the original `OptimisticLockException`. Greppable signature: `OptimisticLockException` near a transaction boundary in your application log.
+2. **Metrics.** With Prometheus enabled, `resilience4j_retry_calls_total{name="<instance>",kind="successful_with_retry"}` increments for every attempt that succeeded after retrying. If the number is non-zero in a steady state you have measurable contention.
+3. **Actuator.** `GET /actuator/health` includes the Resilience4j health contributor (if rate-limiters/circuit-breakers are also on) which reports each instance's state.
+
+If you cannot see any of these signals after a known contention event, double-check that the instance name in `application.properties` matches the `@Retry(name=...)` in the handler — a typo silently disables the retry.
+
+## See also
+
+- [Application Properties Reference](/configuration/application-properties#command-pipeline) — the command pipeline section.
+- [Command Pipeline](/command) — where the retries are applied.
+- [Jobs](/jobs) — for the scheduled-job retry instances.

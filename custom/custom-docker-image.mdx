@@ -1,0 +1,410 @@
+---
+title: "Custom Docker Image"
+description: "Build and deploy a Fineract container that bundles your custom Gradle modules using docker-compose-custom.yml, the :custom:docker Jib build, and the fineract-custom image."
+keywords: ["apache fineract", "docker", "docker compose", "fineract-custom image", "jib", "custom modules", "fineract customization", "fineract deployment"]
+---
+
+This page walks through how Apache Fineract packages a customized build into a Docker image. The pieces fit together in three layers: the `:custom:docker` Gradle subproject — a Jib-based image build that dynamically pulls in every leaf module under `custom/` — the `fineract-custom:latest` image it produces, and `docker-compose-custom.yml` together with the shared compose fragment at `config/docker/compose/fineract-custom.yml` that runs the image with a MariaDB sidecar. The end result is a single `docker compose up` that boots Fineract with your customizations active, your custom Liquibase changesets applied, and your JARs (or mounted configs) layered on top of the upstream artifacts.
+
+## High-level layout
+
+```
+docker-compose-custom.yml                # top-level compose entry point you actually run
+config/docker/compose/fineract-custom.yml # service definition reused via "extends:"
+config/docker/compose/mariadb.yml         # MariaDB service definition reused via "extends:"
+config/docker/env/fineract.env            # base env for the Fineract container
+config/docker/env/fineract-common.env     # tuning + tenant defaults
+config/docker/env/fineract-mariadb.env    # database connection settings
+custom/docker/build.gradle                # :custom:docker — Jib image build
+custom/<company>/<category>/<module>/     # your code, discovered automatically
+```
+
+`docker-compose-custom.yml` orchestrates two services — `db` and `fineract` — by extending fragments from `config/docker/compose/`. The Fineract service runs the `fineract-custom:latest` image, which is built by the `:custom:docker` Gradle subproject. That subproject in turn dynamically depends on every leaf module under `custom/<company>/<category>/<module>/` so any code you drop in is automatically included in the next build.
+
+## `docker-compose-custom.yml`
+
+The compose file is intentionally short. From the repository root:
+
+```yaml
+# docker-compose-custom.yml
+services:
+  db:
+    extends:
+      file: ./config/docker/compose/mariadb.yml
+      service: mariadb
+
+  fineract:
+    extends:
+      file: ./config/docker/compose/fineract-custom.yml
+      service: fineract
+    ports:
+      - "8443:8443"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ./config/docker/env/fineract.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-mariadb.env
+```
+
+Notable details:
+
+- **`extends:` re-uses shared fragments.** The `mariadb` service is defined once in `config/docker/compose/mariadb.yml` and reused across every database-flavored compose file in the repo. The same applies to the Fineract service.
+- **`depends_on` with a healthcheck.** The Fineract container waits for the MariaDB container to report healthy. The healthcheck itself is part of the MariaDB fragment.
+- **Three env files are layered.** `fineract.env` provides the bare minimum (node ID), `fineract-common.env` provides Hikari pool tuning, JVM options, and tenant defaults, and `fineract-mariadb.env` provides the JDBC URL and driver coordinates. Compose merges them in declaration order; later files take precedence.
+
+## `config/docker/compose/fineract-custom.yml`
+
+This fragment is the reusable Fineract service block. It is identical to the upstream `fineract.yml` fragment except for the image name:
+
+```yaml
+# config/docker/compose/fineract-custom.yml
+version: "3.8"
+
+services:
+  fineract:
+    # user: "${FINERACT_USER}:${FINERACT_GROUP}"
+    image: ${IMAGE_NAME:-fineract-custom:latest}
+    volumes:
+      - ${PWD}/config/docker/logback/logback-override.xml:/app/logback-override.xml
+      - ${PWD}/config/docker/aws/etc/credentials:/etc/aws/credentials:ro
+      - ${PWD}/build/fineract/logs:/var/logs/fineract:rw
+    healthcheck:
+      test: ["CMD", 'sh', '-c', 'echo -e "Checking for the availability of Fineract server deployment"; while ! nc -z "localhost" 8443; do sleep 1; printf "-"; done; echo -e " >> Fineract server has started";']
+      timeout: 1s
+      retries: 60
+```
+
+Three things to notice:
+
+- **`image: ${IMAGE_NAME:-fineract-custom:latest}`.** Compose substitutes an `IMAGE_NAME` environment variable if set, otherwise falls back to `fineract-custom:latest`. You can repoint the deployment to a registry-hosted custom image by exporting `IMAGE_NAME=registry.example.com/fineract-custom:1.2.3` before running `docker compose up`.
+- **Volume mounts for runtime overrides.** Three host paths are bind-mounted:
+  - `logback-override.xml` lets you change log levels at runtime without rebuilding the image.
+  - The AWS credentials file is mounted read-only so the Fineract S3 integration can use it.
+  - The host `build/fineract/logs` directory receives container logs.
+- **Healthcheck.** The container reports healthy once port 8443 (HTTPS) is accepting connections. This is what `depends_on` in another compose file would key on if you wanted to chain a downstream service.
+
+## The `:custom:docker` Jib build
+
+The image is built by the `custom/docker/build.gradle` subproject using [Google Jib](https://github.com/GoogleContainerTools/jib), which produces an OCI image directly from compiled classes — no Dockerfile required:
+
+```groovy
+// custom/docker/build.gradle (excerpt)
+description = 'Fineract Custom Docker Image'
+
+apply plugin: 'java'
+apply plugin: 'com.google.cloud.tools.jib'
+apply from: "${rootDir}/buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle"
+
+jib {
+    from {
+        image = 'azul/zulu-openjdk-alpine:21'
+        platforms {
+            platform {
+                architecture = System.getProperty("os.arch").equals("aarch64") ? "arm64" : "amd64"
+                os = 'linux'
+            }
+        }
+    }
+
+    to {
+        image = 'fineract-custom'
+        tags = [
+            "${project.version}",
+            'latest'
+        ]
+    }
+
+    container {
+        creationTime = 'USE_CURRENT_TIMESTAMP'
+        mainClass = 'org.apache.fineract.ServerApplication'
+        args = [
+            '-Duser.home=/tmp',
+            '-Dfile.encoding=UTF-8',
+            '-Duser.timezone=UTC',
+            '-Djava.security.egd=file:/dev/./urandom'
+        ]
+        ports = ['8080/tcp', '8443/tcp']
+        labels = [maintainer: 'Aleksandar Vidakovic <aleks@apache.org>']
+        user = 'nobody:nogroup'
+    }
+
+    allowInsecureRegistries = true
+    // dependencies and pluginExtensions follow ...
+}
+```
+
+The key declarative pieces:
+
+- **Base image.** `azul/zulu-openjdk-alpine:21` — a small Alpine-based OpenJDK 21 image. Architecture is detected automatically (`arm64` on Apple Silicon, `amd64` elsewhere).
+- **Output image.** `fineract-custom:<project.version>` and `fineract-custom:latest`. Both tags are pushed in a single build.
+- **Entry point.** `org.apache.fineract.ServerApplication` — the upstream Spring Boot main class.
+- **JVM args.** Sensible defaults for a containerized run: tmp home, UTF-8, UTC, fast entropy.
+- **User.** `nobody:nogroup`, so the container does not run as root.
+
+### Dynamic module pickup
+
+The dependency block does the same three-level walk that `settings.gradle` performs to discover custom modules at configuration time:
+
+```groovy
+dependencies {
+    implementation project(':fineract-core')
+    implementation project(':fineract-provider')
+    // NOTE: dynamically load all custom modules
+    file("${rootDir}/custom").eachDir { companyDir ->
+        if ('build' != companyDir.name && 'docker' != companyDir.name) {
+            file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+                if ('build' != categoryDir.name) {
+                    file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                        if ('build' != moduleDir.name) {
+                            implementation project(":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // NOTE: other custom dependencies
+    implementation 'org.mariadb.jdbc:mariadb-java-client'
+    implementation 'com.mysql:mysql-connector-j'
+    implementation 'org.postgresql:postgresql'
+    annotationProcessor 'org.springframework.boot:spring-boot-autoconfigure-processor'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+}
+```
+
+Three things are bundled into the image:
+
+1. The upstream `fineract-core` and `fineract-provider` JARs.
+2. Every leaf module under `custom/<company>/<category>/<module>/` — same scanning rule as `settings.gradle`.
+3. The JDBC drivers for MariaDB, MySQL, and PostgreSQL (so the same image works against any of the three databases).
+
+The annotation processors are not bundled in the runtime image; they are only used during compilation to generate Spring Boot's auto-configuration metadata and configuration-property metadata.
+
+### Layer filtering
+
+Jib organizes the container filesystem into layers. The `:custom:docker` build configures the layer filter plugin to keep resources together:
+
+```groovy
+pluginExtensions {
+    pluginExtension {
+        implementation = 'com.google.cloud.tools.jib.gradle.extension.layerfilter.JibLayerFilterExtension'
+        configuration {
+            filters {
+                filter {
+                    glob = '/app/resources/**'
+                }
+            }
+        }
+    }
+}
+```
+
+This keeps the resources layer well-defined so that when only application code changes, fewer layers need to be rebuilt and re-uploaded.
+
+## Building the image
+
+The standard build commands:
+
+```bash
+# Build the image into the local Docker daemon
+./gradlew :custom:docker:jibDockerBuild
+
+# Build to a tar archive
+./gradlew :custom:docker:jibBuildTar
+
+# Push directly to a registry
+./gradlew :custom:docker:jib \
+    -Djib.to.image=registry.example.com/fineract-custom \
+    -Djib.to.tags=1.2.3,latest
+```
+
+After `jibDockerBuild`, you can verify the image:
+
+```bash
+docker images fineract-custom
+# REPOSITORY        TAG       IMAGE ID       CREATED         SIZE
+# fineract-custom   latest    abc123...      1 minute ago    420MB
+# fineract-custom   <version> abc123...      1 minute ago    420MB
+```
+
+## Running the stack
+
+Once the image is built:
+
+```bash
+docker compose -f docker-compose-custom.yml up
+```
+
+Compose creates the `db` container, waits for its healthcheck, then starts the `fineract` container. Liquibase migrations run on first boot:
+
+- The upstream changesets from `db.changelog-master.xml` are applied first.
+- The custom changesets discovered under `db/custom-changelog/` on the classpath are applied next, because `TenantDatabaseUpgradeService` always passes `custom_changelog` as one of the activated Liquibase contexts. See [Customization overview](/custom/overview) for the context-resolution details.
+
+Once the application is up, the Fineract API is available at `https://localhost:8443/fineract-provider/`. The container's port 8443 is published to the host's port 8443 via the compose file.
+
+## Mounting user JARs and configs
+
+The reference compose file mounts three volumes for runtime configuration:
+
+```yaml
+volumes:
+  - ${PWD}/config/docker/logback/logback-override.xml:/app/logback-override.xml
+  - ${PWD}/config/docker/aws/etc/credentials:/etc/aws/credentials:ro
+  - ${PWD}/build/fineract/logs:/var/logs/fineract:rw
+```
+
+You can extend the volume list to inject extra configuration without rebuilding the image. Some common patterns:
+
+### Override Spring Boot configuration
+
+```yaml
+services:
+  fineract:
+    extends:
+      file: ./config/docker/compose/fineract-custom.yml
+      service: fineract
+    volumes:
+      - ${PWD}/config/docker/logback/logback-override.xml:/app/logback-override.xml
+      - ${PWD}/custom/config/application-custom.properties:/app/resources/application-custom.properties:ro
+    environment:
+      SPRING_PROFILES_ACTIVE: test,diagnostics,custom
+```
+
+Spring Boot reads `application-<profile>.properties` from `/app/resources/`. Activating the `custom` profile via `SPRING_PROFILES_ACTIVE` picks up the bind-mounted file. This is how you toggle the per-module activation properties (`acme.note.enabled`, `acme.loan.enabled`, …) without rebuilding.
+
+### Drop additional JARs onto the classpath
+
+Jib lays out the application like a Spring Boot fat jar exploded onto disk:
+
+```
+/app
+├── classes/         # application code from :custom:docker's own src
+├── libs/            # every jar from the dependency closure
+└── resources/       # resources from :custom:docker's own src
+```
+
+To add a third-party JAR at runtime, bind-mount it into `/app/libs/` and Spring Boot's classloader will pick it up. This is rarely the right answer for production — you usually want to add it as a Gradle dependency and rebuild — but it is useful for hotfixes:
+
+```yaml
+volumes:
+  - ${PWD}/hotfix/some-driver.jar:/app/libs/some-driver.jar:ro
+```
+
+### Override per-environment env files
+
+Each compose file lists the env files it loads:
+
+```yaml
+env_file:
+  - ./config/docker/env/fineract.env
+  - ./config/docker/env/fineract-common.env
+  - ./config/docker/env/fineract-mariadb.env
+```
+
+Add your own env file at the end of the list to override anything earlier:
+
+```yaml
+env_file:
+  - ./config/docker/env/fineract.env
+  - ./config/docker/env/fineract-common.env
+  - ./config/docker/env/fineract-mariadb.env
+  - ./custom/env/acme-prod.env
+```
+
+`acme-prod.env` typically holds the activation flags:
+
+```env
+ACME_NOTE_ENABLED=true
+ACME_LOAN_ENABLED=true
+```
+
+Spring Boot's relaxed binding converts those to `acme.note.enabled` and `acme.loan.enabled` automatically — no quoting tricks needed.
+
+## Building a Dockerfile-based image (alternative)
+
+While the upstream toolchain is Jib-only, nothing prevents you from publishing a Dockerfile-based image that layers your customizations on top of an upstream `apache/fineract` image. A minimal pattern:
+
+```dockerfile
+# Dockerfile (place at the repo root)
+FROM apache/fineract:latest AS base
+
+# Drop in custom JARs (already built with ./gradlew assemble)
+COPY custom/acme/*/*/build/libs/*.jar /app/libs/
+
+# Bake configuration straight into the image
+COPY custom/config/application-custom.properties /app/resources/application-custom.properties
+
+ENV SPRING_PROFILES_ACTIVE=test,diagnostics,custom
+ENV ACME_NOTE_ENABLED=true
+ENV ACME_LOAN_ENABLED=true
+
+USER nobody:nogroup
+EXPOSE 8080 8443
+
+ENTRYPOINT ["java", \
+  "-Duser.home=/tmp", \
+  "-Dfile.encoding=UTF-8", \
+  "-Duser.timezone=UTC", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-cp", "/app/resources:/app/classes:/app/libs/*", \
+  "org.apache.fineract.ServerApplication"]
+```
+
+Build and reference it from a custom compose file:
+
+```bash
+./gradlew assemble
+docker build -t my-fineract-custom:1.0.0 .
+IMAGE_NAME=my-fineract-custom:1.0.0 docker compose -f docker-compose-custom.yml up
+```
+
+Because `config/docker/compose/fineract-custom.yml` honors the `IMAGE_NAME` environment variable, no compose file changes are needed when switching between the Jib-built image and a Dockerfile-built one.
+
+## Environment variables to know
+
+The `config/docker/env/fineract-common.env` file documents the tunable parameters. The ones you are most likely to override per environment:
+
+| Variable | Purpose |
+|----------|---------|
+| `FINERACT_NODE_ID` | Cluster node identifier; set per replica |
+| `FINERACT_HIKARI_MINIMUM_IDLE` / `FINERACT_HIKARI_MAXIMUM_POOL_SIZE` | Connection pool sizing |
+| `FINERACT_HIKARI_USERNAME` / `FINERACT_HIKARI_PASSWORD` | Database credentials (override for production!) |
+| `FINERACT_SERVER_SSL_ENABLED` | Set `false` to expose plain HTTP on 8080 |
+| `FINERACT_DEFAULT_TENANTDB_*` | Default tenant database name, host, password |
+| `FINERACT_DEFAULT_MASTER_PASSWORD` | Master encryption password — change before going live |
+| `SPRING_PROFILES_ACTIVE` | Comma-separated profile list; add `custom` to load your application-custom.properties |
+| `JAVA_TOOL_OPTIONS` | JVM flags; defaults already include `-Xmx1G` and container-aware ergonomics |
+
+For module-specific gates, follow the convention from the reference modules:
+
+| Variable | Activates |
+|----------|-----------|
+| `ACME_NOTE_ENABLED` | `acme.note.enabled` (note service replacement) |
+| `ACME_LOAN_ENABLED` | `acme.loan.enabled` (loan COB + processor + job) |
+
+Add the matching `ACME_<module>_ENABLED` variable when you introduce a new module gated on `acme.<module>.enabled`. Spring Boot's relaxed binding handles the conversion.
+
+## Operating notes
+
+- **First-boot migrations can take a while.** Liquibase applies a large number of upstream changesets the first time a tenant database is created. Subsequent boots only apply incremental changes.
+- **The image always carries all three JDBC drivers** (MariaDB, MySQL, PostgreSQL). Switching between databases is a matter of swapping the compose file (`docker-compose-postgresql.yml`, `docker-compose-mariadb.yml`, …) and the corresponding env file — no image rebuild required.
+- **`fineract-custom:latest` is built locally only.** It is never pushed by upstream CI. If you intend to deploy to a registry, override `jib.to.image` in your build pipeline or use the Dockerfile alternative above.
+- **Logs land in two places.** Console output is captured by Docker as normal; the file appender writes to `/var/logs/fineract`, which the compose file bind-mounts to `${PWD}/build/fineract/logs` on the host.
+
+## Reference: file map
+
+| Concern | Path |
+|---------|------|
+| Top-level compose | `docker-compose-custom.yml` |
+| Service fragment | `config/docker/compose/fineract-custom.yml` |
+| MariaDB fragment | `config/docker/compose/mariadb.yml` |
+| Env file (base) | `config/docker/env/fineract.env` |
+| Env file (tuning) | `config/docker/env/fineract-common.env` |
+| Env file (db) | `config/docker/env/fineract-mariadb.env` |
+| Image build | `custom/docker/build.gradle` |
+| Settings discovery | `settings.gradle` |
+| Reference modules | `custom/acme/...` |
+
+For the conceptual model behind these files, see [Customization overview](/custom/overview); for the module-loading mechanics, see [Custom module loading](/custom/custom-module-loading).

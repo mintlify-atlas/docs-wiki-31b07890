@@ -1,0 +1,393 @@
+---
+title: "Batch Command Handlers — Internal Strategy Catalogue"
+sidebarTitle: "Command Handlers"
+description: "Every CommandStrategy under fineract-provider's batch/command/internal package, with the sub-request method, URL pattern and Apache Fineract API resource."
+---
+
+The Apache Fineract Batch API never reaches the database directly. Each
+sub-request is matched against a regex routing table by
+[`CommandStrategyProvider`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java),
+which returns a Spring bean implementing
+[`CommandStrategy`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategy.java).
+The bean translates the `BatchRequest` into a regular method call on the
+matching `*ApiResource` and wraps the response in a `BatchResponse`. This page
+catalogues every concrete strategy that ships under
+`fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/`.
+
+For background, see the [Batch API overview](/batch/overview). For the JAX-RS
+resource that dispatches to the strategies, see
+[BatchApiResource](/batch/batch-api-resource).
+
+## The `CommandStrategy` SPI
+
+Every handler implements one method from
+[`CommandStrategy`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategy.java):
+
+```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategy.java
+public interface CommandStrategy {
+
+    BatchResponse execute(BatchRequest batchRequest, UriInfo uriInfo);
+}
+```
+
+A canonical implementation just copies request fields onto a response, calls
+the upstream `*ApiResource` bean, and sets a status code:
+
+```java fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/CreateClientCommandStrategy.java
+@Component
+@RequiredArgsConstructor
+public class CreateClientCommandStrategy implements CommandStrategy {
+
+    private final ClientsApiResource clientsApiResource;
+
+    @Override
+    public BatchResponse execute(final BatchRequest request, @SuppressWarnings("unused") UriInfo uriInfo) {
+
+        final BatchResponse response = new BatchResponse();
+        final String responseBody;
+
+        response.setRequestId(request.getRequestId());
+        response.setHeaders(request.getHeaders());
+
+        responseBody = clientsApiResource.create(request.getBody());
+
+        response.setStatusCode(HttpStatus.SC_OK);
+        response.setBody(responseBody);
+
+        return response;
+    }
+}
+```
+
+That gives every batched sub-request the same business logic, validation,
+permissions and serialization as a direct REST call — the strategy is just a
+thin adapter between the `BatchRequest`/`BatchResponse` envelope and the
+existing resource.
+
+## Routing rules
+
+`CommandStrategyProvider.init()` maps a `(URL regex, HTTP method)` pair to a
+Spring bean name. The regex toolkit is small:
+
+```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java
+private static final String OPTIONAL_QUERY_PARAM_REGEX = "(\\?([\\w-]+=[^&]+)(?:&[\\w-]+=[^&]+)*)?";
+private static final String MANDATORY_QUERY_PARAM_REGEX = "(\\?([\\w-]+=[^&]+)(?:&[\\w-]+=[^&]+)*)";
+private static final String OPTIONAL_COMMAND_PARAM_REGEX = "(\\?command=[\\w\\-]+)?";
+private static final String MANDATORY_COMMAND_PARAM_REGEX = "\\?command=[\\w\\-]+";
+private static final String UUID_PARAM_REGEX = "[\\w\\d-]+";
+private static final String NUMBER_REGEX = "\\d+";
+private static final String ALPHANUMBERIC_WITH_UNDERSCORE_REGEX = "[a-zA-Z0-9_]*";
+```
+
+Older clients that send paths without the `v1/` prefix are auto-prefixed so
+the routing regex sees a canonical URL:
+
+```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java
+public CommandStrategy getCommandStrategy(final CommandContext commandContext) {
+    if (isResourceVersioned(commandContext)) {
+        return internalGetCommandStrategy(commandContext);
+    } else {
+        CommandContext alteredCommandContext = CommandContext.resource("v1/" + commandContext.getResource())
+                .method(commandContext.getMethod()).build();
+        return internalGetCommandStrategy(alteredCommandContext);
+    }
+}
+```
+
+If no regex matches, the provider returns a default
+`UnknownCommandStrategy` that responds with a `501 Not Implemented` body so
+the caller sees a clear error rather than a `NullPointerException`.
+
+## Handlers grouped by domain
+
+The 50 strategies under
+`fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/`
+cover five domains. Each table lists:
+
+- **Strategy** — the bean class name (file lives in the package above).
+- **Method** — HTTP method for the sub-request.
+- **`relativeUrl` pattern** — the regex from `CommandStrategyProvider.init`,
+  rendered in human-friendly path form.
+- **Upstream resource** — the `*ApiResource` the strategy forwards to.
+
+### Client lifecycle
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `CreateClientCommandStrategy` | POST | `v1/clients` | `ClientsApiResource.create(...)` |
+| `UpdateClientCommandStrategy` | PUT | `v1/clients/{clientId}` | `ClientsApiResource.update(...)` |
+| `ActivateClientCommandStrategy` | POST | `v1/clients/{clientId}?command=activate` | `ClientsApiResource.activate(...)` |
+
+```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java
+commandStrategies.put(CommandContext.resource("v1\\/clients").method(POST).build(), "createClientCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/clients\\/" + NUMBER_REGEX).method(PUT).build(), "updateClientCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/clients\\/" + NUMBER_REGEX + "\\?command=activate").method(POST).build(),
+        "activateClientCommandStrategy");
+```
+
+### Loan lifecycle
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `ApplyLoanCommandStrategy` | POST | `v1/loans` | `LoansApiResource.calculateLoanScheduleOrSubmitLoanApplication(...)` |
+| `GetLoanByIdCommandStrategy` | GET | `v1/loans/{loanId}` (optional query) | `LoansApiResource.retrieveLoan(...)` |
+| `GetLoanByExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}` | `LoansApiResource.retrieveLoan(...)` (external-id overload) |
+| `ApproveLoanCommandStrategy` | POST | `v1/loans/{loanId}?command=approve` | `LoansApiResource.stateTransitions(...)` |
+| `DisburseLoanCommandStrategy` | POST | `v1/loans/{loanId}?command=disburse` | `LoansApiResource.stateTransitions(...)` |
+| `DisburseToSavingsCommandStrategy` | POST | `v1/loans/{loanId}?command=disburseToSavings` | `LoansApiResource.stateTransitions(...)` |
+| `LoanStateTransistionsByExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}?command=...` | `LoansApiResource.stateTransitions(...)` (external-id overload) |
+| `ModifyLoanApplicationCommandStrategy` | PUT | `v1/loans/{loanId}` (optional `?command=`) | `LoansApiResource.modifyLoanApplication(...)` |
+| `ModifyLoanApplicationByExternalIdCommandStrategy` | PUT | `v1/loans/external-id/{externalId}` | `LoansApiResource.modifyLoanApplication(...)` (external-id overload) |
+
+```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java
+commandStrategies.put(CommandContext.resource("v1\\/loans").method(POST).build(), "applyLoanCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/loans\\/" + NUMBER_REGEX + OPTIONAL_QUERY_PARAM_REGEX).method(GET).build(),
+        "getLoanByIdCommandStrategy");
+commandStrategies.put(
+        CommandContext.resource("v1\\/loans\\/external-id\\/" + UUID_PARAM_REGEX + OPTIONAL_QUERY_PARAM_REGEX).method(GET).build(),
+        "getLoanByExternalIdCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/loans\\/" + NUMBER_REGEX + "\\?command=approve").method(POST).build(),
+        "approveLoanCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/loans\\/" + NUMBER_REGEX + "\\?command=disburse").method(POST).build(),
+        "disburseLoanCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/loans\\/" + NUMBER_REGEX + "\\?command=disburseToSavings").method(POST).build(),
+        "disburseToSavingsCommandStrategy");
+```
+
+### Loan transactions, charges and reschedules
+
+This is the largest cluster. Each row covers a forwarded operation on
+`LoanTransactionsApiResource`, `LoanChargesApiResource`, or
+`RescheduleLoansApiResource`.
+
+#### Charges
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `CreateChargeCommandStrategy` | POST | `v1/loans/{loanId}/charges` | `LoanChargesApiResource.executeLoanCharge(...)` |
+| `CreateChargeByLoanExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/charges` (optional `?command=`) | `LoanChargesApiResource` (external-id overload) |
+| `CollectChargesCommandStrategy` | GET | `v1/loans/{loanId}/charges` | `LoanChargesApiResource.retrieveAllLoanCharges(...)` |
+| `CollectChargesByLoanExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/charges` | `LoanChargesApiResource` (external-id overload) |
+| `GetChargeByIdCommandStrategy` | GET | `v1/loans/{loanId}/charges/{chargeId}` | `LoanChargesApiResource.retrieveLoanCharge(...)` |
+| `GetChargeByChargeExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/charges/external-id/{chargeExternalId}` | `LoanChargesApiResource` (external-id overload) |
+| `AdjustChargeCommandStrategy` | POST | `v1/loans/{loanId}/charges/{chargeId}?command=...` | `LoanChargesApiResource.executeLoanCharge(...)` |
+| `AdjustChargeByChargeExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/charges/external-id/{chargeExternalId}?command=...` | `LoanChargesApiResource` (external-id overload) |
+
+#### Loan transactions
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `CreateTransactionLoanCommandStrategy` | POST | `v1/loans/{loanId}/transactions?command=...` | `LoanTransactionsApiResource.executeLoanTransaction(...)` |
+| `CreateTransactionByLoanExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/transactions?command=...` | `LoanTransactionsApiResource` (external-id overload) |
+| `AdjustLoanTransactionCommandStrategy` | POST | `v1/loans/{loanId}/transactions/{transactionId}` (optional `?command=`) | `LoanTransactionsApiResource.adjustLoanTransaction(...)` |
+| `AdjustLoanTransactionByExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/transactions/external-id/{transactionExternalId}` | `LoanTransactionsApiResource` (external-id overload) |
+| `GetLoanTransactionByIdCommandStrategy` | GET | `v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.retrieveTransaction(...)` |
+| `GetLoanTransactionByExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/transactions/external-id/{transactionExternalId}` | `LoanTransactionsApiResource` (external-id overload) |
+| `GetReagePreviewByLoanIdCommandStrategy` | GET | `v1/loans/{loanId}/transactions/reage-preview` | `LoanTransactionsApiResource.retrieveReagePreview(...)` |
+| `GetReagePreviewByLoanExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/transactions/reage-preview` | `LoanTransactionsApiResource` (external-id overload) |
+
+#### Reschedules
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `CreateLoanRescheduleRequestCommandStrategy` | POST | `v1/rescheduleloans` | `RescheduleLoansApiResource.createLoanRescheduleRequest(...)` |
+| `ApproveLoanRescheduleCommandStrategy` | POST | `v1/rescheduleloans/{rescheduleRequestId}?command=approve` | `RescheduleLoansApiResource.updateLoanRescheduleRequest(...)` |
+
+### Loan interest pauses
+
+Interest pauses are a sub-resource of loans. The Batch API exposes both
+loan-ID and external-ID variants:
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `GetLoanInterestPausesByLoanIdCommandStrategy` | GET | `v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.retrieveAll(...)` |
+| `CreateLoanInterestPauseByLoanIdCommandStrategy` | POST | `v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.create(...)` |
+| `UpdateLoanInterestPauseByLoanIdCommandStrategy` | PUT | `v1/loans/{loanId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource.update(...)` |
+| `GetLoanInterestPausesByExternalIdCommandStrategy` | GET | `v1/loans/external-id/{externalId}/interest-pauses` | `LoanInterestPauseApiResource` (external-id overload) |
+| `CreateLoanInterestPauseByExternalIdCommandStrategy` | POST | `v1/loans/external-id/{externalId}/interest-pauses` | `LoanInterestPauseApiResource` (external-id overload) |
+| `UpdateLoanInterestPauseByExternalIdCommandStrategy` | PUT | `v1/loans/external-id/{externalId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource` (external-id overload) |
+
+### Savings accounts
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `ApplySavingsCommandStrategy` | POST | `v1/savingsaccounts` | `SavingsAccountsApiResource.submitApplication(...)` |
+| `GetSavingsAccountByIdCommandStrategy` | GET | `v1/savingsaccounts/{accountId}` | `SavingsAccountsApiResource.retrieveOne(...)` |
+| `SavingsAccountTransactionCommandStrategy` | POST | `v1/savingsaccounts/{accountId}/transactions` (optional `?command=`) | `SavingsAccountTransactionsApiResource.transaction(...)` |
+| `SavingsAccountAdjustTransactionCommandStrategy` | POST | `v1/savingsaccounts/{accountId}/transactions/{transactionId}` (optional `?command=`) | `SavingsAccountTransactionsApiResource.adjustTransaction(...)` |
+| `CreateSavingsAccountChargeCommandStrategy` | POST | `v1/savingsaccounts/{accountId}/charges` | `SavingsAccountChargesApiResource.addSavingsAccountCharge(...)` |
+| `PaySavingsAccountChargeCommandStrategy` | POST | `v1/savingsaccounts/{accountId}/charges/{chargeId}?command=...` | `SavingsAccountChargesApiResource.payOrWaiveSavingsAccountCharge(...)` |
+
+### Datatables
+
+Datatables are user-defined ancillary tables. The Batch API exposes both
+one-to-one and one-to-many variants:
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `CreateDatatableEntryCommandStrategy` | POST | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.createDatatableEntry(...)` |
+| `UpdateDatatableEntryOneToOneCommandStrategy` | PUT | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.updateDatatableEntryOneToOne(...)` |
+| `UpdateDatatableEntryOneToManyCommandStrategy` | PUT | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DatatablesApiResource.updateDatatableEntryOneToMany(...)` |
+| `DeleteDatatableEntryOneToOneCommandStrategy` | DELETE | `v1/datatables/{datatable}/{appTableId}` | `DatatablesApiResource.deleteDatatableEntries(...)` |
+| `DeleteDatatableEntryOneToManyCommandStrategy` | DELETE | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DatatablesApiResource.deleteDatatableEntries(...)` |
+| `GetDatatableEntryByAppTableIdCommandStrategy` | GET | `v1/datatables/{datatable}/{appTableId}` | `DataTablesApiResource.getDatatable(...)` |
+| `GetDatatableEntryByAppTableIdAndDataTableIdCommandStrategy` | GET | `v1/datatables/{datatable}/{appTableId}/{datatableId}` | `DataTablesApiResource.getDatatableManyEntry(...)` |
+| `GetDatatableEntryByQueryCommandStrategy` | GET | `v1/datatables/{datatable}/query?<params>` | `DataTablesApiResource.queryValues(...)` |
+
+```java fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyProvider.java
+commandStrategies.put(CommandContext.resource("v1\\/datatables\\/" + ALPHANUMBERIC_WITH_UNDERSCORE_REGEX + "\\/" + NUMBER_REGEX)
+        .method(POST).build(), "createDatatableEntryCommandStrategy");
+commandStrategies.put(CommandContext
+        .resource("v1\\/datatables\\/" + ALPHANUMBERIC_WITH_UNDERSCORE_REGEX + "\\/" + NUMBER_REGEX + "\\/" + NUMBER_REGEX)
+        .method(PUT).build(), "updateDatatableEntryOneToManyCommandStrategy");
+commandStrategies.put(CommandContext.resource("v1\\/datatables\\/" + ALPHANUMBERIC_WITH_UNDERSCORE_REGEX + "\\/" + NUMBER_REGEX)
+        .method(PUT).build(), "updateDatatableEntryOneToOneCommandStrategy");
+```
+
+<Note>
+  The `ALPHANUMBERIC_WITH_UNDERSCORE_REGEX` allows empty datatable names —
+  intentional, since some upstream clients send the placeholder as part of a
+  templated URL that resolves to a real name through `$.field` substitution.
+</Note>
+
+### Account transfers
+
+| Strategy | Method | `relativeUrl` pattern | Upstream resource |
+| --- | --- | --- | --- |
+| `CreateAccountTransferCommandStrategy` | POST | `v1/accounttransfers` | `PortfolioCommandSourceWritePlatformService.logCommandSource(...)` |
+
+This handler is unusual: instead of forwarding to an `*ApiResource`, it
+directly builds a `CommandWrapper` and pushes it through the command bus.
+The upstream `AccountTransfersApiResource` does the same — the strategy just
+inlines the construction so it can share the
+`DefaultToApiJsonSerializer<CommandProcessingResult>` for the response body.
+
+## Two handler patterns
+
+Most strategies follow one of two implementation patterns.
+
+<Tabs>
+  <Tab title="Direct forward (simple)">
+    The body and any path parameters are forwarded directly to the upstream
+    resource. `CreateClientCommandStrategy` is the archetype: the
+    `relativeUrl` has no path parameters because `POST /v1/clients` does not
+    need one, so the strategy can call `clientsApiResource.create(...)` with
+    only the body.
+
+    ```java fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/CreateClientCommandStrategy.java
+    responseBody = clientsApiResource.create(request.getBody());
+    response.setStatusCode(HttpStatus.SC_OK);
+    response.setBody(responseBody);
+    ```
+  </Tab>
+  <Tab title="Path-parameter splitter">
+    When the URL embeds IDs (and possibly a `?command=` parameter), the
+    strategy splits `relativeUrl` on `/` and `?` to extract them.
+    `SavingsAccountTransactionCommandStrategy` is the archetype:
+
+    ```java fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/SavingsAccountTransactionCommandStrategy.java
+    public BatchResponse execute(BatchRequest batchRequest, UriInfo uriInfo) {
+        String relativeUrl = relativeUrlWithoutVersion(batchRequest);
+        final List<String> pathParameters = Splitter.on('/').splitToList(relativeUrl);
+        String command = null;
+        // ...
+    }
+    ```
+
+    `relativeUrlWithoutVersion` lives in
+    [`CommandStrategyUtils`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/command/CommandStrategyUtils.java)
+    and strips the optional `v1/` prefix so the same parser works for both
+    versioned and unversioned URLs.
+  </Tab>
+</Tabs>
+
+## What `UriInfo` is for
+
+GET-style strategies need to forward query parameters to the upstream
+resource. They wrap the inbound `UriInfo` in
+`MutableUriInfo`, then call the same retrieval method an HTTP client would:
+
+```java fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/GetLoanByIdCommandStrategy.java
+public BatchResponse execute(final BatchRequest request, final UriInfo uriInfo) {
+    final MutableUriInfo parameterizedUriInfo = new MutableUriInfo(uriInfo);
+    final BatchResponse response = new BatchResponse();
+    // ... copy query params from relativeUrl into parameterizedUriInfo
+    final String responseBody = loansApiResource.retrieveLoan(loanId, /* ... */, parameterizedUriInfo);
+    response.setStatusCode(HttpStatus.SC_OK);
+    response.setBody(responseBody);
+    return response;
+}
+```
+
+That is what lets a batched `GET v1/loans/42?associations=all` behave exactly
+like a real HTTP `GET /v1/loans/42?associations=all`.
+
+## Fallback: `UnknownCommandStrategy`
+
+If no regex matches, `CommandStrategyProvider.internalGetCommandStrategy`
+returns a default
+[`UnknownCommandStrategy`](https://github.com/apache/fineract/blob/develop/fineract-core/src/main/java/org/apache/fineract/batch/command/internal/UnknownCommandStrategy.java)
+instance. It produces a response indicating the URL or method is not
+supported by the Batch API — important for early-failure feedback when a
+client mistypes `relativeUrl` or sends a method that no strategy handles.
+
+## Adding a new strategy
+
+The process is mechanical:
+
+<Steps>
+  <Step title="Implement `CommandStrategy`">
+    Create a new `@Component` under
+    `fineract-provider/src/main/java/org/apache/fineract/batch/command/internal/`
+    that injects the upstream `*ApiResource` bean and copies the
+    `requestId`/`headers` onto the response, just like
+    `CreateClientCommandStrategy`.
+  </Step>
+  <Step title="Register the route">
+    Add a new `commandStrategies.put(...)` line in
+    `CommandStrategyProvider.init()` with the URL regex, HTTP method and bean
+    name (lower-camel-case of the class).
+  </Step>
+  <Step title="Write integration tests">
+    Add a scenario to
+    `integration-tests/src/test/java/org/apache/fineract/integrationtests/BatchRequestsIntegrationTest.java`
+    that hits the new sub-request both standalone and chained through
+    `reference`.
+  </Step>
+  <Step title="Document it">
+    Add a row to the appropriate table on this page so the new operation is
+    discoverable from the catalogue.
+  </Step>
+</Steps>
+
+## Strategy index by upstream resource
+
+If you are working in a particular domain and want to know which Batch
+strategies touch it, this is the reverse mapping:
+
+| Upstream `*ApiResource` | Strategy classes |
+| --- | --- |
+| `ClientsApiResource` | `CreateClientCommandStrategy`, `UpdateClientCommandStrategy`, `ActivateClientCommandStrategy` |
+| `LoansApiResource` | `ApplyLoanCommandStrategy`, `GetLoanByIdCommandStrategy`, `GetLoanByExternalIdCommandStrategy`, `ApproveLoanCommandStrategy`, `DisburseLoanCommandStrategy`, `DisburseToSavingsCommandStrategy`, `LoanStateTransistionsByExternalIdCommandStrategy`, `ModifyLoanApplicationCommandStrategy`, `ModifyLoanApplicationByExternalIdCommandStrategy` |
+| `LoanChargesApiResource` | `CreateChargeCommandStrategy`, `CreateChargeByLoanExternalIdCommandStrategy`, `CollectChargesCommandStrategy`, `CollectChargesByLoanExternalIdCommandStrategy`, `GetChargeByIdCommandStrategy`, `GetChargeByChargeExternalIdCommandStrategy`, `AdjustChargeCommandStrategy`, `AdjustChargeByChargeExternalIdCommandStrategy` |
+| `LoanTransactionsApiResource` | `CreateTransactionLoanCommandStrategy`, `CreateTransactionByLoanExternalIdCommandStrategy`, `AdjustLoanTransactionCommandStrategy`, `AdjustLoanTransactionByExternalIdCommandStrategy`, `GetLoanTransactionByIdCommandStrategy`, `GetLoanTransactionByExternalIdCommandStrategy`, `GetReagePreviewByLoanIdCommandStrategy`, `GetReagePreviewByLoanExternalIdCommandStrategy` |
+| `RescheduleLoansApiResource` | `CreateLoanRescheduleRequestCommandStrategy`, `ApproveLoanRescheduleCommandStrategy` |
+| `LoanInterestPauseApiResource` | `GetLoanInterestPausesByLoanIdCommandStrategy`, `CreateLoanInterestPauseByLoanIdCommandStrategy`, `UpdateLoanInterestPauseByLoanIdCommandStrategy`, `GetLoanInterestPausesByExternalIdCommandStrategy`, `CreateLoanInterestPauseByExternalIdCommandStrategy`, `UpdateLoanInterestPauseByExternalIdCommandStrategy` |
+| `SavingsAccountsApiResource` | `ApplySavingsCommandStrategy`, `GetSavingsAccountByIdCommandStrategy` |
+| `SavingsAccountTransactionsApiResource` | `SavingsAccountTransactionCommandStrategy`, `SavingsAccountAdjustTransactionCommandStrategy` |
+| `SavingsAccountChargesApiResource` | `CreateSavingsAccountChargeCommandStrategy`, `PaySavingsAccountChargeCommandStrategy` |
+| `DatatablesApiResource` / `DataTablesApiResource` | `CreateDatatableEntryCommandStrategy`, `UpdateDatatableEntryOneToOneCommandStrategy`, `UpdateDatatableEntryOneToManyCommandStrategy`, `DeleteDatatableEntryOneToOneCommandStrategy`, `DeleteDatatableEntryOneToManyCommandStrategy`, `GetDatatableEntryByAppTableIdCommandStrategy`, `GetDatatableEntryByAppTableIdAndDataTableIdCommandStrategy`, `GetDatatableEntryByQueryCommandStrategy` |
+| `PortfolioCommandSourceWritePlatformService` | `CreateAccountTransferCommandStrategy` |
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Batch API overview" icon="map" href="/batch/overview">
+    Concepts, dispatch sequence, transactional vs non-transactional mode and
+    use cases.
+  </Card>
+  <Card title="BatchApiResource" icon="route" href="/batch/batch-api-resource">
+    The JAX-RS endpoint, request and response shapes, `$.field` resolution
+    and the body-size limit on inline-COB batches.
+  </Card>
+</CardGroup>

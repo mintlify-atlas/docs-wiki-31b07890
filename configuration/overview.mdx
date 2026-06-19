@@ -1,0 +1,301 @@
+---
+title: "Configuration Overview"
+description: "How Apache Fineract is configured across build-time Gradle properties, Spring Boot application.properties, and per-tenant runtime global configuration flags."
+keywords: ["Apache Fineract", "configuration", "application.properties", "global configuration", "FINERACT_", "Spring Boot", "feature flags", "instance mode"]
+---
+
+Apache Fineract has a layered configuration model. The same binary can run as a write-enabled API node, a read-only reporting replica, a Liquibase-only schema upgrader, or a batch worker — all driven by configuration rather than separate builds. This page maps the three layers you need to understand before you change anything: build-time Gradle properties, the Spring Boot `application.properties` baseline (overridable via `FINERACT_*` environment variables), and the per-tenant runtime flags stored in the tenant database's `c_configuration` table.
+
+## The three configuration layers
+
+Fineract intentionally separates concerns by lifecycle. A property belongs in exactly one layer, and the layer determines who can change it, when it takes effect, and what is restarted.
+
+<CardGroup cols={3}>
+  <Card title="Build-time" icon="hammer">
+    Gradle properties consumed by `build.gradle` / `settings.gradle` during compilation. Affect what is packaged into the JAR — they are not readable at runtime.
+  </Card>
+  <Card title="Application properties" icon="gear">
+    Spring Boot `application.properties` (and `application-liquibase-only.properties`) loaded at JVM startup. Override per environment with `FINERACT_*` env vars, JVM `-D` flags, or a mounted file. Require a restart.
+  </Card>
+  <Card title="Runtime global flags" icon="database">
+    Per-tenant rows in the `c_configuration` table managed through `GlobalConfigurationApiResource` (`/v1/configurations`). Take effect immediately, without restart, and can differ per tenant.
+  </Card>
+</CardGroup>
+
+### Layer 1 — Build-time (Gradle)
+
+The Gradle build configures what code, dependencies and resources are baked into the `fineract-provider` JAR. Notable build-time inputs:
+
+- The version coordinates declared in `build.gradle` and the root `settings.gradle`.
+- Java toolchain version (currently Java 17+).
+- Optional modules included or excluded via Gradle profiles (e.g. `-PuseAllJars`).
+- The Liquibase change log packaged from `src/main/resources/db/changelog/db.changelog-master.xml`.
+
+Build-time properties are not part of this configuration reference because they don't show up at runtime. If you need to change one, you re-build and re-deploy the artifact.
+
+### Layer 2 — `application.properties` (Spring Boot)
+
+Source: `fineract-provider/src/main/resources/application.properties`.
+
+This file is the single source of truth for every Spring Boot setting the runtime needs. Every property follows the pattern `<key>=${ENV_VAR_NAME:default-value}`, so each property can be overridden by an environment variable without modifying the file. For example:
+
+```properties
+server.port=${FINERACT_SERVER_PORT:8443}
+fineract.security.basicauth.enabled=${FINERACT_SECURITY_BASICAUTH_ENABLED:true}
+```
+
+The companion file `fineract-provider/src/main/resources/application-liquibase-only.properties` is activated with the Spring profile `liquibase-only`. It sets `spring.main.web-application-type=none` so the JVM exits cleanly once Liquibase has finished — useful for one-shot schema-upgrade jobs in CI/CD pipelines or Kubernetes init containers.
+
+See [Application Properties Reference](/configuration/application-properties) and [Environment Variables](/configuration/environment-variables) for the full inventory.
+
+### Layer 3 — Runtime global configuration (per tenant)
+
+Source: the `c_configuration` table in each tenant database (not the tenants registry database). Each row has:
+
+| Column | Meaning |
+| --- | --- |
+| `name` | The string key, e.g. `maker-checker`, `enable-business-date`. |
+| `enabled` | Boolean — whether the flag is on for this tenant. |
+| `value` | Optional numeric value (e.g. `force-password-reset-days = 90`). |
+| `string_value` | Optional string value. |
+| `date_value` | Optional date. |
+| `description` | Free-text help shown in the admin UI. |
+| `is_trap_door` | If `true`, the flag can only be turned on once and never disabled again. |
+
+Administrators with the `CONFIGURATION` permission read and update these flags through:
+
+```
+GET  /fineract-provider/api/v1/configurations
+GET  /fineract-provider/api/v1/configurations/{configId}
+GET  /fineract-provider/api/v1/configurations/name/{name}
+PUT  /fineract-provider/api/v1/configurations/{configId}
+PUT  /fineract-provider/api/v1/configurations/name/{configName}
+```
+
+These endpoints live in `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/api/GlobalConfigurationApiResource.java`. Updates flow through Fineract's command pipeline, so they are auditable and (when `maker-checker` is on) require a checker to approve.
+
+See [Global Configuration Flags](/configuration/global-configuration-flags) for the complete list.
+
+## Instance modes and feature toggles
+
+On top of the three layers, two further switches change what a running JVM does:
+
+- **Instance mode** — `fineract.mode.read-enabled`, `fineract.mode.write-enabled`, `fineract.mode.batch-worker-enabled`, `fineract.mode.batch-manager-enabled` decide whether the node accepts read traffic, write traffic, executes scheduled jobs, or coordinates partitioned jobs. The values are evaluated per HTTP request by `FineractInstanceModeApiFilter` and per job by the Spring Batch wiring. See [Feature Toggles & Instance Mode](/configuration/feature-toggles-and-instance-mode) and [Runtime Instance Mode](/runtime/instance-mode).
+- **Module flags** — `fineract.module.investor.enabled`, `fineract.module.loan-origination.enabled`, the `fineract.loan.transactionprocessor.*` switches and the `fineract.job.*` flags decide which optional sub-systems are wired into the Spring context at startup.
+
+## How precedence works
+
+When the JVM starts, Spring Boot resolves each property by walking sources in order. The simplified order (highest to lowest priority) is:
+
+1. JVM system properties (`-Dfineract.server-port=9000`).
+2. OS environment variables (`FINERACT_SERVER_PORT=9000`).
+3. An external `application.properties` mounted at the working directory or referenced via `--spring.config.location`.
+4. The packaged `application.properties` inside the JAR.
+5. Hard-coded defaults in `FineractProperties` and other `@ConfigurationProperties` beans.
+
+The `${ENV:default}` syntax inside `application.properties` is what lets a single environment variable name (e.g. `FINERACT_HIKARI_JDBC_URL`) override a property — Spring's placeholder resolution checks the environment first and falls back to the default.
+
+Runtime global flags (layer 3) are read from the tenant database every time they are consulted (with caching where appropriate), so they always win over what the Java code would otherwise default to.
+
+## Choosing the right layer for a setting
+
+| Question | Layer |
+| --- | --- |
+| Does it change per environment (dev/staging/prod) but not per tenant? | `application.properties` (layer 2). |
+| Does it change per tenant inside the same JVM? | `c_configuration` (layer 3). |
+| Does it change what code is packaged or what JVM the build targets? | Gradle (layer 1). |
+| Is it a secret (DB password, S3 key, OAuth client secret)? | Environment variable that backs a layer-2 placeholder. |
+| Does it switch the node's HTTP role (read-only vs read-write)? | `fineract.mode.*` (layer 2 — affects request routing). |
+
+## Externalising properties
+
+Beyond the env-var route, Spring Boot supports several ways to point Fineract at an external properties file. Useful when you want to ship the same JAR but mount an environment-specific config:
+
+```bash
+# Same directory as the JAR
+java -jar fineract-provider.jar
+
+# Or explicitly:
+java -Dspring.config.location=file:/etc/fineract/application.properties \
+     -jar fineract-provider.jar
+
+# Or add an additional file on top of the packaged one:
+java -Dspring.config.additional-location=file:/etc/fineract/overrides.properties \
+     -jar fineract-provider.jar
+```
+
+The external file completely overrides the packaged baseline if you use `spring.config.location`, or layers on top of it if you use `spring.config.additional-location`. In containerised deployments env vars are usually preferred because they integrate cleanly with secret stores, but mounted files are a fine alternative when you have many tightly coupled settings to change at once.
+
+## Multi-tenant configuration
+
+
+
+Apache Fineract is multi-tenant by default. Two database tiers coexist in the same JVM:
+
+- The **tenants registry database** (default name `fineract_tenants`) holds a single row per tenant in the `tenants` and `tenant_server_connections` tables. It is reached via the `spring.datasource.hikari.*` properties.
+- The **per-tenant database** (default name `fineract_default`) holds the actual portfolio data — clients, loans, savings, accounting entries, and the `c_configuration` table. There is one per tenant, sized to that institution's needs.
+
+When a request arrives, the tenant identifier (HTTP header `Fineract-Platform-TenantId`, default `default`) is resolved against the registry, the matching connection details are loaded, and a Hikari pool is obtained from the tenant's pool cache. Layer-3 flags are read from that tenant's `c_configuration` and applied for the rest of the request.
+
+This is why a single property like `maker-checker` can be on for tenant A and off for tenant B at the same time, in the same JVM, served by the same threadpool — the flag is a per-tenant DB row, not a JVM-level variable.
+
+## File map
+
+```
+fineract-provider/
+└── src/main/resources/
+    ├── application.properties                 ← layer 2 baseline
+    └── application-liquibase-only.properties  ← layer 2, schema-upgrade profile
+fineract-provider/src/main/java/org/apache/fineract/
+├── infrastructure/configuration/
+│   ├── api/GlobalConfigurationApiResource.java       ← layer 3 REST API
+│   ├── domain/ConfigurationDomainServiceJpa.java     ← layer 3 read service
+│   └── service/                                      ← write & read services
+├── infrastructure/instancemode/
+│   └── api/InstanceModeApiResource.java              ← test-only mode toggle
+fineract-core/src/main/java/org/apache/fineract/
+├── infrastructure/configuration/api/
+│   └── GlobalConfigurationConstants.java             ← canonical flag names
+└── infrastructure/instancemode/
+    ├── api/FineractInstanceModeConstants.java        ← property keys
+    └── filter/FineractInstanceModeApiFilter.java     ← request gating
+```
+
+## Secrets management
+
+Because every property in `application.properties` can be overridden by an environment variable, the recommended approach to secrets (database passwords, S3 keys, OAuth client secrets, the JWT signing key, etc.) is:
+
+1. **Never check secrets into the JAR.** The defaults in `application.properties` are deliberately low-value (`root` / `mysql` / `openmf`) and only suitable for the demo Docker Compose stack.
+2. **Inject secrets via the container runtime.** In Kubernetes, this means binding a `Secret` to the env via `envFrom` or `valueFrom.secretKeyRef`. In Docker Compose, use the `secrets:` clause and read from `/run/secrets/...`.
+3. **Avoid mounting modified property files** unless you also encrypt them at rest — environment variables are easier to rotate and audit.
+
+The properties most often needing this treatment are:
+
+- `FINERACT_HIKARI_PASSWORD`
+- `FINERACT_DEFAULT_TENANTDB_PWD` / `FINERACT_DEFAULT_TENANTDB_RO_PWD`
+- `FINERACT_DEFAULT_TENANTDB_MASTER_PASSWORD` / `FINERACT_DEFAULT_MASTER_PASSWORD`
+- `FINERACT_SERVER_SSL_KEY_STORE_PASSWORD`
+- `FINERACT_CONTENT_S3_ACCESS_KEY` / `FINERACT_CONTENT_S3_SECRET_KEY`
+- `FINERACT_AWS_CREDENTIALS_ACCESS_KEY` / `FINERACT_AWS_CREDENTIALS_SECRET_KEY`
+- `FINERACT_REMOTE_JOB_MESSAGE_HANDLER_JMS_BROKER_PASSWORD`
+
+## Profiles
+
+In addition to the three layers above, Spring profiles activate auxiliary properties files. Fineract ships two profiles whose names you will encounter:
+
+- **`liquibase-only`** — loads `application-liquibase-only.properties`, which sets `spring.main.web-application-type=none`. The JVM runs the Liquibase migrations and exits. Ideal for Kubernetes `initContainers` or for a one-shot CI job that prepares a database before the application starts.
+- **`test`** — exposes the `InstanceModeApiResource` (`PUT /v1/instance-mode`) so integration tests can flip the mode mid-run. Must not be enabled in production.
+
+Activate a profile by setting `SPRING_PROFILES_ACTIVE=<name>` or `--spring.profiles.active=<name>`. Multiple profiles can be combined with commas.
+
+## Where each layer is stored
+
+| Layer | Storage | Read by | Restart needed? |
+| --- | --- | --- | --- |
+| Build-time | Gradle properties, baked into the JAR. | Java code at runtime via classpath resources / generated constants. | Rebuild + redeploy. |
+| `application.properties` | The JAR's `src/main/resources/application.properties` plus any external file plus env vars. | Spring `Environment`, `@ConfigurationProperties` beans. | Yes. |
+| Global flags | Each tenant DB's `c_configuration` table. | `ConfigurationDomainServiceJpa` (cached). | No. |
+
+## Layered configuration in practice — a deployment story
+
+Suppose you operate Fineract for two financial institutions, A and B, on a Kubernetes cluster. A typical configuration story spans all three layers:
+
+1. **Build** — your CI pipeline builds `fineract-provider.jar` once and pushes the resulting Docker image. There are no per-environment or per-tenant build artefacts.
+2. **Deploy** — the same image runs in `dev`, `staging` and `prod`. The per-environment differences (database URL, S3 bucket, log level, TLS material) are injected via Kubernetes `ConfigMap` and `Secret` resources that map onto `FINERACT_*` env vars (layer 2).
+3. **Onboard tenant A** — the operator inserts a row in the tenants registry pointing at institution A's database, then runs Liquibase to create the schema. Tenant A's `c_configuration` is seeded with sensible defaults.
+4. **Customise tenant A** — institution A wants maker-checker, 90-day password resets, and the business-date feature on. The operator calls `PUT /v1/configurations/name/maker-checker`, etc. — all layer-3 changes, no restart, no impact on institution B.
+5. **Onboard tenant B** — repeats step 3.
+6. **Customise tenant B** — institution B uses single-control workflows and 30-day password rotation. Layer-3 changes against tenant B leave tenant A untouched even though both share the JVM.
+
+This pattern — build once, deploy with env vars, customise per tenant via REST — is the canonical way to operate Fineract at scale.
+
+## A tour through one property
+
+To make the layering concrete, consider what happens at startup for `server.port`:
+
+```properties
+# application.properties
+server.port=${FINERACT_SERVER_PORT:8443}
+```
+
+1. Spring Boot reads the literal expression `${FINERACT_SERVER_PORT:8443}`.
+2. It looks up `FINERACT_SERVER_PORT` in the environment. If the container sets `FINERACT_SERVER_PORT=9443`, that value is bound to `server.port` and the embedded Tomcat listens on `9443`.
+3. If the env var is unset, the default `8443` is used.
+4. A `-Dserver.port=10443` JVM flag overrides both — system properties beat env variables.
+5. None of the above are persisted anywhere; restart the JVM with different inputs to change the value.
+
+Compare this to the runtime layer-3 flag `maker-checker`:
+
+1. `ConfigurationDomainServiceJpa` queries the `c_configuration` table when an action needs the flag.
+2. An administrator calls `PUT /v1/configurations/name/maker-checker` with `{"enabled": true}`.
+3. The next command request sees the new value — no restart needed.
+4. The change is auditable in the `m_portfolio_command_source` table because it went through the command pipeline.
+
+## When does each layer take effect?
+
+| Change | Required action |
+| --- | --- |
+| Edit `application.properties` (or a mounted override) | Restart the JVM. |
+| Change a `FINERACT_*` env var | Restart the JVM. |
+| Add a `-D` JVM flag | Restart the JVM. |
+| Change `spring.profiles.active` | Restart the JVM. |
+| Update a `c_configuration` row through `/v1/configurations` | Immediate; next request sees the new value (modulo cache TTL). |
+| Add a new tenant to the registry | Immediate; the tenant resolver re-reads on the next request. |
+| Add a new column or table via Liquibase | Restart with the migrations enabled. |
+
+The reason for separating layers 2 and 3 is precisely this trade-off: layer-2 settings are infrastructural (database host, TLS keystore, thread pool size) where a restart is acceptable, while layer-3 flags are business decisions (turn maker-checker on; relax the password reuse policy from 5 to 3) that you want to flip without restarting.
+
+## Operational checklist
+
+When you bring up a new environment, the configuration steps you almost always do are:
+
+1. **Datasource** — set `FINERACT_HIKARI_JDBC_URL`, `FINERACT_HIKARI_USERNAME`, `FINERACT_HIKARI_PASSWORD` to point at your tenants registry DB.
+2. **Default tenant** — set `FINERACT_DEFAULT_TENANTDB_*` to describe the per-tenant DB used during bootstrap.
+3. **Server** — set `FINERACT_SERVER_PORT` and bind TLS material (`FINERACT_SERVER_SSL_KEY_STORE*`) or terminate TLS at a reverse proxy and set `FINERACT_SERVER_SSL_ENABLED=false`.
+4. **Security** — choose `FINERACT_SECURITY_BASICAUTH_ENABLED` vs `FINERACT_SECURITY_OAUTH_ENABLED`; turn on `FINERACT_SECURITY_HSTS_ENABLED` for HTTPS deployments.
+5. **Mode** — leave the default (everything `true`) for a single-node setup, or split roles via `FINERACT_MODE_*` for a horizontally-scaled topology.
+6. **Liquibase** — keep `FINERACT_LIQUIBASE_ENABLED=true` for the first deploy. For subsequent deploys you can either keep it on or run a separate Liquibase-only container ahead of the API JVM.
+7. **Observability** — flip on `FINERACT_MANAGEMENT_PROMETHEUS_ENABLED=true` for scraping, and `FINERACT_MANAGEMENT_OLTP_ENABLED=true` if you have an OpenTelemetry collector.
+8. **Per-tenant flags** — once the JVM is up, set `maker-checker`, `enable-business-date`, `force-password-reset-days` and any other layer-3 flags through `/v1/configurations`.
+
+## Reading the live configuration
+
+Beyond the documented APIs, two Spring Boot Actuator endpoints are invaluable when you are debugging a misconfigured environment:
+
+- `GET /actuator/configprops` — lists all `@ConfigurationProperties` beans with their resolved values. Filter for `fineract` to see exactly what Fineract is using.
+- `GET /actuator/env` — shows every property source Spring resolved at startup, in priority order. Useful to confirm that an env var actually reached the JVM.
+
+These endpoints are gated by `management.endpoints.web.exposure.include` — add `configprops,env` if you want to expose them outside `health,info,prometheus`. **Do not** expose them in production without authentication: they reveal database passwords and other secrets.
+
+## Common pitfalls
+
+<Warning>**Default master password.** `fineract.database.defaultMasterPassword=fineract` (and the matching tenant master password) are dev defaults. Change both via `FINERACT_DEFAULT_MASTER_PASSWORD` / `FINERACT_DEFAULT_TENANTDB_MASTER_PASSWORD` before any production deploy — the master password is used to encrypt tenant connection passwords in the registry.</Warning>
+
+<Warning>**TLS keystore.** `classpath:keystore.jks` with password `openmf` is a development keystore. Replace it with a real certificate (via `FINERACT_SERVER_SSL_KEY_STORE` pointing to a file, e.g. `file:/etc/fineract/keystore.p12`) or terminate TLS at a reverse proxy and set `FINERACT_SERVER_SSL_ENABLED=false`.</Warning>
+
+<Warning>**Wide-open CORS.** The shipped defaults allow any origin, any method, any header, and credentials — convenient for local development, dangerous in production. Lock down `FINERACT_SECURITY_CORS_ALLOWED_ORIGIN_PATTERNS` to your front-end's exact origin.</Warning>
+
+<Tip>If a property does not seem to be taking effect, set `--debug` on the JVM and Spring Boot will print `Conditions Evaluation Report` and the resolved property sources at startup — very useful for diagnosing precedence issues.</Tip>
+
+## What to read next
+
+<CardGroup cols={2}>
+  <Card title="Application Properties" icon="file-lines" href="/configuration/application-properties">
+    Group-by-group walkthrough of every key in `application.properties`.
+  </Card>
+  <Card title="Environment Variables" icon="terminal" href="/configuration/environment-variables">
+    The `FINERACT_*` → property mapping used by Docker, Kubernetes and CI.
+  </Card>
+  <Card title="Global Configuration Flags" icon="toggle-on" href="/configuration/global-configuration-flags">
+    The per-tenant flags in `c_configuration` and the REST API that drives them.
+  </Card>
+  <Card title="Resilience4j Retries" icon="rotate" href="/configuration/resilience4j-retries">
+    Retry & circuit-breaker configuration for the command pipeline and jobs.
+  </Card>
+  <Card title="Feature Toggles & Instance Mode" icon="sliders" href="/configuration/feature-toggles-and-instance-mode">
+    `fineract.mode.*` and `fineract.module.*` flags, with deployment patterns.
+  </Card>
+  <Card title="Runtime: Instance Mode" icon="server" href="/runtime/instance-mode">
+    The operational view of read/write/batch instance modes.
+  </Card>
+</CardGroup>

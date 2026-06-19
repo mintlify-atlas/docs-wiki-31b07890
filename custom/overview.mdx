@@ -1,0 +1,319 @@
+---
+title: "Customization Overview"
+description: "How Apache Fineract supports downstream customization through the custom/ directory, the custom_changelog Liquibase context, and Spring Boot auto-configuration."
+keywords: ["apache fineract", "customization", "custom modules", "spring boot auto-configuration", "liquibase custom_changelog", "fineract extension", "downstream fork"]
+---
+
+Apache Fineract is built to be forked, extended, and white-labeled. The codebase reserves a dedicated `custom/` directory at the repository root that downstream adopters use to layer company-specific business logic, jobs, events, and data on top of the upstream platform — without forking the upstream subprojects. This page describes the three pillars that make that possible: the `custom/` directory layout (recognized by `settings.gradle` and the custom Docker image), the dedicated `custom_changelog` Liquibase context for schema additions, and Spring Boot's `AutoConfiguration.imports` mechanism that wires everything together at boot.
+
+The combination lets you maintain a clean fork: your own Gradle modules and migrations live under `custom/`, while the upstream `fineract-core`, `fineract-provider`, and product subprojects stay untouched. Pulling in new upstream releases reduces to a normal Git merge — the conflict surface is bounded to the few places where you have intentionally overridden a bean.
+
+## The customization story
+
+Apache Fineract's runtime is a Spring Boot application assembled from many Gradle subprojects (`fineract-core`, `fineract-provider`, `fineract-loan`, `fineract-savings`, `fineract-progressive-loan`, and so on). Each of those subprojects ships its own Spring beans, JPA entities, REST resources, and Liquibase changelog fragments. The customization model is built on the observation that a downstream integrator typically wants to:
+
+1. Add new beans (services, jobs, COB business steps, external event types, transaction processors).
+2. Override a small number of upstream beans with bespoke implementations.
+3. Add new database tables or seed data that should live alongside (but be controllable independently from) the upstream schema.
+4. Ship a single Docker image that bundles upstream Fineract plus the custom modules.
+
+Fineract supports all four cases without requiring you to patch upstream code. The mechanisms are:
+
+| Concern | Upstream hook |
+|---------|---------------|
+| Module discovery (compile time) | `settings.gradle` walks `custom/<company>/<category>/<module>` |
+| Module discovery (runtime) | Spring Boot reads `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` from every JAR on the classpath |
+| Schema additions | Liquibase `includeAll path="db/custom-changelog"` with context `custom_changelog` |
+| Bean overrides | `@ConditionalOnProperty`, `@ConditionalOnMissingBean`, and explicit `@Bean` redefinitions in your auto-configuration |
+| Distribution | The `:custom:docker` Gradle subproject builds a `fineract-custom` image containing all detected custom modules |
+
+A reference implementation lives in the repository under `custom/acme/`. It is not a runtime dependency; it exists so that the build wiring, packaging, and auto-configuration mechanics can be exercised in CI. Treat it as the canonical example when you build your own modules.
+
+## The `custom/` directory layout
+
+The root `custom/` directory uses a strict three-level convention:
+
+```
+custom/
+├── docker/                       # :custom:docker — Jib build of the fat image
+│   └── build.gradle
+└── <company>/                    # e.g. acme
+    └── <category>/               # e.g. loan, event, note
+        └── <module>/             # e.g. starter, cob, processor, service
+            ├── build.gradle
+            ├── dependencies.gradle
+            └── src/...
+```
+
+The reference modules shipped upstream are:
+
+```
+custom/acme/event/externalevent       # custom LoanBusinessEvent subclass + provider config
+custom/acme/event/starter             # auto-configuration that scans the externalevent package
+custom/acme/loan/cob                  # custom LoanCOBBusinessStep
+custom/acme/loan/job                  # custom Spring Batch Job + JobNameProvider bean
+custom/acme/loan/processor            # custom LoanRepaymentScheduleTransactionProcessor
+custom/acme/loan/starter              # auto-configuration that ties cob/job/processor together
+custom/acme/note/service              # custom NoteRead/WritePlatformService overrides
+custom/acme/note/starter              # auto-configuration scanning the note package
+```
+
+Everything that is not at `custom/docker` and not named `build` is treated as a module by both `settings.gradle` and the custom Docker build script.
+
+### How Gradle discovers modules
+
+The pattern is implemented in `settings.gradle` at the repository root:
+
+```groovy
+// settings.gradle
+include ':custom:docker'
+// NOTE: dynamically load custom modules with pattern "custom -> company -> category -> module"
+file("${rootDir}/custom").eachDir { companyDir ->
+    if ('build' != companyDir.name && 'docker' != companyDir.name) {
+        file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+            if ('build' != categoryDir.name) {
+                file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                    if ('build' != moduleDir.name) {
+                        include ":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Three nested `eachDir` loops register every leaf directory as a Gradle subproject of the form `:custom:<company>:<category>:<module>`. There is no manifest to maintain — dropping a new directory in the right place is enough. The `build` directory exclusion exists so that the Gradle output of a previous build is not mistakenly treated as a module.
+
+Each module owns its own `build.gradle` and a separate `dependencies.gradle` file. A minimal module's `build.gradle` looks like this (from `custom/acme/note/starter/build.gradle`):
+
+```groovy
+description = 'ACME Fineract Note Starter'
+group = 'com.acme.fineract'
+
+base {
+    archivesName = 'acme-fineract-note-starter'
+}
+
+apply from: 'dependencies.gradle'
+```
+
+And the matching `dependencies.gradle`:
+
+```groovy
+dependencies {
+    implementation(project(':custom:acme:note:service'))
+    implementation('org.springframework.boot:spring-boot-starter')
+    testImplementation(project(':fineract-core'))
+    testImplementation(project(':fineract-loan'))
+    testImplementation(project(':fineract-savings'))
+    testImplementation(project(':fineract-provider'))
+    testImplementation('org.springframework.boot:spring-boot-starter-jdbc')
+    testImplementation('org.springframework.boot:spring-boot-starter-data-jpa')
+}
+```
+
+Splitting `dependencies.gradle` out makes it easier to keep the build file declarative and to dependency-scan modules in CI.
+
+## Spring Boot auto-configuration
+
+The compile-time wiring is only half of the story. At runtime, Spring Boot has to find and apply your `@AutoConfiguration` classes. Apache Fineract relies on the Spring Boot 2.7+ mechanism: each starter module places a single file at
+
+```
+src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+```
+
+The file lists fully-qualified auto-configuration class names, one per line. The three sample starter modules ship these:
+
+```
+# custom/acme/event/starter/.../AutoConfiguration.imports
+com.acme.fineract.event.starter.AcmeEventAutoConfiguration
+
+# custom/acme/loan/starter/.../AutoConfiguration.imports
+com.acme.fineract.loan.starter.AcmeLoanAutoConfiguration
+
+# custom/acme/note/starter/.../AutoConfiguration.imports
+com.acme.fineract.portfolio.note.starter.AcmeNoteAutoConfiguration
+```
+
+<Note>
+Apache Fineract targets Spring Boot 3.x. The legacy `META-INF/spring.factories` entry (`org.springframework.boot.autoconfigure.EnableAutoConfiguration=...`) is no longer the preferred way to register auto-configurations — use the `AutoConfiguration.imports` file instead. If you are porting a Spring Boot 2.x starter, both mechanisms work, but the imports file is canonical.
+</Note>
+
+### Anatomy of an auto-configuration
+
+`custom/acme/note/starter/src/main/java/com/acme/fineract/portfolio/note/starter/AcmeNoteAutoConfiguration.java` shows the minimum viable pattern:
+
+```java
+package com.acme.fineract.portfolio.note.starter;
+
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.ComponentScan;
+
+@AutoConfiguration
+@ComponentScan("com.acme.fineract.portfolio.note")
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteAutoConfiguration {}
+```
+
+There are three important elements:
+
+- `@AutoConfiguration` marks the class for Spring Boot's auto-configuration pipeline. It implies `@Configuration(proxyBeanMethods = false)` and gives you fine-grained ordering hooks (`before`, `after`).
+- `@ComponentScan` widens the scan to your company's package. Without it, your `@Service` and `@Component` beans living under `com.acme.fineract.*` would never be picked up because the upstream entry point scans `org.apache.fineract.*` only.
+- `@ConditionalOnProperty` makes the entire module opt-in. Setting `acme.note.enabled=true` activates it; leaving the property unset keeps the upstream beans live.
+
+A slightly richer example (`AcmeLoanAutoConfiguration`) also redefines an upstream factory bean:
+
+```java
+@AutoConfiguration
+@ComponentScan(basePackages = {
+        "com.acme.fineract.loan.cob",
+        "com.acme.fineract.loan.processor",
+        "com.acme.fineract.loan.job"
+})
+@ConditionalOnProperty("acme.loan.enabled")
+public class AcmeLoanAutoConfiguration {
+
+    @Bean
+    public LoanRepaymentScheduleTransactionProcessorFactory loanRepaymentScheduleTransactionProcessorFactory(
+            AcmeLoanRepaymentScheduleTransactionProcessor defaultLoanRepaymentScheduleTransactionProcessor,
+            List<LoanRepaymentScheduleTransactionProcessor> processors) {
+        return new LoanRepaymentScheduleTransactionProcessorFactory(
+                defaultLoanRepaymentScheduleTransactionProcessor, processors);
+    }
+}
+```
+
+That single `@Bean` method replaces upstream's default factory so that the ACME-flavored transaction processor is treated as the default. The page on [Custom module loading](/custom/custom-module-loading) goes deeper into override patterns and the rules around bean name collisions.
+
+## The `custom_changelog` Liquibase context
+
+Liquibase migrations in Apache Fineract are split across multiple [contexts](https://docs.liquibase.com/concepts/changelogs/attributes/contexts.html) so that the application can decide which subset to apply per environment. The relevant contexts are defined as constants in `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/service/migration/TenantDatabaseUpgradeService.java`:
+
+```java
+public static final String TENANT_STORE_DB_CONTEXT = "tenant_store_db";
+public static final String INITIAL_SWITCH_CONTEXT = "initial_switch";
+public static final String TENANT_DB_CONTEXT = "tenant_db";
+public static final String CUSTOM_CHANGELOG_CONTEXT = "custom_changelog";
+```
+
+The master changelog `fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml` references the custom-changelog directory with all three context conditions tied together:
+
+```xml
+<includeAll path="db/custom-changelog"
+            errorIfMissingOrEmpty="false"
+            context="tenant_db AND !initial_switch AND custom_changelog"/>
+```
+
+Three things happen here:
+
+1. `errorIfMissingOrEmpty="false"` means an upstream-only build with no custom modules on the classpath does not fail when the `db/custom-changelog` resource path is empty.
+2. The compound context `tenant_db AND !initial_switch AND custom_changelog` ensures custom changesets are applied only against tenant databases, only after the initial migration window, and only when the `custom_changelog` context is activated.
+3. Because `includeAll` searches the classpath, every custom module that places its own files under `src/main/resources/db/custom-changelog/` is automatically merged into the tenant migration plan.
+
+### Activation in `TenantDatabaseUpgradeService`
+
+`TenantDatabaseUpgradeService.upgradeIndividualTenant(...)` decides at startup which contexts to pass to Liquibase:
+
+```java
+// 'initial_switch' and 'custom_changelog' contexts should be controlled by the application
+// configuration settings, and we should not use them to control the script order
+if (databaseStateVerifier.isFirstLiquibaseMigration(tenantDataSource)) {
+    ExtendedSpringLiquibase liquibase = liquibaseFactory.create(
+            tenantDataSource,
+            TENANT_DB_CONTEXT,
+            CUSTOM_CHANGELOG_CONTEXT,
+            INITIAL_SWITCH_CONTEXT,
+            tenant.getTenantIdentifier());
+    applyInitialLiquibase(tenantDataSource, liquibase, tenant.getTenantIdentifier(),
+            (ds) -> !databaseStateVerifier.isTenantOnLatestUpgradableVersion(ds));
+}
+SpringLiquibase tenantLiquibase = liquibaseFactory.create(
+        tenantDataSource,
+        TENANT_DB_CONTEXT,
+        CUSTOM_CHANGELOG_CONTEXT,
+        tenant.getTenantIdentifier());
+tenantLiquibase.afterPropertiesSet();
+```
+
+The custom context is always passed alongside `tenant_db` for non-Liquibase-disabled tenants. Effectively, every fresh boot of a Fineract instance built with custom modules runs the custom changesets right after the upstream tenant migrations.
+
+### Layout of a custom changelog
+
+Each module owns a slice of the custom changelog. The reference modules place files at:
+
+```
+custom/acme/event/externalevent/src/main/resources/db/custom-changelog/0001_acme_external_event_configuration.xml
+custom/acme/loan/cob/src/main/resources/db/custom-changelog/0001_acme_loan_cob.xml
+custom/acme/loan/job/src/main/resources/db/custom-changelog/0001_acme_loan_job.xml
+custom/acme/note/starter/src/main/resources/db/custom-changelog/0001_acme_note_initial.xml
+```
+
+A minimal example registers a new external event type:
+
+```xml
+<!-- custom/acme/event/externalevent/.../0001_acme_external_event_configuration.xml -->
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.1.xsd">
+    <changeSet author="acme" id="1">
+        <insert tableName="m_external_event_configuration">
+            <column name="type" value="AcmeLoanExternalEvent"/>
+            <column name="enabled" valueBoolean="false"/>
+        </insert>
+    </changeSet>
+</databaseChangeLog>
+```
+
+Another example creates a new dummy table:
+
+```xml
+<!-- custom/acme/note/starter/.../0001_acme_note_initial.xml -->
+<databaseChangeLog ...>
+    <changeSet author="acme" id="1">
+        <createTable tableName="acme_note_dummy">
+            <column autoIncrement="true" name="id" type="BIGINT">
+                <constraints nullable="false" primaryKey="true"/>
+            </column>
+            <column name="name" type="VARCHAR(100)">
+                <constraints unique="true"/>
+            </column>
+            <column name="description" type="VARCHAR(500)"/>
+        </createTable>
+    </changeSet>
+</databaseChangeLog>
+```
+
+<Tip>
+Use a vendor-scoped filename prefix (`0001_acme_*`, `0002_acme_*`, …) instead of competing with upstream numbering. Multiple custom modules contribute to the same `db/custom-changelog/` resource path on the classpath, so unique prefixes prevent accidental ID collisions inside Liquibase's `DATABASECHANGELOG` table.
+</Tip>
+
+## Putting the three pillars together
+
+The simplest end-to-end customization is one new module that:
+
+1. Lives at `custom/<company>/<category>/<module>/`.
+2. Contains a `@AutoConfiguration` class plus `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` pointing to it.
+3. Contains zero or more Liquibase XML files under `src/main/resources/db/custom-changelog/`.
+4. Is depended on transitively from `:custom:docker`'s `build.gradle`, which itself dynamically picks up every leaf module under `custom/`.
+
+The next two pages drill in:
+
+- [Custom module loading](/custom/custom-module-loading) — how to add a new Gradle module, registering it with Spring auto-configuration, bean naming conflicts, and override patterns.
+- [Custom Docker image](/custom/custom-docker-image) — how `docker-compose-custom.yml`, the `:custom:docker` Jib build, and the `fineract-custom:latest` image bundle everything for production deployments.
+
+## Reference: file map
+
+| Concern | Path |
+|---------|------|
+| Module discovery | `settings.gradle` (root) |
+| Custom Docker module | `custom/docker/build.gradle` |
+| Docker Compose entry point | `docker-compose-custom.yml` |
+| Compose service definition | `config/docker/compose/fineract-custom.yml` |
+| Liquibase context constants | `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/service/migration/TenantDatabaseUpgradeService.java` |
+| Master changelog | `fineract-provider/src/main/resources/db/changelog/db.changelog-master.xml` |
+| Reference modules | `custom/acme/...` |
+| Auto-configuration imports | `custom/acme/<...>/starter/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` |

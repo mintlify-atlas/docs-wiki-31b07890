@@ -1,0 +1,307 @@
+---
+title: "Job Catalog: Every JobName"
+sidebarTitle: "Job Catalog"
+description: "The complete catalog of Apache Fineract background jobs — every constant in the JobName enum, its display name as stored in the job table, what it does, which Spring Batch / tasklet code path implements it, and whether it is a partitioned (manager/worker) job or an in-process tasklet."
+---
+
+This page is the authoritative list of every background job that Apache Fineract ships. Each row corresponds to one constant in:
+
+```text fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java
+package org.apache.fineract.infrastructure.jobs.service;
+
+public enum JobName {
+
+    UPDATE_LOAN_ARREARS_AGEING("Update Loan Arrears Ageing"), //
+    APPLY_ANNUAL_FEE_FOR_SAVINGS("Apply Annual Fee For Savings"), //
+    ...
+    WORKING_CAPITAL_LOAN_COB_JOB("Working Capital Loan COB"), //
+    ;
+
+    private final String name;
+    JobName(final String name) { this.name = name; }
+    @Override public String toString() { return this.name; }
+}
+```
+
+The **enum-style name** (left of the parens) is the Spring Batch `Job` bean name registered with the `JobLocator`. The **display name** (the string in the constructor) is what gets stored in `job.name` and shown in the UI. The bridge:
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/config/JobNameProviderConfig.java
+@Configuration
+public class JobNameProviderConfig {
+
+    @Bean
+    public JobNameProvider fineractJobNameProvider() {
+        List<JobNameData> jobNames = Arrays.stream(JobName.values())
+            .map(jn -> new JobNameData(jn.name(), jn.toString())).toList();
+        return new SimpleJobNameProvider(jobNames);
+    }
+}
+```
+
+A job that does not have a Spring Batch `@Bean Job` matching its enum-style name will not run — `JobRegisterServiceImpl.createJobDetail` throws `JobIsNotFoundOrNotEnabledException` and `JobSchedulerServiceImpl` logs and continues. That is intentional: it lets modules be packaged out of a deployment without breaking the scheduler.
+
+## Concepts that recur in the table
+
+A few terms are used in the **Effect / Trigger** column below:
+
+- **Tasklet** — a single-step Spring Batch job whose `Step` is a `Tasklet`. Runs in one transaction, in one thread.
+- **Chunk** — a Spring Batch chunk-oriented step (`reader → processor → writer`), still single-instance.
+- **Partitioned** — the job has a `*Partitioner` and a manager step that hands worker steps off to either the same JVM (Spring Events transport) or other JVMs (JMS / Kafka transport). See `jobs/spring-batch-partitioned-jobs`.
+- **Composite** — the job is configured in code as a sequence of multiple `Step` beans (e.g. `LOAN_COB` runs `resolveCustomJobParametersStep → loanCOBStep → stayedLockedStep`).
+
+`JobName.LOAN_COB` is the canonical partitioned job. It is the only entry in the partitioned-job whitelist:
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/data/partitionedjobs/PartitionedJob.java
+public enum PartitionedJob {
+    LOAN_COB(LoanCOBConstant.LOAN_COB_PARTITIONER_STEP);
+
+    @Getter private final String partitionerStepName;
+
+    public static boolean existsByJobName(String jobName) {
+        PartitionedJob partitionedJob = null;
+        for (PartitionedJob job : values()) {
+            if (jobName.equalsIgnoreCase(job.name())) {
+                partitionedJob = job;
+            }
+        }
+        return partitionedJob != null;
+    }
+}
+```
+
+`StuckJobExecutorServiceImpl` consults this enum to decide whether to use the partitioned-job restart path or the simple tasklet restart path (see `jobs/stuck-job-handling`).
+
+`WORKING_CAPITAL_LOAN_COB_JOB` is functionally a partitioned job in the same family but is not currently in the `PartitionedJob` whitelist — its stuck-job recovery uses the tasklet path.
+
+## The catalog
+
+| # | Enum-style name (`JobName.<X>`) | Display name (`job.name`) | What it does | Implementation path | Partitioned? |
+|---|----------------------------------|---------------------------|--------------|---------------------|---------------|
+| 1 | `UPDATE_LOAN_ARREARS_AGEING` | `Update Loan Arrears Ageing` | Recomputes the per-loan arrears aging snapshot (days in arrears, overdue principal/interest/fees buckets) used by reports and delinquency rules. Reads outstanding installments, writes `m_loan_arrears_aging`. | `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/service/*` (loan arrears tasklet) | No (tasklet) |
+| 2 | `APPLY_ANNUAL_FEE_FOR_SAVINGS` | `Apply Annual Fee For Savings` | For every active savings account whose annual-fee anniversary falls on today, posts the configured annual charge. | `fineract-provider/.../portfolio/savings/service/SavingsSchedularService*` | No (tasklet) |
+| 3 | `APPLY_HOLIDAYS_TO_LOANS` | `Apply Holidays To Loans` | Re-derives repayment schedules for loans in offices that have new holidays whose `processed = false`; writes new due dates and marks the holiday as processed. | `fineract-provider/.../portfolio/loanaccount/service/LoanWritePlatformServiceJpaRepositoryImpl#applyHolidaysToLoans` | No (tasklet) |
+| 4 | `POST_INTEREST_FOR_SAVINGS` | `Post Interest For Savings` | Capitalises savings interest at the configured interest-posting frequency; emits journal entries via the accounting bridge. | `fineract-provider/.../portfolio/savings/service/*SavingsSchedularService*` | No (tasklet) |
+| 5 | `TRANSFER_FEE_CHARGE_FOR_LOANS` | `Transfer Fee For Loans From Savings` | Walks loans whose charge payment mode is "from linked savings" and transfers due fees by debiting savings → posting to loan. | `fineract-provider/.../portfolio/loanaccount/service/*` | No (tasklet) |
+| 6 | `ACCOUNTING_RUNNING_BALANCE_UPDATE` | `Update Accounting Running Balances` | Walks `acc_gl_journal_entry` rows where running balance has not been set and updates the GL-account-by-office running balance. | `fineract-provider/.../accounting/journalentry/service/RunningBalanceWritePlatformServiceImpl` | No (tasklet) |
+| 7 | `PAY_DUE_SAVINGS_CHARGES` | `Pay Due Savings Charges` | For savings accounts with a due unpaid charge today (e.g. monthly maintenance fee), settles the charge against the account balance. | `fineract-provider/.../portfolio/savings/service/*` | No (tasklet) |
+| 8 | `APPLY_CHARGE_TO_OVERDUE_LOAN_INSTALLMENT` | `Apply penalty to overdue loans` | Adds the configured overdue-charge / penalty to loans whose installment crossed the grace period. | `fineract-provider/.../portfolio/loanaccount/service/LoanSchedularService*` | No (tasklet) |
+| 9 | `EXECUTE_STANDING_INSTRUCTIONS` | `Execute Standing Instruction` | Walks `m_account_transfer_standing_instructions` with `valid_from <= today <= valid_till` and a due `next_run_date`; performs each transfer. | `fineract-provider/.../portfolio/account/service/StandingInstructionWritePlatformService*` | No (tasklet) |
+| 10 | `ADD_ACCRUAL_ENTRIES` | `Add Accrual Transactions` | Generates loan accrual transactions in **non-periodic** mode (one accrual per scheduled installment). | `fineract-provider/.../portfolio/loanaccount/service/LoanAccrualWritePlatformService*` | No (tasklet) |
+| 11 | `UPDATE_NPA` | `Update Non Performing Assets` | Recomputes the NPA flag on each loan and rolls up to product-level by walking the configured NPA criteria. | `fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/updatenpa/UpdateNpaConfig.java`, `UpdateNpaTasklet.java` | No (single-step tasklet) |
+| 12 | `UPDATE_DEPOSITS_ACCOUNT_MATURITY_DETAILS` | `Update Deposit Accounts Maturity details` | For fixed / recurring deposit accounts whose maturity falls on or before today, updates maturity status and triggers configured on-maturity actions (close / transfer / re-invest). | `fineract-provider/.../portfolio/savings/service/DepositAccountWritePlatformService*` | No (tasklet) |
+| 13 | `TRANSFER_INTEREST_TO_SAVINGS` | `Transfer Interest To Savings` | For recurring-deposit and fixed-deposit accounts configured to pay interest into a linked savings account, performs that transfer. | `fineract-provider/.../portfolio/savings/service/*` | No (tasklet) |
+| 14 | `ADD_PERIODIC_ACCRUAL_ENTRIES` | `Add Periodic Accrual Transactions` | Generates accruals in **periodic** mode (typically daily) for loans configured with periodic accrual. | `fineract-provider/.../portfolio/loanaccount/service/LoanAccrualPlatformService#addPeriodicAccruals` | No (tasklet) |
+| 15 | `RECALCULATE_INTEREST_FOR_LOAN` | `Recalculate Interest For Loans` | For loans with `is_interest_recalculation_enabled = true`, re-derives the schedule based on actual repayments to date. | `fineract-provider/.../portfolio/loanaccount/service/*` | No (tasklet) |
+| 16 | `GENERATE_RD_SCEHDULE` | `Generate Mandatory Savings Schedule` | Pre-generates the next horizon of expected mandatory-deposit installments for active recurring-deposit accounts. Misspelling preserved from upstream. | `fineract-provider/.../portfolio/savings/service/DepositAccountWritePlatformService*` | No (tasklet) |
+| 17 | `GENERATE_LOANLOSS_PROVISIONING` | `Generate Loan Loss Provisioning` | Walks the loan-loss-provisioning category table and produces provisioning entries based on outstanding principal and the configured percentages. | `fineract-provider/.../accounting/provisioning/service/ProvisioningEntriesWritePlatformService*` | No (tasklet) |
+| 18 | `POST_DIVIDENTS_FOR_SHARES` | `Post Dividends For Shares` | Walks dividend periods whose status is `INITIATED` and posts the per-shareholder dividend transactions. Misspelling preserved from upstream. | `fineract-provider/.../portfolio/shareproducts/service/ShareAccountDividendWritePlatformService*` | No (tasklet) |
+| 19 | `UPDATE_SAVINGS_DORMANT_ACCOUNTS` | `Update Savings Dormant Accounts` | Walks savings accounts whose `last_active_transaction_date` is older than the product-configured dormancy thresholds and updates `sub_status` to `inactive` / `dormant` / `escheat`. | `fineract-provider/.../portfolio/savings/service/SavingsSchedularService*` | No (tasklet) |
+| 20 | `ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_LOANS_WITH_INCOME_POSTED_AS_TRANSACTIONS` | `Add Accrual Transactions For Loans With Income Posted As Transactions` | Variant of periodic accrual for loans configured with the "income posted as transactions" accounting rule (separate accrual GL movement per transaction). | `fineract-provider/.../portfolio/loanaccount/service/*` | No (tasklet) |
+| 21 | `EXECUTE_REPORT_MAILING_JOBS` | `Execute Report Mailing Jobs` | Walks scheduled report-mailing rows whose `next_run_datetime <= now()`, renders the report, attaches it to an email and queues it. | `fineract-provider/.../infrastructure/reportmailingjob/service/ReportMailingJobWritePlatformService*` | No (tasklet) |
+| 22 | `UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE` | `Update SMS Outbound with Campaign Message` | For active SMS campaigns triggered by schedule, generates outbound message rows in `sms_messages_outbound`. | `fineract-provider/.../infrastructure/campaigns/sms/service/SmsCampaignWritePlatformService*` | No (tasklet) |
+| 23 | `SEND_MESSAGES_TO_SMS_GATEWAY` | `Send Messages to SMS Gateway` | Pushes pending SMS outbound messages to the configured SMS gateway and stores the gateway-returned message id. | `fineract-provider/.../infrastructure/sms/service/SmsMessageScheduledJobService*` | No (tasklet) |
+| 24 | `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` | `Get Delivery Reports from SMS Gateway` | Pulls delivery reports from the SMS gateway for messages still in `WAITING_FOR_REPORT` state and updates their status. | `fineract-provider/.../infrastructure/sms/service/SmsMessageScheduledJobService*` | No (tasklet) |
+| 25 | `GENERATE_ADHOC_CLIENT_SCHEDULE` | `Generate AdhocClient Schedule` | Generates ad-hoc transactional client snapshot rows used by the savings-and-loan-overview ad-hoc query feature. | `fineract-provider/.../adhocquery/service/AdHocWritePlatformService*` | No (tasklet) |
+| 26 | `UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE` | `Update Email Outbound with campaign message` | The email-campaign equivalent of job #22 — turns active email campaigns into rows in the outbound queue. | `fineract-provider/.../infrastructure/campaigns/email/service/EmailCampaignWritePlatformService*` | No (tasklet) |
+| 27 | `EXECUTE_EMAIL` | `Execute Email` | Sends pending outbound email messages via the configured SMTP / JavaMail sender. | `fineract-provider/.../infrastructure/campaigns/email/service/EmailMessageJobEmailService*` | No (tasklet) |
+| 28 | `UPDATE_TRIAL_BALANCE_DETAILS` | `Update Trial Balance Details` | Refreshes the per-office trial-balance summary tables used by reports. | `fineract-provider/.../accounting/journalentry/service/*` | No (tasklet) |
+| 29 | `EXECUTE_DIRTY_JOBS` | `Execute All Dirty Jobs` | Walks `job` rows where `currently_running = false` AND `is_misfired = true`, and re-fires them. Used to catch up jobs whose previous fire died without writing run history. | `fineract-provider/.../infrastructure/jobs/service/executealldirtyjobs/ExecuteAllDirtyJobsConfig.java`, `ExecuteAllDirtyJobsTasklet.java` | No (single-step tasklet) |
+| 30 | `INCREASE_BUSINESS_DATE_BY_1_DAY` | `Increase Business Date by 1 day` | Advances the tenant's `BUSINESS_DATE` by one day. Cross-references `core/business-date`. | `fineract-provider/.../infrastructure/jobs/service/increasedateby1day/increasebusinessdateby1day/*` | No (single-step tasklet) |
+| 31 | `INCREASE_COB_DATE_BY_1_DAY` | `Increase COB Date by 1 day` | Advances the tenant's `COB_DATE` by one day. The terminal job of a successful Loan COB cycle. Cross-references `cob/overview`. | `fineract-provider/.../infrastructure/jobs/service/increasedateby1day/increasecobdateby1day/*` | No (single-step tasklet) |
+| 32 | `LOAN_COB` | `Loan COB` | The Loan Close-of-Business pipeline — runs every configured `LoanCOBBusinessStep` against every loan whose COB row is behind the business date. The only entry in `PartitionedJob`. | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/LoanCOBManagerConfiguration.java`, `LoanCOBWorkerConfiguration.java`, `LoanCOBPartitioner.java` | **Yes** (partition step `loanCOBPartitionerStep`) |
+| 33 | `LOAN_DELINQUENCY_CLASSIFICATION` | `Loan Delinquency Classification` | Re-evaluates the delinquency bucket of every active loan and emits `LoanDelinquencyBucketChangedBusinessEvent` for accounts whose bucket changed. | `fineract-provider/.../portfolio/delinquency/service/DelinquencyWritePlatformService*` | No (tasklet) |
+| 34 | `SEND_ASYNCHRONOUS_EVENTS` | `Send Asynchronous Events` | Flushes the `external_event` table — sends rows with status `TO_BE_SENT` to the configured external-events sink (JMS / Kafka). Cross-references `core/external-events`. | `fineract-provider/.../infrastructure/event/external/service/ExternalEventService*` | No (tasklet) |
+| 35 | `PURGE_EXTERNAL_EVENTS` | `Purge External Events` | Deletes rows from `external_event` whose `status = SENT` and `created_at` is older than the configured retention threshold. | `fineract-provider/.../infrastructure/event/external/service/ExternalEventService*` (purge tasklet) | No (tasklet) |
+| 36 | `PURGE_PROCESSED_COMMANDS` | `Purge Processed Commands` | Deletes processed command-source rows older than the configured retention threshold to keep `m_portfolio_command_source` small. | `fineract-provider/.../commands/service/CommandSourceService*` (purge tasklet) | No (tasklet) |
+| 37 | `ACCRUAL_ACTIVITY_POSTING` | `Accrual Activity Posting` | Posts the daily accrual-activity rollup transaction on each loan with periodic accrual configured. | `fineract-provider/.../portfolio/loanaccount/service/AccrualActivity*` | No (tasklet) |
+| 38 | `ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_WITH_INCOME_POSTED_AS_TRANSACTIONS` | `Add Accrual Transactions For Savings` | Savings-side equivalent of #20 — periodic accrual for savings products configured to post income as transactions. | `fineract-provider/.../portfolio/savings/service/*` | No (tasklet) |
+| 39 | `JOURNAL_ENTRY_AGGREGATION` | `Journal Entry Aggregation` | Daily aggregation of journal entries into compact `*_aggregated` rows; gated on `fineract.job.journal-entry-aggregation.enabled` and skips the most recent N days as configured by `fineract.job.journal-entry-aggregation.exclude-recent-N-days`. | `fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/aggregationjob/JournalEntryAggregationJobConfiguration.java`, `JournalEntryAggregationJobReader.java`, `JournalEntryAggregationJobWriter.java`, `JournalEntryAggregationJobExecutionDecider.java` | No (chunk-oriented) |
+| 40 | `WORKING_CAPITAL_LOAN_COB_JOB` | `Working Capital Loan COB` | The Working-Capital Loan Close-of-Business pipeline (variant of LOAN_COB tuned for revolving-credit / WC products). Inline counterpart is `INLINE_WORKING_CAPITAL_LOAN_COB`. | `fineract-provider/src/main/java/org/apache/fineract/cob/loan/` (`WorkingCapitalLoanInlineCOBConfig.java` plus the shared LoanCOB infrastructure) | No (composite, but functionally partitioned) |
+
+## Quick lookups
+
+### By instance-mode gate
+
+| Property | Jobs that go silent if `false` |
+|----------|-------------------------------|
+| `fineract.mode.batch-manager-enabled` | All 40 — `JobSchedulerServiceImpl` won't register them. |
+| `fineract.mode.batch-worker-enabled` | `LOAN_COB` worker steps (partition handlers) — manager still schedules but workers can't pick up. |
+| `fineract.job.loan-cob-enabled` | `LOAN_COB`, the inline `INLINE_LOAN_COB` and the LoanCOB API filter (`LoanCOBApiFilter`). |
+| `fineract.job.journal-entry-aggregation.enabled` | `JOURNAL_ENTRY_AGGREGATION` |
+
+### By trigger surface
+
+| Trigger surface | Jobs / endpoints |
+|-----------------|------------------|
+| Cron via Quartz | All 40, when active and scheduled |
+| `POST /v1/jobs/{id}?command=executeJob` | All 40, when batch-manager-enabled |
+| `POST /v1/jobs/short-name/{shortName}?command=executeJob` | All 40 that have a `short_name` populated in the seed data (e.g. `SA_PINT` for `POST_INTEREST_FOR_SAVINGS`) |
+| `POST /v1/jobs/{jobName}/inline` | `LOAN_COB`, `WC_LOAN_COB` only — gated by `InlineJobType` |
+| Startup `ContextRefreshedEvent` catch-up | All 40 with `is_misfired = true` when `executeInstructionForMisfiredJobs = true` |
+| Stuck-job restart at boot | All 40 whose `BATCH_JOB_EXECUTION.STATUS = STARTED` and below the retry threshold; partitioned path applies to `LOAN_COB` only |
+
+### Implementation pattern shorthand
+
+| Pattern | Examples |
+|---------|----------|
+| Single-step tasklet inside `jobs/service/<area>/<area>Config.java` | `UPDATE_NPA` (`updatenpa/UpdateNpaConfig.java` + `UpdateNpaTasklet.java`), `EXECUTE_DIRTY_JOBS` (`executealldirtyjobs/`), `INCREASE_BUSINESS_DATE_BY_1_DAY` (`increasedateby1day/increasebusinessdateby1day/`), `INCREASE_COB_DATE_BY_1_DAY` (`increasedateby1day/increasecobdateby1day/`) |
+| Chunk-oriented reader/processor/writer | `JOURNAL_ENTRY_AGGREGATION` (`aggregationjob/JournalEntryAggregationJobConfiguration.java`) |
+| Partitioned (manager + worker) | `LOAN_COB` (`cob/loan/LoanCOBManagerConfiguration.java` + `LoanCOBWorkerConfiguration.java` + `LoanCOBPartitioner.java`) |
+| Domain-service-driven tasklet in a portfolio module | Most of the loan / savings / accounting jobs (#1-#10, #12-#28, #33-#38) |
+
+## How to find a job's bean
+
+Given an enum-style name like `UPDATE_NPA`, the bean is registered by a `@Bean` method whose `name` attribute matches. For example:
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/updatenpa/UpdateNpaConfig.java
+@Bean(name = JobName.UPDATE_NPA + JOB_NAME_SUFFIX)
+protected Job updateNpaJob() {
+    return new JobBuilder(JobName.UPDATE_NPA.name(), jobRepository)
+        .start(updateNpaStep())
+        .build();
+}
+```
+
+The `JobLocator` (provided by Spring Batch) discovers these by their job name (`JobName.UPDATE_NPA.name()` → `"UPDATE_NPA"`). That is the name `jobLocator.getJob(...)` is called with in `JobRegisterServiceImpl.createJobDetail`.
+
+A handy way to find any job's wiring is:
+
+```bash
+grep -rln "JobName\.<ENUM_NAME>\.name()" fineract-provider/src/main/java
+```
+
+## What is NOT in `JobName`
+
+The `JobName` enum is the catalog of **Spring Batch jobs**. A few things look like jobs but are not:
+
+- The **`COBBusinessStep`** chain — these are sub-units of `LOAN_COB`, not free-standing jobs. See `cob/business-steps`.
+- The **report-mailing definitions** — these are stored in `report_mailing_job` and are *fired* by the `EXECUTE_REPORT_MAILING_JOBS` job (#21), not as separate `JobName` entries.
+- The **standing instructions** — same pattern as above; `EXECUTE_STANDING_INSTRUCTIONS` (#9) drives them.
+- The **scheduler control** itself (`/v1/scheduler` `start` / `stop`) — that's a state flip on `scheduler_detail`, not a job.
+- **Inline COB execution** — that uses `InlineJobType` (an enum with two values: `LOAN_COB` and `WC_LOAN_COB`), which maps **inline** job tokens (`LOAN_COB`, `WC_LOAN_COB`) to **inline executor classes** (`InlineLoanCOBExecutorServiceImpl`, `InlineWorkingCapitalLoanCOBExecutorServiceImpl`). The Spring Batch job those executors invoke under the hood is named `INLINE_LOAN_COB` / `INLINE_WORKING_CAPITAL_LOAN_COB`, not in `JobName`. See `jobs/inline-job-execution`.
+
+## How the catalog is exposed to the SPI
+
+Other Gradle modules can contribute additional jobs without touching `JobName` by registering their own `JobNameProvider` bean:
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/jobname/JobNameProvider.java
+public interface JobNameProvider {
+    Set<JobNameData> provide();
+}
+```
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/jobname/SimpleJobNameProvider.java
+public class SimpleJobNameProvider implements JobNameProvider {
+
+    private final Set<JobNameData> jobNames;
+
+    public SimpleJobNameProvider(Collection<JobNameData> jobNames) {
+        this.jobNames = Set.copyOf(jobNames);
+    }
+
+    @Override
+    public Set<JobNameData> provide() {
+        return jobNames;
+    }
+}
+```
+
+`JobNameService` flattens every registered provider's set and is what `JobRegisterServiceImpl` consults to translate the display name from `job.name` back to the enum-style key.
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/jobname/JobNameService.java
+@Component
+@RequiredArgsConstructor
+public class JobNameService {
+
+    private final Collection<JobNameProvider> providers;
+
+    public JobNameData getJobByHumanReadableName(String jobName) {
+        Optional<JobNameData> optionalJob = getJobNames().stream()
+            .filter(jn -> jobName.equals(jn.getHumanReadableName())).findAny();
+        return optionalJob.orElseThrow(() -> new IllegalArgumentException("Job not found by name: " + jobName));
+    }
+
+    private Set<JobNameData> getJobNames() {
+        return providers.stream().map(JobNameProvider::provide).flatMap(Collection::stream).collect(toSet());
+    }
+}
+```
+
+If you add a job in a downstream module, ship a `JobNameProvider` bean with it and Fineract's scheduler will discover it.
+
+## The `JobName` lifecycle
+
+A new constant in `JobName.java` is **not enough** to make a job runnable. The end-to-end checklist for adding a job:
+
+1. **Add the enum constant** to `fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java`. Pick a stable display name — it is what operators will see and what the `job` table will store.
+
+2. **Register a Spring Batch `@Bean Job`** whose name matches the **enum-style** name (`JobName.MY_NEW_JOB.name()`). The bean must live in a `@Configuration` that is `@ConditionalOnProperty` or `@Conditional` so it can be disabled with a flag if it is not safe to ship to all deployments. Example shape:
+
+   ```java
+   @Configuration
+   public class MyNewJobConfig {
+       @Bean(name = JobName.MY_NEW_JOB.name() + JOB_NAME_SUFFIX)
+       public Job myNewJob(JobRepository jobRepository, ...) {
+           return new JobBuilder(JobName.MY_NEW_JOB.name(), jobRepository)
+                   .start(myStep())
+                   .build();
+       }
+   }
+   ```
+
+3. **Add a row to the `job` table** via a Liquibase changelog so the scheduler can see it on first boot. The row needs at minimum: `name` (display name), `display_name`, `cron_expression`, `is_active`, `task_priority`, `group_name`, `node_id`, `short_name`, `updates_allowed`. See changelogs under `fineract-provider/src/main/resources/db/changelog/tenant/parts/` for prior examples.
+
+4. **(Optional) Add to `PartitionedJob`** if the job uses a manager / worker partitioned step. Required for `StuckJobExecutorServiceImpl` to use the partitioned restart path. See `jobs/spring-batch-partitioned-jobs`.
+
+5. **(Optional) Add tuning properties** to `application.properties` under `fineract.partitioned-job.partitioned-job-properties[i]` if partitioned, or a dedicated `fineract.job.<my-job>.*` namespace if you want runtime knobs.
+
+6. **(Optional) Add command-source permissions** in the `m_permission` seed data if you want users to be able to fire it via `POST /v1/jobs/{id}?command=executeJob`. The default permission is `EXECUTEJOB_SCHEDULER`.
+
+7. **(Optional) Add to `InlineJobType`** only if your job is loan-scoped and you have an `InlineExecutorService` implementation for it. See `jobs/inline-job-execution`.
+
+A job that omits step 2 (no Spring Batch bean) will show up in the `/v1/jobs` list but every fire will throw `JobIsNotFoundOrNotEnabledException` and a warning will be logged at boot:
+
+```text fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobSchedulerServiceImpl.java
+try {
+    jobRegisterService.scheduleJob(jobDetails);
+} catch (JobIsNotFoundOrNotEnabledException e) {
+    log.warn("{}", e.getMessage());
+}
+```
+
+This is intentional: a job that's been disabled in this deployment should not crash startup.
+
+## Reading the run history
+
+For any job in the catalog, the per-fire history is available at:
+
+```text
+GET /v1/jobs/{jobId}/runhistory?offset=0&limit=200
+GET /v1/jobs/short-name/{shortName}/runhistory?offset=0&limit=200
+```
+
+Each row corresponds to one Quartz fire (cron or run-now), with fields:
+
+| Field | From | Meaning |
+|-------|------|---------|
+| `version` | `ScheduledJobRunHistory.version` | Monotonically increasing per job |
+| `jobRunStartTime` | `context.getFireTime()` | When Quartz invoked the job |
+| `jobRunEndTime` | end of `SchedulerJobListener.jobWasExecuted` | When Quartz finished |
+| `status` | `success` / `failed` | `SchedulerServiceConstants.STATUS_*` |
+| `triggerType` | `cron` / `application` | What kicked it off |
+| `jobRunErrorMessage` | extracted by `getCauseFromException` | The root-cause message |
+| `jobRunErrorLog` | full stack trace | The full unwound stack |
+
+Failure rows are written by `SchedulerJobListener` (see `jobs/scheduler-and-quartz`). Inline runs **do not** produce these rows — they go to `BATCH_JOB_EXECUTION` only.
+
+## Cross-references
+
+- `jobs/overview` — for the architectural picture.
+- `jobs/scheduler-and-quartz` — for the Quartz integration and the REST API.
+- `jobs/spring-batch-partitioned-jobs` — for the wiring of partitioned jobs (`LOAN_COB`).
+- `jobs/inline-job-execution` — for the inline path (`InlineJobType`).
+- `jobs/stuck-job-handling` — for what happens to a row in the catalog whose execution didn't terminate cleanly.
+- `cob/overview` — for `LOAN_COB`, `WORKING_CAPITAL_LOAN_COB_JOB`, `INCREASE_COB_DATE_BY_1_DAY`.
+- `core/business-date` — for `INCREASE_BUSINESS_DATE_BY_1_DAY`.
+- `core/external-events` — for `SEND_ASYNCHRONOUS_EVENTS`, `PURGE_EXTERNAL_EVENTS`.
+- `command/overview` — for `PURGE_PROCESSED_COMMANDS`.

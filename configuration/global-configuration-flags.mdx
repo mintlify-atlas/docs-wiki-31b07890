@@ -1,0 +1,315 @@
+---
+title: "Global Configuration Flags"
+description: "The per-tenant runtime configuration flags Apache Fineract reads from the c_configuration table, with the REST API used to read and update them."
+keywords: ["Apache Fineract", "global configuration", "c_configuration", "maker-checker", "business date", "two-factor", "feature flag", "GlobalConfigurationApiResource"]
+---
+
+This page documents the **runtime, per-tenant** configuration flags Apache Fineract reads from each tenant database's `c_configuration` table. Unlike `application.properties` (which is read once at JVM start), these flags can be toggled at any time through the REST API and the change takes effect immediately for that tenant. They are the most direct way for administrators to enable or disable a Fineract feature without touching infrastructure.
+
+**Source files**
+
+- `fineract-core/src/main/java/org/apache/fineract/infrastructure/configuration/api/GlobalConfigurationConstants.java` — the canonical list of flag names.
+- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/api/GlobalConfigurationApiResource.java` — the REST API.
+- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/domain/ConfigurationDomainServiceJpa.java` — the runtime read service.
+
+## The `c_configuration` table
+
+Each tenant database contains a `c_configuration` table populated by Liquibase. Every row is a flag:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | bigint | Surrogate key. |
+| `name` | varchar | Stable string identifier (e.g. `maker-checker`). Used by `GlobalConfigurationConstants`. |
+| `enabled` | tinyint(1) | `true` enables the flag for this tenant. |
+| `value` | bigint | Optional numeric value (e.g. days, retry count). |
+| `string_value` | varchar | Optional string value. |
+| `date_value` | date | Optional date value. |
+| `description` | varchar | Free-text help shown in the admin UI. |
+| `is_trap_door` | tinyint(1) | If `true`, the flag is one-way: once enabled it can never be disabled again. |
+
+Trap-door flags are a deliberate safety measure for irreversible changes — for instance, switching the rounding mode after balances have accrued cannot be undone without a data migration.
+
+## Why per-tenant flags exist
+
+Apache Fineract serves financial institutions that disagree about almost everything: whether to require checker approval before a disbursement, whether to allow back-dated transactions, how often users should rotate passwords, whether to enable the address module or use the older client-fields workflow. Hard-coding any of these choices would force every operator into the same policy, while making them JVM-wide configuration would force every tenant in a multi-tenant Fineract deployment to share that policy.
+
+The `c_configuration` table solves the problem by carrying the flag inside each tenant's own database. A single Fineract JVM can therefore serve "Bank A" with maker-checker on, "MFI B" with maker-checker off, and "Co-op C" with maker-checker on for loans but off for savings — all without restarting or reconfiguring the JVM.
+
+## REST API
+
+The full surface lives in `GlobalConfigurationApiResource` (`@Path("/v1/configurations")`):
+
+```http
+GET  /fineract-provider/api/v1/configurations              # list all flags (optional ?survey=true)
+GET  /fineract-provider/api/v1/configurations/{configId}   # single flag by id
+GET  /fineract-provider/api/v1/configurations/name/{name}  # single flag by name
+PUT  /fineract-provider/api/v1/configurations/{configId}        # update by id
+PUT  /fineract-provider/api/v1/configurations/name/{configName} # update by name
+```
+
+Update payload:
+
+```json
+{
+  "enabled": true,
+  "value": 90
+}
+```
+
+All calls require the `CONFIGURATION` permission. Updates flow through Fineract's command pipeline, so they are auditable and (if `maker-checker` is on) they require a checker to approve before they take effect.
+
+### Reading a flag from Java code
+
+`ConfigurationDomainServiceJpa` is the read service; everywhere in Fineract that needs to consult a flag injects this bean and calls a typed accessor like `isMakerCheckerEnabledForTask(...)`, `retrievePenaltyWaitPeriod()`, or `isBusinessDateEnabled()`.
+
+## Notable flags
+
+The complete list lives in `GlobalConfigurationConstants.java`; the entries below are the ones operators most often need to know about, grouped by topic.
+
+### Workflow & maker-checker
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `maker-checker` | enabled | Turns on the four-eyes workflow for all commands marked as maker-checkable. |
+| `enable-same-maker-checker` | enabled | If true, the same user can act as both maker and checker (useful for tests). |
+
+### Business date & COB
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `enable-business-date` | enabled | Enables the per-tenant business date instead of "wall clock" date. See [Business Date](/cob). |
+| `enable-automatic-cob-date-adjustment` | enabled | Move the business date forward automatically after a successful COB. |
+| `enable-cob-bulk-event` | enabled | Emit a single bulk event for a COB run rather than one per loan. |
+
+### Backdated transactions & rescheduling
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `allow-transactions-on-holiday` | enabled | Permit transactions whose value date falls on a holiday. |
+| `allow-transactions-on-non-workingday` | enabled | Permit transactions on a non-working day. |
+| `reschedule-future-repayments` | enabled | Re-spread future repayments after a reschedule. |
+| `reschedule-repayments-on-holidays` | enabled | Move repayments off a holiday automatically. |
+| `loan-reschedule-is-first-payday-allowed-on-holiday` | enabled | Override for the first installment. |
+| `allow-backdated-transaction-before-interest-posting` | enabled | Allow transactions with a date before the last interest posting. |
+| `allow-backdated-transaction-before-interest-posting-date-for-days` | value | Window (in days) within which backdating is allowed. |
+| `skip-repayment-on-first-day-of-month` | enabled | Skip a repayment that lands on day 1. |
+| `change-emi-if-repaymentdate-same-as-disbursementdate` | enabled | Adjust EMI when the first repayment falls on the disbursement date. |
+
+### Password & login security
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `force-password-reset-days` | value | Days after which users must reset their password. |
+| `force-password-reset-on-first-login` | enabled | Require a reset on the first sign-in. |
+| `password-reuse-check-history-count` | value | Number of previous passwords kept and disallowed. |
+| `max-login-retry-attempts` | value | Lockout threshold. |
+
+### Penalties, charges, interest
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `penalty-wait-period` | value | Days to wait after a missed installment before applying a penalty. |
+| `grace-on-penalty-posting` | value | Grace days before a penalty is posted to GL. |
+| `backdate-penalties-enabled` | enabled | Whether penalties can be backdated when applied. |
+| `interest-charged-from-date-same-as-disbursal-date` | enabled | Sets the starting date for interest accrual. |
+| `is-interest-to-be-recovered-first-when-greater-than-emi` | enabled | Adjusts the allocation when interest exceeds EMI. |
+| `is-principal-compounding-disabled-for-overdue-loans` | enabled | Stops compounding on principal once a loan goes overdue. |
+| `enable-immediate-charge-accrual-post-maturity` | enabled | Accrue charges immediately after a loan's maturity date. |
+| `sub-rates` | enabled | Enables sub-rate (e.g. tax-on-interest) computation. |
+
+### Groups, offices, clients
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `min-clients-in-group` | value | Minimum group size. |
+| `max-clients-in-group` | value | Maximum group size. |
+| `meetings-mandatory-for-jlg-loans` | enabled | Require a meeting schedule for JLG loans. |
+| `office-specific-products-enabled` | enabled | Limit products to specific offices. |
+| `restrict-products-to-user-office` | enabled | Restrict the user's product list to their office. |
+| `enable-address` | enabled | Activates the client address module. |
+| `daily-tpt-limit` | value | Daily third-party transfer limit. |
+
+### Accounting & rounding
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `financial-year-beginning-month` | value | Months 1–12; controls interest posting period boundaries. |
+| `savings-interest-posting-current-period-end` | enabled | Posts savings interest on the last date of the current period instead of the first day of the next. |
+| `rounding-mode` | value | One of `RoundingMode` ordinals (default `6` = `HALF_EVEN`). |
+| `office-opening-balances-contra-account` | value | GL account id for opening-balance contras. |
+| `account-mapping-for-payment-type` | enabled | Lets you map a payment type to a specific GL account. |
+| `account-mapping-for-charge` | enabled | Lets you map a charge to a specific GL account. |
+| `fixed-deposit-transfer-interest-next-day-for-period-end-posting` | enabled | Defers an FD interest transfer to the next day. |
+| `allow-cash-and-non-cash-accrual` | enabled | Permits mixing accrual policies. |
+| `block-transactions-on-closed-overpaid-loans` | enabled | Hardens overpaid-loan handling. |
+| `purge-external-events-older-than-days` | value | Retention for the external events table. |
+| `purge-processed-commands-older-than-days` | value | Retention for processed commands. |
+| `external-event-batch-size` | value | Batch size when flushing external events. |
+
+### Account number generation
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `custom-account-number-length` | value | Length used by the auto-generator. |
+| `random-account-number` | enabled | Use random numbers instead of sequential ones. |
+| `enable-auto-generated-external-id` | enabled | Auto-fill the `externalId` column on create. |
+
+### Delinquency & reporting
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `loan-arrears-delinquency-display-data` | enabled | Adds delinquency analytics to the loan summary. |
+| `enable-instant-delinquency-calculation` | enabled | Recompute delinquency synchronously on relevant events. |
+| `days-before-repayment-is-due` | value | Notification window before a repayment is due. |
+| `days-after-repayment-is-overdue` | value | Grace days before "overdue" is flagged. |
+| `next-payment-due-date` | string_value | Strategy used to compute the next payment due date. |
+| `report-export-s3-folder-name` | string_value | Folder under the S3 bucket for exports. |
+| `enable-post-reversal-txns-for-reverse-transactions` | enabled | Record an offsetting transaction on reversal. |
+
+### External asset transfer / investor
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `asset-externalization-of-non-active-loans` | enabled | Allow externalising loans that are not in the active state. |
+| `outstanding-interest-calculation-strategy-for-external-asset-transfer` | string_value | Strategy name. |
+| `allowed-loan-statuses-for-external-asset-transfer` | string_value | Comma-separated loan statuses. |
+| `allowed-loan-statuses-of-delayed-settlement-for-external-asset-transfer` | string_value | Comma-separated loan statuses. |
+| `asset-externalization-of-non-active-loans` | enabled | (See above.) |
+
+### Integrations
+
+| Flag | Type | Notes |
+| --- | --- | --- |
+| `enable-payment-hub-integration` | enabled | Activates payment hub callbacks. |
+| `enable-originator-creation-during-loan-application` | enabled | Auto-create the originator linked to a loan application. |
+| `amazon-s3` | enabled | Per-tenant S3 enablement (in addition to the global `fineract.content.s3.enabled`). |
+
+### Other commonly referenced flags
+
+| Flag | Notes |
+| --- | --- |
+| `paymenttype-applicable-for-disbursement-charges` | Lets disbursement charges be filtered by payment type. |
+| `constraint-approach-for-datatables` | Use database constraints instead of application checks for datatables. |
+| `organisation-start-date` | Earliest date for backdated activity. |
+| `allow-force-withdrawal-on-savings-account` | Permits the "force withdraw" operation. |
+| `force-withdrawal-on-savings-account-limit` | Numeric limit for the above. |
+| `charge-accrual-date` | Strategy id for when charge accruals are recorded. |
+
+## Flags with values vs flags that are just booleans
+
+Most of the flags above are pure booleans (the `enabled` column drives behaviour and the other columns are ignored). A meaningful subset carry an associated value:
+
+- `force-password-reset-days` — `value` is the rotation period in days.
+- `penalty-wait-period` — `value` is the wait period in days.
+- `min-clients-in-group` / `max-clients-in-group` — `value` is the group-size bound.
+- `daily-tpt-limit` — `value` is the daily third-party transfer limit.
+- `financial-year-beginning-month` — `value` is `1`–`12`.
+- `rounding-mode` — `value` is the ordinal of `java.math.RoundingMode`.
+- `password-reuse-check-history-count` / `max-login-retry-attempts` — `value` is the count.
+
+When you `PUT` an update for a value-carrying flag, supply both `enabled` and `value`:
+
+```json
+{ "enabled": true, "value": 90 }
+```
+
+For string-valued flags (`next-payment-due-date`, the asset-transfer strategy names, `report-export-s3-folder-name`) the column is `string_value` and the request payload uses `stringValue`. Date-valued flags (`organisation-start-date`) use `date_value` / `dateValue`. The API resource maps each variant for you.
+
+## Reading flags in code
+
+`ConfigurationDomainServiceJpa` is the central read-service every Fineract module consults to make a runtime decision. It caches the result of each `c_configuration` lookup using Fineract's cache abstraction (see `fineract.cache.default-template.*` in [Application Properties Reference](/configuration/application-properties#cache)), so the table is not hit on every business operation. The cache is invalidated when the corresponding flag is updated via the REST API.
+
+A typical access pattern looks like:
+
+```java
+@Service
+public class SomeBusinessService {
+    private final ConfigurationDomainService configurationDomainService;
+
+    public void doSomething(Loan loan) {
+        if (this.configurationDomainService.isInterestChargedFromDateSameAsDisbursalDate()) {
+            // use disbursal date
+        } else {
+            // use first-repayment date
+        }
+    }
+}
+```
+
+The constant names in `GlobalConfigurationConstants` are the source of truth; if you are adding a new flag, you add a constant there and a Liquibase change-set that inserts the row into `c_configuration`.
+
+## Survey configurations
+
+`GET /v1/configurations?survey=true` returns the same table but filtered to the rows tagged as "survey" — used by the SPM (social performance management) module. The structure of each row is identical; only the curated subset differs.
+
+## Difference between this and `application.properties`
+
+A common source of confusion is the overlap between the layer-2 (`application.properties`) and layer-3 (`c_configuration`) flags. The rules of thumb:
+
+- If a setting must be different across **environments** (dev/staging/prod) but the same across **tenants** in the same environment — it belongs in `application.properties`. Examples: database URL, S3 endpoint, JVM thread pool size.
+- If a setting must be different across **tenants** that share the same JVM — it belongs in `c_configuration`. Examples: `maker-checker`, `enable-business-date`, `force-password-reset-days`.
+- A handful of features have **both** an `application.properties` switch and a `c_configuration` flag (notably S3 for content and exports). In those cases the property is a "can this JVM use S3 at all" flag and the global configuration row is a "should this tenant use S3 in particular" flag — both must be on.
+
+If you find yourself wanting to toggle the same setting per environment **and** per tenant, you have a design problem; pick one layer and live with it.
+
+## Worked example — turning on maker-checker
+
+```bash
+# Find the flag
+curl -k -u mifos:password \
+  https://localhost:8443/fineract-provider/api/v1/configurations/name/maker-checker
+```
+
+```json
+{
+  "id": 4,
+  "name": "maker-checker",
+  "enabled": false,
+  "trapDoor": false
+}
+```
+
+```bash
+# Enable it
+curl -k -u mifos:password \
+  -X PUT \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": true}' \
+  https://localhost:8443/fineract-provider/api/v1/configurations/name/maker-checker
+```
+
+From the next request onwards, every command that is annotated as maker-checkable will be queued for checker approval instead of executing inline.
+
+## Permissions model
+
+The `CONFIGURATION` permission gates access to the API. In practice you should also wire it to maker-checker so that no single administrator can flip a flag without oversight. The standard pattern is:
+
+1. Grant the `CONFIGURATION_READ` role to all staff who need to inspect flags.
+2. Grant `CONFIGURATION_UPDATE` only to a small "admin" role.
+3. Turn on the `maker-checker` flag itself so that future updates require a checker. Once on, the only way to disable maker-checker is through another maker-checker workflow — the system bootstraps its own oversight.
+
+## Adding a new flag
+
+If you are extending Fineract with a new feature flag, the steps are:
+
+1. Add a constant to `GlobalConfigurationConstants.java` (in `fineract-core`).
+2. Write a Liquibase change-set that inserts a row into `c_configuration` with the name, default `enabled` value, optional `value`/`string_value`/`date_value` and a description.
+3. Inject `ConfigurationDomainService` (or `ConfigurationDomainServiceJpa`) into the service that consults the flag and add an accessor method (`isMyFeatureEnabled()`).
+4. Use the accessor at runtime. The cache will populate on first call and invalidate on update.
+
+Because the flag is per-tenant, the Liquibase change-set automatically runs against every tenant database, so all tenants get the new row.
+
+## Notes & gotchas
+
+<Warning>**Trap-door flags are irreversible.** Before enabling one (for instance changing `rounding-mode`), be sure you understand the data implications — there is no UI to disable it again.</Warning>
+
+<Tip>Flags are **per-tenant**. If you run multi-tenant Fineract, you can have `maker-checker` on for one institution and off for another at the same time, on the same JVM.</Tip>
+
+<Tip>For survey-related configuration use `GET /v1/configurations?survey=true` — the same endpoint returns a different curated subset.</Tip>
+
+## See also
+
+- [Configuration Overview](/configuration/overview) — how `c_configuration` fits with the other layers.
+- [Application Properties Reference](/configuration/application-properties) — the JVM-level baseline.
+- [Maker-Checker / Command Pipeline](/command) — how the workflow gate is enforced.
+- [Business Date & COB](/cob) — how the date flags interact with the close-of-business job.

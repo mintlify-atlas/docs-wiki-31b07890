@@ -1,0 +1,319 @@
+---
+title: "Progressive Loan Module: Architecture and Overview"
+sidebarTitle: "Progressive Loan"
+description: "Why Apache Fineract ships a second loan engine — declining-balance EMI maths plugged into the Loan aggregate via product configuration and a separate Gradle module."
+---
+
+Apache Fineract historically computes loan repayment schedules in `fineract-loan` using a **cumulative**
+model — interest is accrued over the term and added on top of principal so each installment carries an
+even slice of the total. The `fineract-progressive-loan` Gradle module is a parallel, drop-in engine that
+implements the more common **progressive / declining-balance EMI** model: interest is recomputed against the
+*outstanding* principal at every period and the principal share of each installment grows over time. Both
+engines live in the same Spring `ApplicationContext` and the choice between them is made *per loan product*,
+not per deployment.
+
+<Info>
+The progressive engine is also packaged as a stand-alone JAR
+(`fineract-progressive-loan-embeddable-schedule-generator`) so frontends and microservices can compute
+schedules without booting the full Fineract server. See the [embeddable schedule generator
+page](./embeddable-schedule-generator) for details.
+</Info>
+
+## Why a second loan module?
+
+The `fineract-loan` module models the schedule with a *cumulative interest* approach: the total interest is
+pre-computed, the total cost is distributed equally across installments, and per-installment principal /
+interest split is back-derived. That model is what historically powered Mifos-style microfinance products.
+
+The progressive engine instead solves the standard amortising-loan equation period-by-period:
+
+- The **outstanding balance** is tracked between installments.
+- For every interest period, a **rate factor** is computed from the nominal interest, the day count
+  convention, and the actual vs. calculated days in the period.
+- The EMI value is solved so that the present value of all future installments equals the current outstanding
+  balance (`A · ∏(1+rᵢ) / Σ ∏ partial products`).
+- Mid-life events — disbursements, interest-rate changes, capitalized income, buy-down fees, charge-off,
+  re-age, re-amortisation, due-date changes, interest pause — recompute the schedule *forward* from the
+  event date instead of rebuilding it from scratch.
+
+This makes the progressive engine the right fit for SME / consumer-finance products where regulators expect a
+classic amortisation table, and where transactions that change the principal mid-term must propagate to all
+future installments without disturbing the past.
+
+## How it plugs into the existing `Loan` aggregate
+
+The `Loan` entity (in `fineract-loan`) is unchanged. The product carries two enums that decide which engine
+runs and how each transaction is processed:
+
+- `LoanScheduleType` — `CUMULATIVE` vs **`PROGRESSIVE`**.
+- `LoanScheduleProcessingType` — `HORIZONTAL` vs `VERTICAL`
+  (from `fineract-loan/.../loanschedule/domain/LoanScheduleProcessingType.java`):
+
+```java
+// fineract-loan/.../loanaccount/loanschedule/domain/LoanScheduleProcessingType.java
+public enum LoanScheduleProcessingType {
+    HORIZONTAL("Horizontal"),
+    VERTICAL("Vertical");
+    public boolean isHorizontal() { return this == HORIZONTAL; }
+    public boolean isVertical()   { return this == VERTICAL;   }
+}
+```
+
+`Loan` exposes a one-liner that switches the rest of the codebase between the two engines:
+
+```java
+// fineract-loan/.../loanaccount/domain/Loan.java
+public boolean isProgressiveSchedule() {
+    return getLoanProductRelatedDetail().getLoanScheduleType() == PROGRESSIVE;
+}
+```
+
+The progressive engine is then auto-wired by Spring through three conditional configurations under
+`fineract-progressive-loan`:
+
+- `portfolio/configuration/FineractProgressiveLoanBeanConfiguration.java` — registers the
+  `ProgressivePossibleNextRepaymentCalculationServiceImpl` bean (delinquency support).
+- `portfolio/loanaccount/starter/ProgressiveLoanAccountConfiguration.java` — registers the capitalized
+  income, buy-down fee and validator beans.
+- `portfolio/loanaccount/starter/AdvancedPaymentScheduleTransactionProcessorCondition.java` — gates the
+  `AdvancedPaymentScheduleTransactionProcessor` on the `fineract.loan.transaction-processor.advanced-payment-strategy.enabled`
+  property:
+
+```java
+public class AdvancedPaymentScheduleTransactionProcessorCondition extends PropertiesCondition {
+    @Override
+    protected boolean matches(FineractProperties properties) {
+        return properties.getLoan().getTransactionProcessor().getAdvancedPaymentStrategy().isEnabled();
+    }
+}
+```
+
+```mermaid
+flowchart TB
+    subgraph fineract-loan
+        Loan[Loan aggregate]
+        Product[LoanProduct + LoanScheduleType + LoanScheduleProcessingType]
+        ILoanCfg[ILoanConfigurationDetails]
+        SGI[LoanScheduleGenerator interface]
+        TX[LoanRepaymentScheduleTransactionProcessor]
+    end
+
+    subgraph fineract-progressive-loan
+        PSG[ProgressiveLoanScheduleGenerator]
+        EMI[ProgressiveEMICalculator]
+        Model[ProgressiveLoanInterestScheduleModel]
+        APSP[AdvancedPaymentScheduleTransactionProcessor]
+        DCfg[FineractProgressiveLoanBeanConfiguration]
+        DSvc[ProgressivePossibleNextRepaymentCalculationServiceImpl]
+    end
+
+    Product -->|LoanScheduleType=PROGRESSIVE| Loan
+    Loan -->|loan.isProgressiveSchedule| PSG
+    SGI <|.. PSG
+    PSG --> EMI
+    EMI --> Model
+    Loan -->|advanced-payment strategy| APSP
+    TX <|.. APSP
+    DCfg --> DSvc
+    DSvc --> EMI
+    ILoanCfg --> EMI
+
+    subgraph fineract-progressive-loan-embeddable-schedule-generator
+        Embed[EmbeddableProgressiveLoanScheduleGenerator]
+    end
+    PSG -.->|wrapped, no DB| Embed
+```
+
+## Sub-package map
+
+The module lives at `fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/` and is split into
+five top-level packages, intentionally mirroring the layout of `fineract-loan` so that the conditional
+beans drop in cleanly:
+
+### `configuration/`
+
+- `FineractProgressiveLoanBeanConfiguration.java` — registers the
+  `ProgressivePossibleNextRepaymentCalculationServiceImpl` and wires it with the
+  `InterestScheduleModelRepositoryWrapper` and `AdvancedPaymentScheduleTransactionProcessor` collaborators.
+
+### `delinquency/`
+
+- `service/ProgressivePossibleNextRepaymentCalculationServiceImpl.java` — extends the abstract delinquency
+  service from `fineract-loan` with a `canAccept(Loan loan)` that returns `loan.isProgressiveSchedule()`.
+
+### `loanaccount/`
+
+The richest package. Notable sub-areas:
+
+- `domain/ProgressiveLoanModel.java` — the persisted `m_loan_progressive_model` snapshot of the interest
+  schedule model.
+- `domain/transactionprocessor/impl/AdvancedPaymentScheduleTransactionProcessor.java` — the per-transaction
+  allocation engine that backs progressive loans.
+- `loanschedule/domain/ProgressiveLoanScheduleGenerator.java` — implementation of `LoanScheduleGenerator`.
+- `loanschedule/data/LoanSchedulePlan.java` (+ period subtypes) — DTO returned by the embeddable JAR.
+- `service/` — capitalized income, buy-down fee, recalculation, GSON parser for the persisted JSON model.
+- `mapper/LoanConfigurationDetailsMapper.java` — projects `Loan` + `LoanProductRelatedDetail` into the
+  `ILoanConfigurationDetails` view consumed by the EMI calculator.
+- `repository/` — `ProgressiveLoanModelRepository`, `LoanCapitalizedIncomeBalanceRepository`,
+  `LoanBuyDownFeeBalanceRepository`.
+- `starter/ProgressiveLoanAccountConfiguration.java` — Spring `@Configuration` for the writer/reader beans.
+- `api/LoanCapitalizedIncomeApiResource.java`, `api/LoanBuyDownFeeApiResource.java` — `/v1/loans/...` REST
+  surface for the progressive-only loan features.
+- `rescheduleloan/data/ProgressiveLoanRescheduleRequestDataValidator.java` — progressive reschedule
+  validation rules.
+
+### `loanproduct/`
+
+- `calc/EMICalculator.java` — the contract.
+- `calc/ProgressiveEMICalculator.java` — the implementation (the largest file in the module; ~2200 lines).
+- `calc/data/` — the immutable data model around the calculator:
+  `ProgressiveLoanInterestScheduleModel`, `RepaymentPeriod`, `InterestPeriod`, `EmiChangeOperation`,
+  `EmiAdjustment`, `OutstandingDetails`, `PeriodDueDetails`, `RepaymentScheduleInstallmentData`,
+  `EqualAmortizationValues`, `LoanReAgeParameterData`, `OverdueBalanceCorrection`,
+  `ProcessedTransactionData`.
+- `calc/converter/{RepaymentScheduleInstallmentConverter, LoanTransactionConverter, LoanReAgeParameterConverter}.java`
+  — bridges between persistent entities and the immutable data model.
+- `calc/EMICalculatorDataMapper.java` — facade over the converters.
+- `domain/{AdvancedPaymentAllocations, CreditAllocations}{JsonParser, Validator}.java` — the JSON parsing
+  and validation for the advanced-payment-strategy allocation rules used by progressive loans.
+- `mapper/AdvancedPaymentDataMapper.java` — MapStruct mapper for the allocation rule DTOs.
+- `service/LoanProduct{Payment, Credit}AllocationRuleMerger.java` — merges product-level allocation rules
+  with loan-level overrides.
+
+### `util/`
+
+- `InstallmentProcessingHelper.java` — tiny utility that bumps installment numbers by one when a period is
+  inserted in the middle of the schedule (used by re-age and re-amortise flows).
+
+## Relationship to the embeddable module
+
+`fineract-progressive-loan-embeddable-schedule-generator` is a *thin* wrapper around
+`ProgressiveLoanScheduleGenerator` that wires it with no-op JPA collaborators and packages everything (plus
+`fineract-core` and `fineract-loan`) into a single shaded JAR using the Gradle Shadow plugin. Its
+`dependencies.gradle` shows the only two production dependencies:
+
+```groovy
+// fineract-progressive-loan-embeddable-schedule-generator/dependencies.gradle
+dependencies {
+    implementation(project(path: ':fineract-progressive-loan'))
+    implementation(project(path: ':fineract-loan'))
+    testImplementation(project(path: ':fineract-core'))
+    annotationProcessor 'org.projectlombok:lombok'
+    annotationProcessor 'org.mapstruct:mapstruct-processor'
+}
+```
+
+The build excludes everything except those three Fineract modules from the shaded JAR:
+
+```groovy
+// fineract-progressive-loan-embeddable-schedule-generator/build.gradle
+var requiredModuleNames = ['fineract-core', 'fineract-loan', 'fineract-progressive-loan']
+tasks.named('shadowJar', ShadowJar) {
+    dependencies {
+        exclude((dep) -> !requiredModuleNames.any( (reqModName) -> dep.moduleName.contains(reqModName)))
+    }
+    minimize() { exclude("*.xml") }
+}
+```
+
+## Three deployment shapes
+
+The same `ProgressiveLoanScheduleGenerator` class is loaded into the JVM in three different ways depending
+on what the caller needs:
+
+1. **Inside the full server.** Loaded by Spring via `ProgressiveLoanAccountConfiguration` (and the
+   `FineractProgressiveLoanBeanConfiguration` companion). All collaborators — `EMICalculator`,
+   `ScheduledDateGenerator`, `InterestScheduleModelRepositoryWrapperImpl` (which writes to
+   `m_loan_progressive_model`) — are Spring beans, JPA is active, and the generator participates in COB
+   business steps, transaction processing, and the REST API surface.
+2. **Inside the full server, but called from a "advanced-payment" transaction processor.** When the
+   product carries the advanced-payment-strategy enablement flag, the
+   `AdvancedPaymentScheduleTransactionProcessor` becomes the active processor for that loan. It is the
+   bridge that lets every transaction (repayment, charge-off, write-off, re-age, capitalized income,
+   buy-down fee) re-enter the EMI calculator with an `EmiChangeOperation`.
+3. **Outside the server, as a thin shaded JAR.** The `fineract-progressive-loan-embeddable-schedule-generator`
+   module hand-wires the same generator with `NoopInterestScheduleModelRepositoryWrapper` and ships the
+   result as a single fat JAR that runs without Spring, without JPA, and without a database. See the
+   [embeddable generator page](./embeddable-schedule-generator) for the build configuration.
+
+## REST surface specific to progressive loans
+
+Two `/v1/loans/...` resources ship in `fineract-progressive-loan` because the features they expose only
+exist on the progressive side:
+
+- `loanaccount/api/LoanCapitalizedIncomeApiResource.java` — read-only endpoint that returns the amortisation
+  schedule of a **capitalized income** transaction on a loan. Capitalized income is a transaction that adds
+  to the outstanding principal but is recognised as interest revenue over time; only the progressive engine
+  knows how to compute the recognition schedule.
+- `loanaccount/api/LoanBuyDownFeeApiResource.java` — read-only endpoint that returns the amortisation
+  schedule of a **buy-down fee**. A buy-down fee is the inverse — a transaction that reduces the
+  effective interest rate of the loan, amortised across the schedule.
+
+Both resources rely on the corresponding `*ReadPlatformService` implementations and the
+`LoanBuyDownFeeBalance` / `LoanCapitalizedIncomeBalance` entities in `domain/`.
+
+## Where to read next
+
+<CardGroup cols={2}>
+  <Card title="EMI Calculator" icon="calculator" href="./emi-calculator">
+    The maths — `ProgressiveEMICalculator` and the rate-factor / EMI formula.
+  </Card>
+  <Card title="Schedule Generator" icon="list-ol" href="./schedule-generator">
+    `ProgressiveLoanScheduleGenerator` and how it walks the calculator.
+  </Card>
+  <Card title="Installment Representation" icon="table-rows" href="./repayment-schedule-installment">
+    What an installment looks like on the progressive side and how it differs from `fineract-loan`.
+  </Card>
+  <Card title="Delinquency" icon="bell-exclamation" href="./delinquency-service">
+    `ProgressivePossibleNextRepaymentCalculationServiceImpl` and the
+    `LOAN_DELINQUENCY_CLASSIFICATION` job.
+  </Card>
+  <Card title="Embeddable Generator" icon="cube" href="./embeddable-schedule-generator">
+    Use the progressive engine outside of the server as a single JAR.
+  </Card>
+</CardGroup>
+
+## File map
+
+```text
+fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/
+├── configuration/
+│   └── FineractProgressiveLoanBeanConfiguration.java        — registers delinquency next-repayment bean
+├── delinquency/service/
+│   └── ProgressivePossibleNextRepaymentCalculationServiceImpl.java
+├── loanaccount/
+│   ├── api/                                                 — /v1/loans capitalized-income, buy-down-fee
+│   ├── data/                                                — LoanCapitalizedIncomeData, BuyDownFeeAmortizationDetails, ...
+│   ├── domain/
+│   │   ├── ProgressiveLoanModel.java                        — JSON snapshot of the interest model
+│   │   ├── LoanCapitalizedIncomeBalance.java
+│   │   ├── LoanBuyDownFeeBalance.java
+│   │   └── transactionprocessor/impl/
+│   │       ├── AdvancedPaymentScheduleTransactionProcessor.java
+│   │       ├── ChangeOperation.java
+│   │       └── ProgressiveTransactionCtx.java
+│   ├── handler/                                             — AddCapitalizedIncomeCommandHandler, AddBuyDownFeeCommandHandler, ...
+│   ├── loanschedule/
+│   │   ├── domain/ProgressiveLoanScheduleGenerator.java     — implements LoanScheduleGenerator
+│   │   └── data/LoanSchedulePlan*.java                      — public projection shape
+│   ├── mapper/LoanConfigurationDetailsMapper.java
+│   ├── repository/                                          — *BalanceRepository + ProgressiveLoanModelRepository
+│   ├── rescheduleloan/data/ProgressiveLoanRescheduleRequestDataValidator.java
+│   ├── service/
+│   │   ├── InterestScheduleModelRepositoryWrapper{,Impl}.java
+│   │   ├── ProgressiveLoanInterestScheduleModelParserService{,GsonImpl}.java
+│   │   ├── ProgressiveLoanModelProcessingService.java
+│   │   ├── ProgressiveLoanModelRecalculationService.java
+│   │   ├── CapitalizedIncomeBalance{Service,ReadService}Impl.java
+│   │   ├── BuyDownFee{,Read,Write}PlatformService*.java
+│   │   └── ProgressiveLoanTransactionValidator{,Impl}.java
+│   └── starter/
+│       ├── ProgressiveLoanAccountConfiguration.java         — @Configuration for write/read services
+│       └── AdvancedPaymentScheduleTransactionProcessorCondition.java
+├── loanproduct/
+│   ├── calc/                                                 — EMICalculator + ProgressiveEMICalculator + data/
+│   ├── domain/                                               — AdvancedPaymentAllocations* + CreditAllocations*
+│   ├── mapper/AdvancedPaymentDataMapper.java
+│   └── service/LoanProduct{Payment,Credit}AllocationRuleMerger.java
+└── util/InstallmentProcessingHelper.java                    — installment-number bump helper
+```

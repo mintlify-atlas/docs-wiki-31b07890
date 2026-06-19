@@ -1,0 +1,592 @@
+---
+title: "Progressive Schedule Generator: From Terms to Installments"
+sidebarTitle: "Schedule Generator"
+description: "Walkthrough of Apache Fineract's ProgressiveLoanScheduleGenerator — how it composes the EMI calculator into a full loan schedule, with disbursement, charge and prepayment handling."
+---
+
+The Apache Fineract **progressive loan schedule generator** is the bridge between the loan application terms
+the platform stores (principal, term, frequency, day-count, charges, disbursement tranches) and the concrete
+list of `LoanScheduleModelPeriod` instances that get persisted as `LoanRepaymentScheduleInstallment` rows.
+It lives in
+`fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/ProgressiveLoanScheduleGenerator.java`
+and implements the same `LoanScheduleGenerator` interface that the cumulative engine in `fineract-loan`
+implements — so a loan product can switch engines purely through its `LoanScheduleType`.
+
+<Tip>
+The generator's job is **orchestration**, not arithmetic. All EMI maths is delegated to
+`ProgressiveEMICalculator`; the generator owns scheduled-date generation, disbursement-tranche handling,
+charge accumulation and the conversion into the public `LoanScheduleModel` / `LoanSchedulePlan` types.
+</Tip>
+
+## The interface and the implementation
+
+The contract is `LoanScheduleGenerator` (in `fineract-loan`). The progressive implementation lives at
+`fineract-progressive-loan/.../loanschedule/domain/ProgressiveLoanScheduleGenerator.java`:
+
+```java
+// fineract-progressive-loan/.../loanschedule/domain/ProgressiveLoanScheduleGenerator.java
+@Component
+public class ProgressiveLoanScheduleGenerator implements LoanScheduleGenerator {
+
+    private final ScheduledDateGenerator scheduledDateGenerator;
+    private final EMICalculator emiCalculator;
+    private final InterestScheduleModelRepositoryWrapper interestScheduleModelRepositoryWrapper;
+
+    private LoanTransactionProcessingService loanTransactionProcessingService;
+
+    public ProgressiveLoanScheduleGenerator(ScheduledDateGenerator scheduledDateGenerator,
+            EMICalculator emiCalculator,
+            InterestScheduleModelRepositoryWrapper interestScheduleModelRepositoryWrapper) {
+        this.scheduledDateGenerator = scheduledDateGenerator;
+        this.emiCalculator = emiCalculator;
+        this.interestScheduleModelRepositoryWrapper = interestScheduleModelRepositoryWrapper;
+    }
+
+    @Autowired(required = false)
+    public void setLoanTransactionProcessingService(LoanTransactionProcessingService loanTransactionProcessingService) {
+        this.loanTransactionProcessingService = loanTransactionProcessingService;
+    }
+```
+
+Three Spring beans are injected:
+
+- `ScheduledDateGenerator` — produces the raw list of `(from, due)` date pairs from the loan term + frequency
+  + holiday rules.
+- `EMICalculator` — the maths kernel covered in detail on the [EMI calculator page](./emi-calculator).
+- `InterestScheduleModelRepositoryWrapper` — fetches the persisted `ProgressiveLoanModel` snapshot for
+  follow-up operations (prepayment quote, per-period interest till date).
+
+`LoanTransactionProcessingService` is wired *setter-style* with `required = false` so the embeddable
+schedule generator (which has no transaction processor) still works.
+
+## The single-call public surface
+
+A frontend or microservice does not need the JPA-aware `LoanScheduleGenerator` API — it can call the simpler
+overload that takes a `LoanRepaymentScheduleModelData` and returns a `LoanSchedulePlan`:
+
+```java
+// ProgressiveLoanScheduleGenerator.java
+public LoanSchedulePlan generate(final MathContext mc, final LoanRepaymentScheduleModelData modelData) {
+    LoanApplicationTerms loanApplicationTerms = LoanApplicationTerms.assembleFrom(modelData, mc);
+    return LoanSchedulePlan.from(generate(mc, loanApplicationTerms, null, null));
+}
+```
+
+This is the entry point used by the
+[embeddable schedule generator](./embeddable-schedule-generator) JAR. The internal call delegates to the
+full `LoanScheduleGenerator` method.
+
+## The full schedule generation flow
+
+The richer overload takes the parsed `LoanApplicationTerms`, the active `LoanCharge` set and the
+`HolidayDetailDTO` and returns a `LoanScheduleModel`. The sequence is:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as ProgressiveLoanScheduleService
+    participant Gen as ProgressiveLoanScheduleGenerator
+    participant DateGen as ScheduledDateGenerator
+    participant EMI as ProgressiveEMICalculator
+    participant Model as ProgressiveLoanInterestScheduleModel
+
+    Caller->>Gen: generate(mc, terms, charges, holidayDTO)
+    Gen->>Gen: deriveTotalChargesDueAtTimeOfDisbursement(charges)
+    Gen->>Gen: LoanScheduleParams.createLoanScheduleParams(...)
+    Gen->>Gen: separateTotalCompoundingPercentageCharges(charges)
+    Gen->>DateGen: generateRepaymentPeriods(mc, start, terms, holiday)
+    DateGen-->>Gen: List<LoanScheduleModelRepaymentPeriod>
+    Gen->>EMI: generatePeriodInterestScheduleModel(periods, cfg, multiplesOf, mc)
+    EMI-->>Model: new ProgressiveLoanInterestScheduleModel(...)
+    Gen->>Gen: prepareDisbursementsOnLoanApplicationTerms(terms)
+    Gen->>Gen: getSortedDisbursementList(terms)
+
+    loop for each LoanScheduleModelRepaymentPeriod
+        Gen->>Gen: applyInterestRateChangesOnPeriod(terms, rp, model)
+        Gen->>EMI: changeInterestRate / applyInterestPause (if needed)
+        Gen->>Gen: processDisbursements(... false ...)
+        Gen->>EMI: addDisbursement(model, date, amount - downPayment)
+        Gen->>EMI: findRepaymentPeriod(model, from, due)
+        EMI-->>Gen: Optional<RepaymentPeriod>
+        Gen->>Gen: repaymentPeriod.addPrincipalAmount / addInterestAmount
+        Gen->>Gen: applyChargesForCurrentPeriod(rp, charges, params, ccy, mc)
+        Gen->>Gen: periods.add(rp); params.increment
+    end
+
+    opt multiDisburseLoan
+        Gen->>Gen: processDisbursements(... true ...)
+    end
+    Gen->>Gen: updatePeriodsWithCharges(currency, params, periods, nonCompounding, mc)
+    Gen-->>Caller: LoanScheduleModel.from(periods, currency, termInDays, ...)
+```
+
+The annotated source — the heart of `generate(...)`:
+
+```java
+@Override
+public LoanScheduleModel generate(final MathContext mc, final LoanApplicationTerms loanApplicationTerms,
+        final Set<LoanCharge> loanCharges, final HolidayDetailDTO holidayDetailDTO) {
+
+    // 1. Total disbursement-time charges (used by LoanScheduleModelDisbursementPeriod rows).
+    final BigDecimal chargesDueAtTimeOfDisbursement = deriveTotalChargesDueAtTimeOfDisbursement(loanCharges);
+
+    // 2. Pick the schedule anchor — disbursement-date or submitted-on-date.
+    final CurrencyData currency = loanApplicationTerms.getCurrency();
+    LocalDate periodStartDate =
+            RepaymentStartDateType.DISBURSEMENT_DATE.equals(loanApplicationTerms.getRepaymentStartDateType())
+                    ? loanApplicationTerms.getExpectedDisbursementDate()
+                    : loanApplicationTerms.getSubmittedOnDate();
+
+    final LoanScheduleParams scheduleParams = LoanScheduleParams.createLoanScheduleParams(currency,
+            Money.of(currency, chargesDueAtTimeOfDisbursement, mc), periodStartDate, Money.zero(currency, mc), mc);
+
+    // 3. Charges that depend on total interest are deferred to a second pass.
+    final Set<LoanCharge> nonCompoundingCharges = separateTotalCompoundingPercentageCharges(loanCharges);
+
+    // 4. Generate the raw list of date pairs.
+    final List<LoanScheduleModelRepaymentPeriod> expectedRepaymentPeriods =
+            scheduledDateGenerator.generateRepaymentPeriods(mc, periodStartDate, loanApplicationTerms, holidayDetailDTO);
+
+    // 5. Build the in-memory interest model using the EMI calculator.
+    final ProgressiveLoanInterestScheduleModel interestScheduleModel =
+            emiCalculator.generatePeriodInterestScheduleModel(
+                    expectedRepaymentPeriods, loanApplicationTerms.toLoanConfigurationDetails(),
+                    loanApplicationTerms.getInstallmentAmountInMultiplesOf(), mc);
+
+    final List<LoanScheduleModelPeriod> periods = new ArrayList<>(expectedRepaymentPeriods.size());
+    prepareDisbursementsOnLoanApplicationTerms(loanApplicationTerms);
+    final List<DisbursementData> disbursementDataList = getSortedDisbursementList(loanApplicationTerms);
+```
+
+The per-period loop:
+
+```java
+    for (LoanScheduleModelRepaymentPeriod repaymentPeriod : expectedRepaymentPeriods) {
+        scheduleParams.setPeriodStartDate(repaymentPeriod.getFromDate());
+        scheduleParams.setActualRepaymentDate(repaymentPeriod.getDueDate());
+
+        // a) Apply mid-life interest-rate changes and interest-pause windows that
+        //    fall inside this repayment period BEFORE booking any disbursement.
+        applyInterestRateChangesOnPeriod(loanApplicationTerms, repaymentPeriod, interestScheduleModel);
+
+        // b) Book any disbursement tranches that fall inside this period.
+        processDisbursements(loanApplicationTerms, disbursementDataList, scheduleParams,
+                             interestScheduleModel, periods, chargesDueAtTimeOfDisbursement, false, mc);
+
+        repaymentPeriod.setPeriodNumber(scheduleParams.getInstalmentNumber());
+
+        // c) Read back the principal/interest split the EMI calculator computed.
+        emiCalculator.findRepaymentPeriod(interestScheduleModel,
+                                          repaymentPeriod.getFromDate(),
+                                          repaymentPeriod.getDueDate())
+                .ifPresent(interestRepaymentPeriod -> {
+                    final Money principalDue = interestRepaymentPeriod.getDuePrincipal();
+                    final Money interestDue  = interestRepaymentPeriod.getDueInterest();
+                    repaymentPeriod.addPrincipalAmount(principalDue);
+                    repaymentPeriod.addInterestAmount(interestDue);
+                    repaymentPeriod.setOutstandingLoanBalance(
+                            interestRepaymentPeriod.getOutstandingLoanBalance());
+                    scheduleParams.addTotalCumulativePrincipal(principalDue);
+                    scheduleParams.addTotalCumulativeInterest(interestDue);
+                    scheduleParams.addTotalRepaymentExpected(principalDue.plus(interestDue, mc));
+                });
+
+        // d) Roll in fees and penalties due in this period.
+        applyChargesForCurrentPeriod(repaymentPeriod, loanCharges, scheduleParams, currency, mc);
+        periods.add(repaymentPeriod);
+
+        scheduleParams.incrementInstalmentNumber();
+        scheduleParams.incrementPeriodNumber();
+    }
+```
+
+The tail handles "after-maturity" disbursements (for some multi-disburse products) and the second-pass
+charges:
+
+```java
+    if (loanApplicationTerms.isMultiDisburseLoan()) {
+        processDisbursements(loanApplicationTerms, disbursementDataList, scheduleParams, interestScheduleModel,
+                             periods, chargesDueAtTimeOfDisbursement, true, mc);
+    }
+
+    // Charges that depend on the *total* loan interest (e.g. percentage-of-interest fees) are computed
+    // after the main loop because the interest is only known at this point.
+    updatePeriodsWithCharges(currency, scheduleParams, periods, nonCompoundingCharges, mc);
+
+    final BigDecimal totalPrincipalPaid = BigDecimal.ZERO;
+    final BigDecimal totalOutstanding   = BigDecimal.ZERO;
+    return LoanScheduleModel.from(periods, currency, interestScheduleModel.getLoanTermInDays(),
+            scheduleParams.getPrincipalToBeScheduled().plus(loanApplicationTerms.getDownPaymentAmount(), mc),
+            scheduleParams.getTotalCumulativePrincipal().plus(loanApplicationTerms.getDownPaymentAmount(), mc).getAmount(),
+            totalPrincipalPaid,
+            scheduleParams.getTotalCumulativeInterest().getAmount(),
+            scheduleParams.getTotalFeeChargesCharged().getAmount(),
+            scheduleParams.getTotalPenaltyChargesCharged().getAmount(),
+            scheduleParams.getTotalRepaymentExpected().getAmount(),
+            totalOutstanding);
+}
+```
+
+## Disbursement tranches
+
+A progressive product can have several disbursement tranches; each one is booked at its own date and grows
+the outstanding balance on the model. `processDisbursements(...)` handles them, optionally producing
+**down-payment** periods at the same time:
+
+```java
+private void processDisbursements(final LoanApplicationTerms loanApplicationTerms,
+        final List<DisbursementData> disbursementDataList, final LoanScheduleParams scheduleParams,
+        final ProgressiveLoanInterestScheduleModel interestScheduleModel,
+        final List<LoanScheduleModelPeriod> periods, final BigDecimal chargesDueAtTimeOfDisbursement,
+        final boolean includeDisbursementsAfterMaturityDate, final MathContext mc) {
+
+    for (DisbursementData disbursementData : disbursementDataList) {
+        final LocalDate disbursementDate = disbursementData.disbursementDate();
+        final LocalDate periodFromDate   = scheduleParams.getPeriodStartDate();
+        final LocalDate periodDueDate    = scheduleParams.getActualRepaymentDate();
+
+        // Either after maturity, or within the current repayment period
+        boolean hasDisbursementAfterLastRepaymentPeriod = includeDisbursementsAfterMaturityDate
+                && !disbursementDate.isBefore(interestScheduleModel.getMaturityDate());
+        boolean hasDisbursementInCurrentRepaymentPeriod = !includeDisbursementsAfterMaturityDate
+                && !disbursementDate.isBefore(periodFromDate) && disbursementDate.isBefore(periodDueDate);
+        if (!hasDisbursementAfterLastRepaymentPeriod && !hasDisbursementInCurrentRepaymentPeriod) {
+            continue;
+        }
+
+        Money outstandingBalance = emiCalculator.getOutstandingLoanBalanceOfPeriod(
+                interestScheduleModel, disbursementDate);
+        final Money disbursedAmount = Money.of(loanApplicationTerms.getCurrency(),
+                disbursementData.getPrincipal(), mc);
+        periods.add(LoanScheduleModelDisbursementPeriod.disbursement(
+                disbursementData.disbursementDate(), disbursedAmount, chargesDueAtTimeOfDisbursement));
+
+        // Multi-disburse cap-check
+        if (loanApplicationTerms.isMultiDisburseLoan()
+                && loanApplicationTerms.getMaxOutstandingBalance() != null) {
+            Money maxOutstandingBalance = loanApplicationTerms.getMaxOutstandingBalanceMoney();
+            if (outstandingBalance.plus(disbursedAmount).isGreaterThan(maxOutstandingBalance)) {
+                throw new MultiDisbursementOutstandingAmoutException(
+                        "Outstanding balance must not exceed the amount: " + maxOutstandingBalance,
+                        loanApplicationTerms.getMaxOutstandingBalance(), disbursedAmount);
+            }
+        }
+
+        Money downPaymentAmount = Money.zero(loanApplicationTerms.getCurrency(), mc);
+        if (loanApplicationTerms.isDownPaymentEnabled()) {
+            downPaymentAmount = Money.of(loanApplicationTerms.getCurrency(),
+                    MathUtil.percentageOf(disbursedAmount.getAmount(),
+                            loanApplicationTerms.getDisbursedAmountPercentageForDownPayment(), mc), mc);
+            if (loanApplicationTerms.getInstallmentAmountInMultiplesOf() != null) {
+                downPaymentAmount = Money.roundToMultiplesOf(downPaymentAmount,
+                        loanApplicationTerms.getInstallmentAmountInMultiplesOf(), mc);
+            }
+            LoanScheduleModelDownPaymentPeriod downPaymentPeriod = LoanScheduleModelDownPaymentPeriod.downPayment(
+                    scheduleParams.getInstalmentNumber(), disbursementDate, downPaymentAmount,
+                    outstandingBalance.plus(disbursedAmount, mc).minus(downPaymentAmount, mc));
+            periods.add(downPaymentPeriod);
+            scheduleParams.addTotalRepaymentExpected(downPaymentAmount);
+            scheduleParams.incrementInstalmentNumber();
+        }
+
+        final Money disbursementRemainingBalance = disbursedAmount.minus(downPaymentAmount, mc);
+        scheduleParams.addPrincipalToBeScheduled(disbursementRemainingBalance);
+        emiCalculator.addDisbursement(interestScheduleModel, disbursementDate, disbursementRemainingBalance);
+    }
+}
+```
+
+After `emiCalculator.addDisbursement(...)` returns, the in-memory model carries fresh EMI values for all
+periods affected by the new tranche; the main loop then simply reads them.
+
+## Mid-life interest-rate changes and pauses
+
+```java
+private void applyInterestRateChangesOnPeriod(final LoanApplicationTerms loanApplicationTerms,
+        final LoanScheduleModelRepaymentPeriod repaymentPeriod,
+        final ProgressiveLoanInterestScheduleModel interestScheduleModel) {
+    if (loanApplicationTerms.getLoanTermVariations() == null) { return; }
+
+    loanApplicationTerms.getLoanTermVariations().getInterestRateFromInstallment().stream()
+            .filter(change -> isDateWithinPeriod(change.getTermVariationApplicableFrom(), repaymentPeriod))
+            .forEach(change -> emiCalculator.changeInterestRate(interestScheduleModel,
+                    change.getTermVariationApplicableFrom(), change.getDecimalValue()));
+
+    loanApplicationTerms.getLoanTermVariations().getInterestPauseVariations().stream()
+            .filter(pause -> isDateWithinPeriod(pause.getTermVariationApplicableFrom(), repaymentPeriod))
+            .forEach(pause -> emiCalculator.applyInterestPause(interestScheduleModel,
+                    pause.getTermVariationApplicableFrom(), pause.getDateValue()));
+}
+```
+
+A rate change for an installment that is already in flight is therefore booked **before** that installment's
+disbursement is processed, so the new EMI values it produces are the ones the loop reads.
+
+## Charges (fees and penalties)
+
+Two kinds of charges are handled differently:
+
+- **Per-installment** and **specified-due-date** charges that do not depend on the total interest are added
+  in the main loop via `applyChargesForCurrentPeriod(...)` which delegates to
+  `cumulativeFeeChargesDueWithin(...)` and `cumulativePenaltyChargesDueWithin(...)`.
+- **Percentage-of-interest** and **percentage-of-amount-and-interest** specified-due-date charges depend on
+  the *total* interest of the loan, which is only known once the main loop has finished — they are extracted
+  by `separateTotalCompoundingPercentageCharges(...)` and added in a second pass by
+  `updatePeriodsWithCharges(...)`.
+
+```java
+private Set<LoanCharge> separateTotalCompoundingPercentageCharges(final Set<LoanCharge> loanCharges) {
+    Set<LoanCharge> interestCharges = new HashSet<>();
+    if (loanCharges != null) {
+        for (final LoanCharge loanCharge : loanCharges) {
+            if (loanCharge.isSpecifiedDueDate()
+                    && (loanCharge.getChargeCalculation().isPercentageOfInterest()
+                        || loanCharge.getChargeCalculation().isPercentageOfAmountAndInterest())) {
+                interestCharges.add(loanCharge);
+            }
+        }
+        loanCharges.removeAll(interestCharges);
+    }
+    return interestCharges;
+}
+```
+
+## Reschedule and prepayment
+
+`LoanScheduleGenerator` also declares operations that act on a live loan. The progressive implementation
+handles them by re-running `generate(...)` against the new terms and projecting the resulting
+`LoanScheduleModel` into a `LoanScheduleDTO`:
+
+```java
+@Override
+public LoanScheduleDTO rescheduleNextInstallments(MathContext mc, LoanApplicationTerms loanApplicationTerms, Loan loan,
+        HolidayDetailDTO holidayDetailDTO, LoanRepaymentScheduleTransactionProcessor processor,
+        LocalDate rescheduleFrom) {
+    LoanScheduleModel model = generate(mc, loanApplicationTerms, loan.getActiveCharges(), holidayDetailDTO);
+    return LoanScheduleDTO.from(null, model);
+}
+```
+
+For a prepayment quote the generator does *not* rebuild from scratch — it asks the persisted
+`ProgressiveLoanInterestScheduleModel` snapshot and the calculator for the outstanding amounts:
+
+```java
+@Override
+public OutstandingAmountsDTO calculatePrepaymentAmount(MonetaryCurrency currency, LocalDate onDate,
+        LoanApplicationTerms loanApplicationTerms, MathContext mc, Loan loan, HolidayDetailDTO holidayDetailDTO,
+        LoanRepaymentScheduleTransactionProcessor loanRepaymentScheduleTransactionProcessor) {
+    if (!(loanRepaymentScheduleTransactionProcessor instanceof AdvancedPaymentScheduleTransactionProcessor processor)) {
+        throw new IllegalStateException("Expected an AdvancedPaymentScheduleTransactionProcessor");
+    }
+
+    List<LoanRepaymentScheduleInstallment> installments = loan.getRepaymentScheduleInstallments();
+    LoanRepaymentScheduleInstallment actualInstallment = findInPeriod(onDate, installments).orElse(installments.get(0));
+
+    LocalDate transactionDate = switch (loanApplicationTerms.getPreClosureInterestCalculationStrategy()) {
+        case TILL_PRE_CLOSURE_DATE   -> onDate;
+        case TILL_REST_FREQUENCY_DATE -> actualInstallment.getDueDate();
+        case NONE -> throw new IllegalStateException("Unexpected PreClosureInterestCalculationStrategy: NONE");
+    };
+
+    Optional<ProgressiveLoanInterestScheduleModel> savedModel =
+            interestScheduleModelRepositoryWrapper.getSavedModel(loan, transactionDate);
+    ProgressiveLoanInterestScheduleModel model = savedModel.orElseThrow();
+    OutstandingDetails outstandingAmounts = emiCalculator.getOutstandingAmountsTillDate(model, transactionDate);
+
+    OutstandingAmountsDTO result = new OutstandingAmountsDTO(currency)
+            .principal(outstandingAmounts.getOutstandingPrincipal())
+            .interest(outstandingAmounts.getOutstandingInterest());
+
+    if (loan.isProgressiveSchedule()) {
+        // Outstanding down-payment installments are added back to principal
+        final List<LoanRepaymentScheduleInstallment> downPaymentInstallments =
+                loan.getRepaymentScheduleInstallments(LoanRepaymentScheduleInstallment::isDownPayment).stream().toList();
+        for (final LoanRepaymentScheduleInstallment installment : downPaymentInstallments) {
+            result.plusPrincipal(installment.getPrincipalOutstanding(loan.getCurrency()));
+        }
+    }
+    // If interest recalculation is off, subtract what has already been paid
+    if (!loan.isInterestRecalculationEnabled()) {
+        BigDecimal paidInterest = installments.stream().map(LoanRepaymentScheduleInstallment::getInterestPaid)
+                                              .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal paidPrincipal = installments.stream().map(LoanRepaymentScheduleInstallment::getPrincipal)
+                                                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        result.principal().minus(paidPrincipal);
+        result.interest().minus(paidInterest);
+    }
+
+    installments.forEach(installment -> {
+        if (installment.isAdditional()) {
+            result.plusPrincipal(installment.getPrincipalOutstanding(currency))
+                  .plusInterest(installment.getInterestOutstanding(currency));
+        }
+        result.plusFeeCharges(installment.getFeeChargesOutstanding(currency))
+              .plusPenaltyCharges(installment.getPenaltyChargesOutstanding(currency));
+    });
+    return result;
+}
+```
+
+## Per-period interest till date
+
+For COB-style daily interest accrual and for partial-period interest queries, the generator exposes:
+
+```java
+@Override
+public Money getPeriodInterestTillDate(@NotNull LoanRepaymentScheduleInstallment installment,
+                                       @NotNull LocalDate targetDate) {
+    Loan loan = installment.getLoan();
+    LoanRepaymentScheduleTransactionProcessor transactionProcessor =
+            loanTransactionProcessingService.getTransactionProcessor(loan.getTransactionProcessingStrategyCode());
+
+    if (!(transactionProcessor instanceof AdvancedPaymentScheduleTransactionProcessor)) {
+        throw new IllegalStateException("Expected an AdvancedPaymentScheduleTransactionProcessor");
+    }
+    if (installment.isAdditional() || installment.isDownPayment()) {
+        return Money.zero(loan.getCurrency());
+    }
+    Optional<ProgressiveLoanInterestScheduleModel> savedModel =
+            interestScheduleModelRepositoryWrapper.getSavedModel(loan, targetDate);
+    ProgressiveLoanInterestScheduleModel model = savedModel.orElseThrow();
+    return emiCalculator.getPeriodInterestTillDate(model, installment.getFromDate(), installment.getDueDate(),
+                                                   targetDate, false, true);
+}
+```
+
+## The output DTO: `LoanSchedulePlan`
+
+For callers that do not need the JPA-bound `LoanScheduleModel`, the plan-shaped projection is produced by
+`LoanSchedulePlan.from(LoanScheduleModel)` in
+`fineract-progressive-loan/.../loanschedule/data/LoanSchedulePlan.java`:
+
+```java
+public static LoanSchedulePlan from(LoanScheduleModel model) {
+    List<LoanSchedulePlanPeriod> periods = new ArrayList<>();
+    BigDecimal remainingTotalOutstanding = model.getTotalRepaymentExpected();
+    AtomicReference<BigDecimal> remainingTotalOutstandingRef = new AtomicReference<>(remainingTotalOutstanding);
+    model.getPeriods().forEach(periodModel -> {
+        LoanSchedulePlanPeriod periodPlan = null;
+        if (periodModel instanceof LoanScheduleModelDisbursementPeriod disbursementPeriod) {
+            periodPlan = new LoanSchedulePlanDisbursementPeriod(
+                    disbursementPeriod.getDisbursementDate(),
+                    disbursementPeriod.getDisbursementDate(),
+                    disbursementPeriod.getPrincipalDisbursed().getAmount(),
+                    disbursementPeriod.getPrincipalDisbursed().getAmount());
+        } else if (periodModel instanceof LoanScheduleModelDownPaymentPeriod downPaymentPeriod) {
+            remainingTotalOutstandingRef.set(remainingTotalOutstandingRef.get()
+                    .subtract(downPaymentPeriod.getPrincipalDue().getAmount()));
+            periodPlan = new LoanSchedulePlanDownPaymentPeriod(...);
+        } else if (periodModel instanceof LoanScheduleModelRepaymentPeriod repaymentPeriod) {
+            remainingTotalOutstandingRef.set(remainingTotalOutstandingRef.get()
+                    .subtract(repaymentPeriod.getTotalDue().getAmount()));
+            periodPlan = new LoanSchedulePlanRepaymentPeriod(...);
+        }
+        if (periodPlan != null) { periods.add(periodPlan); }
+    });
+    return new LoanSchedulePlan(periods, model.getCurrency(), model.getLoanTermInDays(),
+            model.getTotalPrincipalDisbursed().getAmount(), model.getTotalPrincipalExpected(),
+            model.getTotalInterestCharged(), model.getTotalFeeChargesCharged(),
+            model.getTotalPenaltyChargesCharged(), model.getTotalRepaymentExpected(),
+            model.getTotalOutstanding());
+}
+```
+
+`LoanSchedulePlanPeriod` is a sealed-feeling interface implemented by three records (`LoanSchedulePlanDisbursementPeriod`,
+`LoanSchedulePlanDownPaymentPeriod`, `LoanSchedulePlanRepaymentPeriod`), each carrying the principal/interest/
+fee/penalty/outstanding fields appropriate for that period kind.
+
+## Why an in-memory interest model?
+
+`ProgressiveLoanInterestScheduleModel` is built once per schedule generation and **persisted** as
+`m_loan_progressive_model.json_model` after the loan goes live. The generator therefore behaves differently
+depending on the entry point:
+
+- **Initial schedule (loan creation):** build the model from scratch and write it (via
+  `InterestScheduleModelRepositoryWrapper.writeInterestScheduleModel(...)`).
+- **Prepayment / interest-till-date / next-repayment queries:** read the persisted model via
+  `getSavedModel(loan, businessDate)` and query the calculator.
+- **Live transactions (disbursement, repayment, charge-off, ...):** load the model, mutate it via
+  the relevant `EMICalculator` event method, and write it back.
+
+The `InterestScheduleModelRepositoryWrapper` interface
+(`portfolio/loanaccount/service/InterestScheduleModelRepositoryWrapper.java`) is the abstraction:
+
+```java
+public interface InterestScheduleModelRepositoryWrapper {
+    Optional<ProgressiveLoanModel> findOneByLoanId(Long loanId);
+    Optional<ProgressiveLoanModel> findOneByLoan(Loan loan);
+    Optional<ProgressiveLoanInterestScheduleModel> extractModel(Optional<ProgressiveLoanModel> progressiveLoanModel);
+
+    ProgressiveLoanInterestScheduleModel writeInterestScheduleModel(Loan loan, ProgressiveLoanInterestScheduleModel model);
+    Optional<ProgressiveLoanInterestScheduleModel> readProgressiveLoanInterestScheduleModel(
+            Long loanId, ILoanConfigurationDetails detail, Integer installmentAmountInMultipliesOf);
+
+    boolean hasValidModelForDate(Long loanId, LocalDate targetDate);
+    Optional<ProgressiveLoanInterestScheduleModel> getSavedModel(Loan loan, LocalDate businessDate);
+    Long removeByLoanId(Long loanId);
+}
+```
+
+The embeddable JAR ships a `NoopInterestScheduleModelRepositoryWrapper` implementation, allowing the
+generator to be used without any persistence at all.
+
+## Persisted snapshot: `ProgressiveLoanModel`
+
+```java
+// portfolio/loanaccount/domain/ProgressiveLoanModel.java
+@Entity
+@Table(name = "m_loan_progressive_model")
+public class ProgressiveLoanModel extends AbstractPersistableCustom<Long> {
+
+    @Version int version;
+
+    @OneToOne
+    @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+
+    @Column(name = "json_model", columnDefinition = "text", nullable = false)
+    private String jsonModel;
+
+    @Column(name = "business_date", nullable = false)
+    private LocalDate businessDate;
+
+    @Column(name = "last_modified_on_utc", nullable = false)
+    private OffsetDateTime lastModifiedDate;
+
+    @Column(name = "json_model_version", nullable = false)
+    private String jsonModelVersion;
+}
+```
+
+The JSON serialisation is handled by `ProgressiveLoanInterestScheduleModelParserServiceGsonImpl` (in
+`portfolio/loanaccount/service/`), which uses Gson with a custom `InterestScheduleModelServiceGsonContext`.
+
+## File map
+
+```text
+fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/
+└── loanaccount/loanschedule/
+    ├── domain/ProgressiveLoanScheduleGenerator.java        — orchestrator (≈ 500 lines)
+    └── data/
+        ├── LoanSchedulePlan.java                            — projection root
+        ├── LoanSchedulePlanPeriod.java                      — interface
+        ├── LoanSchedulePlanRepaymentPeriod.java             — repayment row
+        ├── LoanSchedulePlanDisbursementPeriod.java          — disbursement row
+        └── LoanSchedulePlanDownPaymentPeriod.java           — down-payment row
+└── loanaccount/service/InterestScheduleModelRepositoryWrapper.java
+└── loanaccount/service/InterestScheduleModelRepositoryWrapperImpl.java
+└── loanaccount/service/ProgressiveLoanInterestScheduleModelParserService.java
+└── loanaccount/service/ProgressiveLoanInterestScheduleModelParserServiceGsonImpl.java
+└── loanaccount/domain/ProgressiveLoanModel.java             — persisted snapshot
+```
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="EMI Calculator" icon="calculator" href="./emi-calculator">
+    The `ProgressiveEMICalculator` interface and the closed-form solution it runs.
+  </Card>
+  <Card title="Embeddable Generator" icon="cube" href="./embeddable-schedule-generator">
+    The same generator wrapped with no-op JPA collaborators and shaded into a single JAR.
+  </Card>
+</CardGroup>

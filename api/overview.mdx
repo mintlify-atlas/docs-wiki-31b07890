@@ -1,0 +1,325 @@
+---
+title: "REST API Overview"
+sidebarTitle: "Overview"
+description: "How Apache Fineract exposes its REST API: Jersey JAX-RS resources mounted under /fineract-provider/api/v1, multi-tenant headers, HTTP Basic auth, JSON conventions, command pattern semantics, and the unified error envelope."
+---
+
+The Apache Fineract REST API is the public contract of the platform. Every operation a teller, loan officer, accountant or external integration performs ultimately flows through one of the **`*ApiResource`** classes scattered across the Gradle modules — there are 164+ of them in `fineract-provider` alone, plus more in `fineract-loan`, `fineract-accounting`, `fineract-investor`, `fineract-security`, `fineract-mix`, `fineract-branch`, and the working-capital and progressive-loan modules. They are all plain JAX-RS 3.1 resources served by **Jersey 3** inside the same Spring Boot 3 application context.
+
+This page is the map of how those resources are exposed: where the URL prefix comes from, what headers and credentials every call must carry, how request and response bodies are shaped, how the command-pattern write-path works, and how errors are reported. The remaining pages in this section group the resources by domain and list the most important endpoints inside each one.
+
+## How URLs are assembled
+
+Three things determine the final URL of any Fineract endpoint:
+
+1. The servlet context — the WAR/jar is deployed as `fineract-provider`, giving everything a `/fineract-provider` prefix.
+2. The Jersey **application path** — declared once in `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/jersey/JerseyConfig.java`:
+
+   ```java
+   // fineract-provider/.../infrastructure/core/jersey/JerseyConfig.java
+   @ApplicationPath("/api")
+   @Component
+   public class JerseyConfig extends ResourceConfig {
+       // packages(...) registers every @Path-annotated bean in the context
+   }
+   ```
+
+3. The **class-level `@Path`** on each `*ApiResource` — virtually all of them start with `/v1/...` (a small number of v2 search endpoints exist in `fineract-provider/.../portfolio/client/api/v2/search/`).
+
+Concatenating those gives the canonical base for nearly every call:
+
+```
+https://<host>:<port>/fineract-provider/api/v1/<resource>
+```
+
+The default standalone port is `8443` (HTTPS) — see `fineract-provider/src/main/resources/application.properties` and the embedded Tomcat config. In container builds the context path can be flattened, but the `/api/v1/` segment is always present.
+
+| Layer | Contributed segment | Source |
+| --- | --- | --- |
+| Servlet container | `/fineract-provider` | `fineract-provider/src/main/webapp/WEB-INF/web.xml` and Spring Boot `server.servlet.context-path` |
+| Jersey application | `/api` | `JerseyConfig.java` (`@ApplicationPath`) |
+| Resource class | `/v1/clients`, `/v1/loans`, … | `@Path` on each `*ApiResource` |
+| Sub-resource method | `/template`, `/{id}/charges`, … | `@Path` on each handler method |
+
+## Required headers
+
+Every authenticated request must carry **two** headers — auth and tenant — at minimum. A typical loan-officer GET looks like:
+
+```http
+GET /fineract-provider/api/v1/clients?limit=50&offset=0 HTTP/1.1
+Host: tenant.example.com:8443
+Authorization: Basic bWlmb3M6cGFzc3dvcmQ=
+Fineract-Platform-TenantId: default
+Accept: application/json
+```
+
+### Authorization
+
+Two authentication strategies ship in `fineract-security/.../infrastructure/security/`:
+
+- **HTTP Basic** — the default. `TenantAwareBasicAuthenticationFilter` extracts the `Authorization: Basic …` header, decodes the base64 `username:password`, and resolves the user against the tenant's `m_appuser` table. The same filter handles the special `POST /v1/authentication` endpoint that returns an auth key when the `BASICAUTH_VALIDATE_CREDENTIALS` configuration is enabled.
+- **OAuth2 / JWT** — opt-in via the `oauth` Spring profile. `SpringSecurityOAuth2AccessTokenFilter` validates a Bearer token issued by an external IDP. Look in `fineract-security/.../security/filter/` for the wiring.
+
+When two-factor authentication is enabled, an additional `Fineract-Platform-TFA-Token` header is required on protected calls after the user has gone through the `/v1/twofactor` flow.
+
+### Tenant header
+
+Fineract is **multi-tenant by design**. Each tenant has its own database, configured in the central `tenants` catalog. Every request must declare which tenant it targets:
+
+```java
+// fineract-security/.../security/filter/TenantAwareBasicAuthenticationFilter.java
+private static final String TENANT_ID_REQUEST_HEADER = "Fineract-Platform-TenantId";
+// …
+String tenantIdentifier = request.getHeader(TENANT_ID_REQUEST_HEADER);
+if (StringUtils.isBlank(tenantIdentifier)) {
+    tenantIdentifier = request.getParameter("tenantIdentifier");
+}
+if (tenantIdentifier == null && EXCEPTION_IF_HEADER_MISSING) {
+    throw new InvalidTenantIdentifierException("No tenant identifier found: …");
+}
+```
+
+In other words: the header is preferred; a `tenantIdentifier` query parameter is accepted as a fallback. Missing it returns `401 Unauthorized` with `InvalidTenantIdentifierException`.
+
+### Other common headers
+
+| Header | Purpose |
+| --- | --- |
+| `Accept` | Almost always `application/json`. A few endpoints can return `application/vnd.ms-excel`, `application/pdf`, `image/*` or `text/csv` (downloads, run-reports, document attachments). |
+| `Content-Type` | `application/json` for normal writes, `multipart/form-data` for document/image uploads and `uploadtemplate` endpoints. |
+| `Fineract-Platform-TFA-Token` | Required when two-factor is active. |
+| `Idempotency-Key` | Honoured by command-pattern POSTs; the `IdempotencyKeyResolver` in `fineract-core` short-circuits duplicate replays. |
+| `X-Real-IP`, `X-Forwarded-For` | Optional, recorded into the audit trail when present. |
+
+## Resource layout: `*ApiResource` classes
+
+Every public REST endpoint in Fineract lives in a class named `<Domain>ApiResource.java`. The naming is deliberate and exhaustive — you can grep the whole tree:
+
+```bash
+find fineract-provider/src/main/java -name '*ApiResource.java' | wc -l
+# 164 in fineract-provider alone
+
+find . -name '*ApiResource.java'
+# ~190 total across all modules
+```
+
+A canonical class skeleton looks like this (taken from `ClientsApiResource.java`):
+
+```java
+// fineract-provider/.../portfolio/client/api/ClientsApiResource.java
+@Path("/v1/clients")
+@Component
+@Tag(name = "Client", description = "Clients are people and businesses that have applied …")
+@RequiredArgsConstructor
+public class ClientsApiResource {
+
+    private final PlatformSecurityContext context;
+    private final ClientReadPlatformService clientReadPlatformService;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final DefaultToApiJsonSerializer<ClientData> toApiJsonSerializer;
+
+    @GET
+    @Path("template")
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String retrieveTemplate(@Context final UriInfo uriInfo, …) { … }
+
+    @GET
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String retrieveAll(@Context final UriInfo uriInfo, …) { … }
+
+    @POST
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String create(@Parameter(hidden = true) final String apiRequestBodyAsJson) { … }
+    // …
+}
+```
+
+Patterns to recognise:
+
+- `@Component` + `@RequiredArgsConstructor` — the resource is a Spring bean and Jersey is taught about Spring beans via `JerseyConfig`. There is **no** explicit `@Inject`.
+- `@Tag` / `@Operation` from `io.swagger.v3.oas.annotations.*` — OpenAPI documentation is generated automatically and published at `/fineract-provider/swagger-ui/` and `/fineract-provider/api-docs`.
+- The method bodies are short. They typically (a) call `context.authenticatedUser()`, (b) for reads delegate to a `*ReadPlatformService`, (c) for writes build a `CommandWrapper`, send it through `PortfolioCommandSourceWritePlatformService.logCommandSource(…)`, and (d) return a `String` of pre-serialised JSON.
+
+## Standard JSON conventions
+
+### Pagination
+
+List endpoints follow the same query-parameter contract:
+
+| Param | Meaning |
+| --- | --- |
+| `offset` | Zero-based row offset. Default `0`. |
+| `limit` | Page size. Default `-1` (no limit) or `200` depending on the resource. |
+| `orderBy` | SQL-safe column name. |
+| `sortOrder` | `ASC` or `DESC`. |
+| `fromDate`, `toDate`, `dateFormat`, `locale` | Date-range filters. |
+
+Paged responses come back as:
+
+```json
+{
+  "totalFilteredRecords": 17321,
+  "pageItems": [ { "id": 1, "displayName": "…", … }, … ]
+}
+```
+
+### Dates and locales
+
+Fineract does **not** speak ISO-8601 in request bodies. Every write that contains a date must declare the format and locale:
+
+```json
+{
+  "officeId": 1,
+  "firstname": "Jane",
+  "lastname": "Doe",
+  "activationDate": "01 January 2024",
+  "active": true,
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+This is enforced inside the `*FromApiJsonDeserializer` classes via `JsonParserHelper.extractLocalDateNamed(...)`. Forgetting `dateFormat`/`locale` returns `400 Bad Request` with the `error.msg.dateFormat.parameter.missing` error code.
+
+### Booleans and enums
+
+- Booleans must be JSON booleans (`true`/`false`), never numeric.
+- Enums are written either as the integer code value (`statusId: 100`) or the `code` string (`status: "submittedAndPendingApproval"`) depending on the resource.
+
+## The command pattern (writes)
+
+Almost every write — create, update, delete, activate, approve, disburse, reject, withdraw, repay, undo — flows through one piece of infrastructure: `CommandWrapper` / `PortfolioCommandSourceWritePlatformService` / a `*CommandHandler` bean.
+
+```mermaid
+flowchart LR
+  R["@POST /v1/clients<br/>ClientsApiResource.create"]
+  CW["CommandWrapper<br/>(actionName=CREATE,<br/>entityName=CLIENT, json)"]
+  CS["PortfolioCommandSourceWritePlatformService<br/>.logCommandSource()"]
+  Lookup["CommandHandlerProvider<br/>findHandler(CREATE_CLIENT)"]
+  H["CreateClientCommandHandler"]
+  S["ClientWritePlatformService<br/>.createClient()"]
+  E["m_portfolio_command_source<br/>(audit row)"]
+  R --> CW --> CS --> Lookup --> H --> S
+  CS --> E
+```
+
+The audit row (`m_portfolio_command_source`) is the unified write log: it stores who, when, which entity, the JSON command and the resulting `commandId`/`resourceId`. Maker-checker uses the same table — see `MakercheckersApiResource` and `fineract-provider/.../commands/`.
+
+Responses to POST/PUT/DELETE writes are deliberately small and structurally identical (`CommandProcessingResult`):
+
+```json
+{
+  "officeId": 1,
+  "clientId": 4711,
+  "resourceId": 4711,
+  "changes": { "firstname": "Jane", "lastname": "Doe" }
+}
+```
+
+When `?command=…` is appended to a POST (`POST /v1/clients/{clientId}?command=activate`), the action is dispatched to the matching `*CommandHandler` — see the catalog inside `fineract-core/.../commands/` for the full action-vs-entity grid.
+
+## Error envelope
+
+Every framework-recognised error is rendered through `ApiGlobalErrorResponse` and mapped by exception mappers under `fineract-core/.../infrastructure/core/exception/`. The shape is consistent:
+
+```json
+{
+  "developerMessage": "Validation errors exist.",
+  "httpStatusCode": "400",
+  "defaultUserMessage": "Validation errors exist.",
+  "userMessageGlobalisationCode": "validation.msg.validation.errors.exist",
+  "errors": [
+    {
+      "developerMessage": "The parameter `firstname` is mandatory.",
+      "defaultUserMessage": "The parameter firstname is mandatory.",
+      "userMessageGlobalisationCode": "validation.msg.client.firstname.cannot.be.blank",
+      "parameterName": "firstname"
+    }
+  ]
+}
+```
+
+Common HTTP status mappings:
+
+| Status | Trigger |
+| --- | --- |
+| `400` | `PlatformApiDataValidationException` — bad JSON, missing required parameter, format error. |
+| `401` | Missing/invalid `Authorization`, missing `Fineract-Platform-TenantId`, locked user, expired password. |
+| `403` | `NoAuthorizationException` — user lacks the named permission (`CREATE_LOAN`, `DISBURSE_LOAN`, …). |
+| `404` | `*NotFoundException` thrown by a read-platform service when the entity does not exist for the current tenant. |
+| `405` | Verb not supported on a given path. |
+| `409` | `PlatformDataIntegrityException` — duplicate `externalId`, FK violation, optimistic-lock failure. |
+| `500` | Uncaught exception. Always check `m_portfolio_command_source.error_message` for the persisted detail when it was a write. |
+
+## OpenAPI / Swagger
+
+The full machine-readable specification is generated at build time via `swagger-core` annotations on each resource. The endpoints to consume it are:
+
+| URL | Purpose |
+| --- | --- |
+| `/fineract-provider/swagger-ui/` | Interactive Swagger UI. |
+| `/fineract-provider/api-docs` | OpenAPI JSON. |
+| `/fineract-provider/legacy-docs/apiLive.htm` | The original hand-curated API reference, still shipped under `fineract-provider/src/main/resources/static/legacy-docs/`. |
+
+When a resource page in this section talks about a "template" endpoint, it is the one Swagger labels with `summary: "Retrieve … Template"` — it returns the set of allowed code values, currencies, products and so on that a UI needs to render the create/edit form.
+
+## How the rest of this section is organised
+
+The remaining pages group the 190+ `*ApiResource` files by business domain. Every page contains a table of the **8–25 most important endpoints** in that domain (HTTP verb, full path, source file, purpose) followed by domain notes. For exhaustive coverage of every method on every resource, the source file path under each table is your reference — `grep -n '@Path' <file>` will give the canonical list.
+
+| Page | Resources covered |
+| --- | --- |
+| [Clients & Groups](/api/clients-and-groups) | `ClientsApiResource`, `ClientIdentifiersApiResource`, `ClientChargesApiResource`, `ClientTransactionsApiResource`, `ClientAddressApiResource`, `ClientFamilyMembersApiResource`, `GroupsApiResource`, `CentersApiResource`, `GroupsLevelApiResource`, `ClientSearchV2ApiResource` |
+| [Loans](/api/loans) | `LoansApiResource`, `BulkLoansApiResource`, `LoansPointInTimeApiResource`, `LoanScheduleApiResource`, `LoanDisbursementDetailApiResource`, `GuarantorsApiResource`, `LoanCollateralManagementApiResource`, `RescheduleLoansApiResource`, `DelinquencyApiResource` |
+| [Loan Products](/api/loan-products) | `LoanProductsApiResource`, `LoanProductsDetailsApiResource` |
+| [Loan Transactions](/api/loan-transactions) | `LoanTransactionsApiResource`, `LoanChargesApiResource`, `LoanInterestPauseApiResource`, `LoanCapitalizedIncomeApiResource`, `LoanBuyDownFeeApiResource`, `RepaymentWithPostDatedChecksApiResource` |
+| [Savings & Deposits](/api/savings-and-deposits) | `SavingsAccountsApiResource`, `SavingsAccountChargesApiResource`, `SavingsAccountTransactionsApiResource`, `SavingsProductsApiResource`, `FixedDepositAccountsApiResource`, `FixedDepositProductsApiResource`, `RecurringDepositAccountsApiResource`, `RecurringDepositProductsApiResource`, `ShareDividendApiResource`, `AccountsApiResource`, `ProductsApiResource`, `InterestRateChartsApiResource`, `InterestRateChartSlabsApiResource` |
+| [Accounting](/api/accounting) | `GLAccountsApiResource`, `GLClosuresApiResource`, `JournalEntriesApiResource`, `AccountingRuleApiResource`, `AccrualAccountingApiResource`, `FinancialActivityAccountsApiResource`, `PaymentTypeApiResource`, `ProvisioningEntriesApiResource`, `ProvisioningCategoryApiResource`, `ProvisioningCriteriaApiResource` |
+| [Organisation](/api/organisation) | `OfficesApiResource`, `StaffApiResource`, `HolidaysApiResource`, `WorkingDaysApiResource`, `CurrenciesApiResource`, `FundsApiResource`, `TellerApiResource`, `CashierApiResource`, `TellerJournalApiResource` |
+| [Configuration & Jobs](/api/configuration-and-jobs) | `GlobalConfigurationApiResource`, `ExternalServicesConfigurationApiResource`, `CacheApiResource`, `SchedulerApiResource`, `SchedulerJobApiResource`, `InlineJobApiResource`, `CodesApiResource`, `CodeValuesApiResource`, `FineractEntityApiResource`, `EntityDatatableChecksApiResource` |
+| [Security & Users](/api/security-and-users) | `UsersApiResource`, `RolesApiResource`, `PermissionsApiResource`, `AuthenticationApiResource`, `ForgotPasswordApiResource`, `PasswordPreferencesApiResource`, `TwoFactorApiResource`, `TwoFactorConfigurationApiResource`, `UserDetailsApiResource` |
+| [Reports & Datatables](/api/reports-and-datatables) | `ReportsApiResource`, `RunreportsApiResource`, `DatatablesApiResource`, `ReportMailingJobApiResource`, `ReportMailingJobRunHistoryApiResource`, `MixTaxonomyApiResource`, `MixTaxonomyMappingApiResource`, `MixReportApiResource`, `AdHocApiResource`, `SpmApiResource`, `ScorecardApiResource`, `SurveyApiResource`, `LikelihoodApiResource`, `PovertyLineApiResource`, `LookupTableApiResource` |
+| [External Assets & Investor](/api/external-assets-and-investor) | `ExternalAssetOwnersApiResource`, `ExternalAssetOwnerLoanProductAttributesApiResource`, `ExternalEventConfigurationApiResource` |
+| [Internal-Only](/api/internal-only) | `InternalCOBApiResource`, `InternalLoanAccountLockApiResource`, `InternalExternalEventsApiResource`, `InternalLoanInformationApiResource`, `InternalSavingsAccountInformationApiResource`, `InternalClientInformationApiResource`, `InternalConfigurationsApiResource`, `InternalProgressiveLoanApiResource`, `InternalWorkingCapitalLoanApiResource`, `InstanceModeApiResource` |
+
+## A worked end-to-end example
+
+The shortest end-to-end demonstration — log in, hit a tenant-scoped endpoint, and create something via the command pattern:
+
+```bash
+# 1. Verify credentials (optional; honours BASICAUTH_VALIDATE_CREDENTIALS)
+curl -k -u mifos:password \
+  -H 'Fineract-Platform-TenantId: default' \
+  -X POST https://localhost:8443/fineract-provider/api/v1/authentication
+
+# 2. Retrieve the template needed by the client-create UI
+curl -k -u mifos:password \
+  -H 'Fineract-Platform-TenantId: default' \
+  https://localhost:8443/fineract-provider/api/v1/clients/template
+
+# 3. Create a client (write path → CreateClientCommandHandler)
+curl -k -u mifos:password \
+  -H 'Fineract-Platform-TenantId: default' \
+  -H 'Content-Type: application/json' \
+  -X POST https://localhost:8443/fineract-provider/api/v1/clients \
+  -d '{
+    "officeId": 1,
+    "firstname": "Jane",
+    "lastname": "Doe",
+    "active": true,
+    "activationDate": "01 January 2024",
+    "dateFormat": "dd MMMM yyyy",
+    "locale": "en"
+  }'
+
+# 4. Activate again later via a command query-parameter
+curl -k -u mifos:password \
+  -H 'Fineract-Platform-TenantId: default' \
+  -H 'Content-Type: application/json' \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/clients/4711?command=close' \
+  -d '{ "closureDate": "31 December 2024", "closureReasonId": 22,
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+```
+
+Every other domain page in this section reads the same way — the only thing that changes is the resource and the JSON body.

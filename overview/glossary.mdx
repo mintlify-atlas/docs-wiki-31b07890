@@ -1,0 +1,515 @@
+---
+title: "Apache Fineract Glossary of Banking & Code Terms"
+sidebarTitle: "Glossary"
+description: "Plain-English glossary for Apache Fineract: COB, GL, GLIM/GSIM, JLG, KYC, maker-checker, command source, tenants, datatables, MIX, Mojaloop and more."
+---
+
+This glossary defines the banking and Apache Fineract-specific terms you will
+encounter all over the codebase, with a pointer to where each one is
+materialised in source. Use it as a quick reference when reading code, JIRA
+tickets, or release notes.
+
+<Note>
+Terms appear in alphabetical order. Where a term has both a finance meaning
+and a Fineract code meaning, both are given. File paths are relative to the
+repository root.
+</Note>
+
+## A
+
+### Accrual accounting
+Recognising income/expense when it is *earned* (accrued) rather than when cash
+moves. Fineract supports cash, accrual-periodic, and accrual-upfront variants
+per loan/savings product.
+- Where: `fineract-loan` and `fineract-savings` configure
+  `AccountingRuleType` on `LoanProduct` / `SavingsProduct`. Journal entries
+  posted by `fineract-accounting/.../journalentry/service/`.
+
+### AdHocQuery
+A user-defined SQL query stored in the platform that produces a tabular
+report. Distinct from Pentaho reports — these are stored in
+`m_adhoc_query`.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/adhocquery/`.
+
+### AppUser
+The platform user entity (login, hashed password, roles, office). Authentication
+maps the inbound credential to an `AppUser`.
+- Where:
+  `fineract-core/src/main/java/org/apache/fineract/useradministration/domain/AppUser.java`
+  (referenced from `fineract-security`).
+
+### Avro schema
+Strongly typed schema for events Fineract publishes to Kafka/JMS. Owned by
+the `fineract-avro-schemas` module.
+- Where: `fineract-avro-schemas/src/main/avro/`.
+
+## B
+
+### Batch manager / Batch worker
+A Fineract node that owns the Spring Batch job schedule (manager) vs. one
+that executes partitioned step instances (worker). Selected via
+`fineract.mode.batch-manager-enabled` / `batch-worker-enabled`.
+- Where: `fineract-provider/src/main/resources/application.properties`
+  + `fineract-provider/.../infrastructure/springbatch/`.
+
+### Basic auth (Fineract flavour)
+HTTP basic auth that *also* requires a `Fineract-Platform-TenantId` header.
+The tenant header is consumed before the auth filter so that the password is
+verified against the tenant's user table.
+- Where: `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/filter/`.
+
+### Business date
+The "operational" date Fineract is treating as today for COB purposes. Often
+behind the wall-clock if COB has not yet been run. Distinct from *system date*
+(see below).
+- Where: `BusinessDateType` enum and `BusinessDateService` in
+  `fineract-core/src/main/java/org/apache/fineract/infrastructure/businessdate/`.
+
+### BusinessEventNotifier
+The in-process event bus that domain services publish to when an aggregate
+changes (loan approved, repayment posted, etc.). Listeners may persist an
+outbox row that is later pushed to Kafka/JMS.
+- Where: `fineract-core/src/main/java/org/apache/fineract/infrastructure/event/business/`.
+
+### Business step (COB step)
+A single unit of end-of-day work executed by the COB job — e.g. "apply
+penalty for overdue", "accrue interest". Steps are configured in
+`m_batch_business_step`.
+- Where: `fineract-cob/src/main/java/org/apache/fineract/cob/`,
+  e.g. `LoanCOBBusinessStep`.
+
+## C
+
+### Cash vs. accrual basis
+See *Accrual accounting*. A product can be configured `NONE` (no accounting),
+`CASH_BASED`, `ACCRUAL_PERIODIC`, or `ACCRUAL_UPFRONT`.
+- Where: enum `AccountingRuleType` in
+  `fineract-accounting/.../common/`.
+
+### Charge
+A monetary item attached to a loan or savings account: an upfront fee, a
+recurring fee, or a penalty. Charges have a calculation type, a time, and an
+optional tax group.
+- Where: `fineract-charge/src/main/java/org/apache/fineract/portfolio/charge/`.
+
+### Charge vs. fee vs. penalty
+In Fineract terminology:
+- **Charge** is the umbrella entity (`m_charge`).
+- A charge with `is_penalty=true` is a **penalty** (typically attached on
+  overdue events).
+- A charge with `is_penalty=false` is colloquially a **fee**.
+- Where: `fineract-charge/.../domain/Charge.java`.
+
+### Checker
+The second user in a maker-checker workflow — the one who approves a
+command another user submitted.
+- Where: `fineract-command/.../service/PortfolioCommandSourceWritePlatformService.approveEntry`.
+
+### Client
+A natural-person customer in Fineract. (Not to be confused with the generated
+SDK called `fineract-client`.)
+- Where: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/`.
+
+### COB (Close of Business)
+The orchestrated end-of-day process that runs the chain of business steps for
+each loan / savings account (delinquency aging, accruals, charge application,
+notifications). Implemented as Spring Batch jobs.
+- Where: `fineract-cob/`, opt-in via `fineract.job.loan-cob-enabled`.
+
+### Code value
+A row in `m_code_value` — Fineract's runtime-editable enum mechanism. Things
+like "Gender", "Marital status", "Loan purpose" are codes; their allowed
+values are code values, editable per tenant without a release.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/codes/`.
+
+### Command source
+The persisted record of an attempted write through Fineract's command
+pipeline. Stored in `m_portfolio_command_source` with the full JSON payload,
+acting user, entity ids, and processing result.
+- Where: `fineract-command/.../domain/CommandSource.java`.
+
+### CommandWrapper
+The immutable request object handed to the command pipeline by an
+`*ApiResource`. Carries entity name, action, JSON, ids.
+- Where: `fineract-command/.../domain/CommandWrapper.java` +
+  `CommandWrapperBuilder`.
+
+### Configuration (global)
+Tenant-wide toggle stored in `c_configuration` — e.g. "allow back-dated
+transactions", "enable interest charged for savings".
+- Where: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/`.
+
+### CORS / HSTS
+Standard cross-origin and strict-transport security configured under
+`fineract.security.cors.*` and `fineract.security.hsts.enabled`.
+- Where: `application.properties`, applied in `fineract-security`.
+
+## D
+
+### Datatables
+Tenant-defined extra tables attached to a core entity (`m_client`, `m_loan`,
+…). Fineract auto-generates CRUD endpoints for them. Essential for adding
+custom fields without changing the schema migrations of core entities.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/dataqueries/`.
+
+### Delinquency
+A loan that has missed one or more dues by an arrears tolerance. Fineract
+tracks delinquency *buckets* and *ranges* (1-30 days, 31-60, …) per product.
+- Where: `fineract-loan/src/main/java/org/apache/fineract/portfolio/delinquency/`.
+
+### Disruptor (LMAX)
+The high-throughput ring-buffer used by `fineract-command-disruptor` as an
+alternative to standard async command execution.
+- Where: `fineract-command-disruptor/`.
+
+## E
+
+### EMI (Equated Monthly Instalment)
+The fixed recurring repayment amount (principal + interest) of an
+amortised loan. Fineract computes EMIs in the schedule generator.
+- Where: `fineract-loan/.../loanaccount/loanschedule/`,
+  and the progressive variant in `fineract-progressive-loan-embeddable-schedule-generator/`.
+
+### External event
+A business-significant change Fineract emits to a downstream system over
+Kafka/JMS, serialised with Avro.
+- Where: outbox table `m_external_event` driven by
+  `fineract-provider/.../infrastructure/event/external/`.
+
+## F
+
+### Fineract-Platform-TenantId
+The required HTTP header that names the tenant a request targets. Without it
+Fineract cannot route to a database.
+- Where: read by `TenantAwareBasicAuthenticationFilter` and friends in
+  `fineract-security`.
+
+### FineractProperties
+Typed wrapper around the `fineract.*` keys in `application.properties`.
+- Where: `fineract-core/.../infrastructure/core/config/FineractProperties.java`.
+
+## G
+
+### GL (General Ledger)
+The book of double-entry account balances. Fineract maintains a chart of
+accounts per tenant and posts journal entries as a side-effect of loan/savings
+transactions.
+- Where: `fineract-accounting/src/main/java/org/apache/fineract/accounting/`.
+
+### GLIM (Group Loan Individual Monitoring)
+Group loan model where individual members of a group hold *individual*
+sub-loans while the group's collateral and meetings are shared.
+- Where: `fineract-loan/.../loanaccount/` with `is_glim` flags on loan and
+  GLIM-specific service classes.
+
+### GSIM (Group Savings Individual Monitoring)
+Same idea as GLIM but for savings accounts.
+- Where: `fineract-savings/.../savings/` with `is_gsim` markers.
+
+### Group
+A formal grouping of clients used for solidarity lending or shared accounts.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/portfolio/group/`.
+
+## H
+
+### Holiday
+A non-working calendar day per office. Affects when scheduled repayments
+shift. Configurable via `m_holiday`.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/organisation/holiday/`.
+
+### Hook
+A configurable webhook fired on selected business events. Different from
+external events — hooks are tenant-configured HTTP callbacks.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/hooks/`.
+
+## I
+
+### Idempotency key
+The `Idempotency-Key` HTTP header. Hashed and stored on
+`m_portfolio_command_source` so duplicate retries return the original result
+instead of executing a second time.
+- Where: `fineract-command-jdbc/`.
+
+### Instance mode
+Which subset of Fineract a node runs: read, write, batch-manager,
+batch-worker. See `overview/runtime-and-deployment`.
+- Where: `fineract-provider/.../infrastructure/instancemode/`
+  + the `fineract.mode.*` properties.
+
+### Interoperation
+The Mojaloop interoperable payment hub integration that lets Fineract act as a
+Digital Financial Service Provider in cross-network transfers.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/interoperation/`.
+
+## J
+
+### Jersey
+The JAX-RS implementation that hosts every `*ApiResource` in Fineract. The
+servlet is registered at `/api/v1/*`.
+- Where: `fineract-provider/.../infrastructure/jersey/`.
+
+### JLG (Joint Liability Group)
+A solidarity-lending group where members co-guarantee each other's individual
+loans.
+- Where: `fineract-loan/.../portfolio/group/` plus group-loan service paths.
+
+### Journal entry
+A single debit-or-credit line posted to the GL. Loans/savings transactions
+generate balanced sets of journal entries.
+- Where: `fineract-accounting/src/main/java/org/apache/fineract/accounting/journalentry/`.
+
+### Job (scheduled)
+A Quartz-triggered Spring Batch job (interest posting, COB, journal-entry
+aggregation, etc.). Each row in `m_job` maps to a `JobName` enum value.
+- Where: `fineract-provider/.../infrastructure/jobs/`,
+  jobs themselves in `**/jobs/` packages per domain.
+
+## K
+
+### Kafka
+The default external event broker Fineract supports. The Docker compose
+variants `docker-compose-postgresql-kafka*.yml` show the topology.
+- Where: configuration under `application.properties`
+  + `docker-compose-postgresql-kafka.yml`.
+
+### KYC (Know Your Customer)
+Customer due-diligence data captured at client onboarding. In Fineract this
+is typically modelled with custom datatables hanging off `m_client`
+rather than fixed columns.
+- Where: client domain + datatables; tenant-specific.
+
+## L
+
+### Liquibase
+The schema-migration tool Fineract uses. Migrations are XML changelogs.
+- Where: `fineract-provider/src/main/resources/db/changelog/`
+  + `fineract-core/.../service/migration/`.
+
+### Loan product
+A reusable template that defines the terms (interest method, repayment
+frequency, accounting rule, charges, …) from which individual loans are
+created.
+- Where: `fineract-loan/.../portfolio/loanproduct/domain/LoanProduct.java`.
+
+## M
+
+### Maker-checker
+A workflow where one user (the *maker*) submits a write command and a second
+user (the *checker*) must approve it before it executes. Implemented natively
+by the command pipeline — the maker's command is persisted in
+`awaitingApproval` state.
+- Where: `fineract-command/.../service/PortfolioCommandSourceWritePlatformService`.
+
+### MIX (Microfinance Information eXchange)
+Industry-standard reporting taxonomy for microfinance institutions. Fineract
+exports a MIX-shaped report via the `fineract-mix` module.
+- Where: `fineract-mix/`.
+
+### Mojaloop
+The Bill & Melinda Gates Foundation reference implementation for
+interoperable payments. Fineract integrates as a DFSP — see *Interoperation*.
+- Where: `fineract-provider/.../interoperation/`.
+
+### Multi-tenancy
+Fineract runs many institutions out of one process, each with its own
+database. The *tenant store* lists all tenants; each tenant has its own
+schema.
+- Where: `fineract-core/.../service/tenant/DataSourcePerTenantService.java`.
+
+## N
+
+### NPA (Non-Performing Asset)
+A loan past a certain delinquency threshold, after which it stops accruing
+income and must be written down. In Fineract, the delinquency buckets and
+write-off rules implement this.
+- Where: `fineract-loan/.../portfolio/delinquency/` and write-off
+  transactions in `loanaccount/`.
+
+### Note
+A free-text annotation attached to a client, group, account, or transaction.
+- Where: `fineract-provider/.../portfolio/note/`.
+
+## O
+
+### OAuth2 resource server
+Alternative authentication flavour where the inbound token is a JWT signed
+by an external authorisation server. Enabled with
+`fineract.security.oauth2.enabled`.
+- Where: `fineract-security/`.
+
+### Office
+The organisational unit a client belongs to — a branch or head office.
+Office hierarchy is a tree.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/organisation/office/`.
+
+### Outbox
+The transactional outbox pattern used for external events: a row is
+inserted into `m_external_event` in the same transaction as the business
+write, then a poller relays it to Kafka/JMS.
+- Where: `fineract-provider/.../infrastructure/event/external/`.
+
+## P
+
+### Permission
+A fine-grained authorisation right (`CREATE_LOAN`, `APPROVE_LOAN`, …).
+Permissions roll up into roles.
+- Where: `fineract-core/.../useradministration/domain/Permission.java`.
+
+### PostgreSQL
+The recommended database. The `README.md` notes "support for other backend
+databases is deprecated" (FSIP-9).
+- Where: connection settings in `application.properties`,
+  compose stack in `docker-compose-postgresql*.yml`.
+
+### Progressive loan
+A second loan engine (declining-balance with advance-payment allocation)
+shipped as `fineract-progressive-loan`. Opt-in per product.
+- Where: `fineract-progressive-loan/` +
+  `fineract-progressive-loan-embeddable-schedule-generator/`.
+
+## Q
+
+### Quartz
+The scheduler library Fineract uses to fire jobs. Each tenant gets its own
+Quartz scheduler instance.
+- Where: `fineract-provider/.../infrastructure/jobs/SchedulerJobListener.java`
+  and friends.
+
+## R
+
+### Read platform service
+A read-only service that uses `NamedParameterJdbcTemplate` and hand-written
+SQL to return DTOs (`*Data` classes). Bypasses the command pipeline.
+- Where: `*ReadPlatformServiceImpl.java` in each domain.
+
+### Role
+A named set of permissions assigned to an `AppUser`.
+- Where: `fineract-core/.../useradministration/domain/Role.java`.
+
+## S
+
+### Savings product
+The savings analogue of a loan product. Used for share, fixed, recurring, and
+flexible savings accounts.
+- Where: `fineract-savings/.../portfolio/savings/domain/SavingsProduct.java`.
+
+### Self-service user
+A restricted `AppUser` flavour granted only to end-customers using the
+self-service web/mobile app. Their role limits them to their own
+client/group's data.
+- Where: `fineract-provider/.../portfolio/self/`.
+
+### SPM (Social Performance Management)
+A scorecard module for capturing social-impact data per client / loan, used by
+microfinance institutions to report on their non-financial mission.
+- Where: `fineract-provider/src/main/java/org/apache/fineract/spm/`.
+
+### Static weaving
+Build-time bytecode enhancement of JPA entities by EclipseLink. Removes the
+need for a runtime agent.
+- Where: `STATIC_WEAVING.md`, `static-weaving.gradle`.
+
+### System date
+The wall-clock date according to the JVM. Differs from *business date*
+when COB has not yet been run for the operational day.
+- Where: `BusinessDateType.SYSTEM_DATE`.
+
+## T
+
+### Tenant
+One financial institution running on this Fineract installation. Has its own
+database, its own `AppUser`s, its own configurations.
+- Where: `FineractPlatformTenant` in `fineract-core/.../core/domain/`.
+
+### Tenant store
+The *meta* database — usually named `fineract_tenants` — that lists every
+tenant and the connection details for the tenant database.
+- Where: `application.properties` (`fineract.tenant.*`)
+  + `fineract-core/.../service/tenant/`.
+
+### Tenant vs. tenant store
+- **Tenant database**: the institution's own data
+  (e.g. `fineract_default`).
+- **Tenant store database**: the registry of all tenants
+  (`fineract_tenants`).
+
+### Two-factor auth (2FA)
+Optional second factor (OTP) layered on top of basic or OAuth2 auth.
+- Where: `twofactor-tests/` for the integration suite, code in
+  `fineract-security/`.
+
+## U
+
+### UCI (Unique Client Identifier)
+The institution-defined external identifier for a client. Often a national ID.
+- Where: `m_client.external_id`.
+
+### Undo (transaction)
+The standard Fineract transaction reversal pattern: the original journal
+entries are reversed and a new transaction with `is_reversed=true` is left in
+place as an audit trail.
+- Where: `LoanTransaction.reverse()` and equivalents.
+
+## V
+
+### Validator (`DataValidatorBuilder`)
+The fluent JSON validation helper used by every `serialization/` class to
+parse a `JsonCommand` and raise `PlatformApiDataValidationException` on bad
+input.
+- Where: `fineract-core/.../infrastructure/core/data/DataValidatorBuilder.java`.
+
+## W
+
+### WAR
+Web archive — Fineract can be repackaged as a `.war` via `fineract-war` for
+deployment to an external Tomcat 10+ or Jetty. The default is the embedded
+Spring Boot JAR.
+- Where: `fineract-war/build.gradle`.
+
+### Working days
+The configured business-day-of-week pattern per tenant. Determines schedule
+recalculations alongside *Holidays*.
+- Where: `m_working_days` table and
+  `fineract-provider/.../organisation/workingdays/`.
+
+### Write platform service
+The transactional service that actually mutates aggregates — invoked from the
+command pipeline, not directly from `*ApiResource`.
+- Where: `*WritePlatformServiceJpaRepositoryImpl.java` in each domain.
+
+## X
+
+### X.509 keystore
+The TLS material used by Fineract's embedded HTTPS server, by default the
+self-signed `keystore.jks` shipped at
+`fineract-provider/src/main/resources/keystore.jks`. Always replace in
+production.
+
+## Y
+
+### YAML compose files
+The dozen `docker-compose-*.yml` files at the repo root that assemble runnable
+stacks from fragments in `config/docker/compose/`.
+
+## Z
+
+### Zulu (Azul Zulu JDK)
+The JDK the project's CI tests against, per `README.md`: "Azul Zulu JVM is
+tested by our CI on GitHub Actions." Any Java 21 JDK should work.
+
+## Further reading
+
+<CardGroup cols={2}>
+<Card title="Architecture" href="/overview/architecture">
+How most of these terms wire together into a single request flow.
+</Card>
+<Card title="Repository layout" href="/overview/repository-layout">
+Where each module lives.
+</Card>
+<Card title="Module graph" href="/overview/module-graph">
+Dependency arrows between modules.
+</Card>
+<Card title="Runtime & deployment" href="/overview/runtime-and-deployment">
+Putting tenants, instance modes, and Docker/Kubernetes together.
+</Card>
+</CardGroup>

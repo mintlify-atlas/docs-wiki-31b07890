@@ -1,0 +1,317 @@
+---
+title: "Document and Image Management API in Apache Fineract"
+sidebarTitle: "Document API"
+description: "Attach files and images to any parent entity in Apache Fineract through the polymorphic Document API, with full CRUD, lifecycle, and content-store integration."
+---
+
+Apache Fineract gives every domain object — clients, loans, savings,
+groups, offices, employees, etc. — the ability to carry **attached
+documents** and **avatar images** through a single, polymorphic API. The
+parent entity type is a path parameter, the binary content is streamed
+through Fineract's content store (filesystem or S3), and metadata lives in
+the `m_document` / `m_image` tables.
+
+The whole feature ships as the dedicated `fineract-document` module so it
+can be wired in or omitted without touching the main provider.
+
+## Module layout
+
+```text
+fineract-document/src/main/java/org/apache/fineract/infrastructure/documentmanagement/
+├── api/
+│   ├── DocumentApiConstants.java
+│   ├── DocumentApiResource.java
+│   ├── FileUploadValidator.java
+│   ├── ImageApiConstants.java
+│   └── ImagesApiResource.java
+├── command/                 # Create / Update / Delete commands
+├── data/                    # Request / Response / Data DTOs
+├── domain/
+│   ├── Document.java
+│   ├── DocumentRepository.java
+│   ├── Image.java
+│   └── ImageRepository.java
+├── exception/
+├── handler/                 # Command handlers
+├── mapping/
+└── service/                 # Read / write services
+```
+
+## The `Document` aggregate
+
+`Document` is a Spring Data JDBC entity mapped to `m_document`
+(`fineract-document/src/main/java/org/apache/fineract/infrastructure/documentmanagement/domain/Document.java`):
+
+```java
+@Table("m_document")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor
+@Accessors(chain = true)
+@FieldNameConstants
+public final class Document implements Serializable {
+
+    @Id @Column("id") private Long id;
+
+    @Column("parent_entity_type") private String parentEntityType;
+    @Column("parent_entity_id")   private Long parentEntityId;
+    @Column("name")               private String name;
+    @Column("file_name")          private String fileName;
+    // ... description, type, size, storage_type_enum, location
+}
+```
+
+The `parent_entity_type` / `parent_entity_id` pair is the polymorphism
+trick: instead of a hard FK to `m_client`, `m_loan` etc., the document
+carries the *name* of the parent collection (`clients`, `loans`,
+`savings`, `groups`, `offices`, `staff`, `imports`, …) along with the
+parent's own primary key. The same mechanism drives `m_image` for
+profile pictures.
+
+The repository (`DocumentRepository`) lives next door and exposes the
+standard Spring Data CRUD plus the `findByParentEntityTypeAndParentEntityId`
+look-up that the read service uses to list documents per parent.
+
+## REST surface — `DocumentApiResource`
+
+The resource is rooted at a *templated* path so the same controller
+handles every parent kind
+(`fineract-document/src/main/java/org/apache/fineract/infrastructure/documentmanagement/api/DocumentApiResource.java`):
+
+```java
+@Path("/v1/{entityType}/{entityId}/documents")
+```
+
+Endpoints exposed:
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET    | `/v1/{entityType}/{entityId}/documents` | List documents for a parent |
+| GET    | `/v1/{entityType}/{entityId}/documents/{documentId}` | Metadata for one document |
+| GET    | `/v1/{entityType}/{entityId}/documents/{documentId}/attachment` | Stream the binary content |
+| POST   | `/v1/{entityType}/{entityId}/documents` | Multipart upload — creates `Document` + content-store entry |
+| PUT    | `/v1/{entityType}/{entityId}/documents/{documentId}` | Replace the binary and/or update metadata |
+| DELETE | `/v1/{entityType}/{entityId}/documents/{documentId}` | Remove both row and content-store object |
+
+Example listing:
+
+```java
+@GET
+public List<DocumentData> retrieveAllDocuments(
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_TYPE) final String entityType,
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_ID)   final Long entityId) {
+    // ...
+}
+```
+
+`DocumentApiConstants` defines the field names used both in path
+parameters and in the multipart form (`entityType`, `entityId`,
+`documentId`, `name`, `description`, `file`).
+
+### Supported parent entity types
+
+The same controller accepts any of the following as `{entityType}`:
+
+`clients`, `loans`, `client_identifiers`, `staff`, `savings`,
+`groups`, `offices`, `image`, `imports`. The server-side validator in
+`FileUploadValidator` rejects unknown values with a
+`PlatformApiDataValidationException`.
+
+### Multipart create
+
+```http
+POST /fineract-provider/api/v1/clients/12/documents
+Content-Type: multipart/form-data; boundary=----------XYZ
+
+------------XYZ
+Content-Disposition: form-data; name="name"
+
+Passport copy
+------------XYZ
+Content-Disposition: form-data; name="description"
+
+Front page only
+------------XYZ
+Content-Disposition: form-data; name="file"; filename="passport.png"
+Content-Type: image/png
+
+<binary>
+```
+
+The controller wires the parts into a `DocumentCreateCommand`, which the
+`CommandDispatcher` routes to the `DocumentCreateCommandHandler` under
+`fineract-document/.../documentmanagement/handler/`.
+
+```mermaid
+flowchart LR
+  Client[HTTP multipart] --> Resource[DocumentApiResource]
+  Resource --> Validator[FileUploadValidator]
+  Validator --> Detector[ContentDetectorManager<br/>Tika MIME sniff]
+  Detector --> Handler[DocumentCreateCommandHandler]
+  Handler --> Store[ContentStoreService<br/>filesystem or S3]
+  Handler --> Repo[(m_document)]
+  Store --> Returned[location stored on row]
+```
+
+## The `Image` aggregate
+
+`Image` is the avatar-style cousin of `Document`. Same polymorphic
+parent fields, but only one row per parent (a `PUT` replaces it), and
+the URL of the binary is the *only* metadata stored — there is no
+description or display name.
+
+`ImagesApiResource`
+(`fineract-document/src/main/java/org/apache/fineract/infrastructure/documentmanagement/api/ImagesApiResource.java`)
+is rooted under the same parent path:
+
+```text
+/v1/{entityType}/{entityId}/images
+```
+
+and supports POST (set), GET (download — optionally Base64 / data URL
+encoded, optionally resized via Tika's image processor), and DELETE.
+The image API leverages the content-store **content processors**
+through the static parameter names imported from the contentstore
+package:
+
+```java
+import static org.apache.fineract.infrastructure.contentstore.processor.ImageResizeContentProcessor.IMAGE_RESIZE_PARAM_MAX_WIDTH;
+import static org.apache.fineract.infrastructure.contentstore.processor.ImageResizeContentProcessor.IMAGE_RESIZE_PARAM_MAX_HEIGHT;
+import static org.apache.fineract.infrastructure.contentstore.processor.DataUrlEncoderContentProcessor.DATA_URL_ENCODE_PARAM_ENCODING;
+```
+
+so a single GET can ask for an inline octet-stream, an attachment, or a
+base64-encoded data URL — sized for a card vs. a full profile shot —
+all of which are computed by the content-store pipeline (see the
+content-store policies page).
+
+## Lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Created : POST multipart
+  Created --> Metadata_Updated : PUT (no file)
+  Created --> Binary_Replaced  : PUT (with file)
+  Created --> Removed          : DELETE
+  Binary_Replaced --> Binary_Replaced
+  Metadata_Updated --> Binary_Replaced
+  Metadata_Updated --> Removed
+  Binary_Replaced --> Removed
+  Removed --> [*]
+```
+
+- **Create.** `DocumentCreateCommandHandler` sanitises the path,
+  invokes `ContentDetectorManager` to identify the MIME type, calls
+  `ContentStoreService.upload(...)`, then persists the row with
+  `storage_type_enum` set to whichever store handled the write.
+- **Update.** When the PUT carries a file, the handler uploads the
+  replacement object first, then updates `location` on the row, then
+  asynchronously deletes the previous object.
+- **Download.** `GET /attachment` calls `ContentStoreService.download(location)`
+  and streams the result with `Content-Disposition: attachment`.
+- **Delete.** Removes the database row and the underlying blob — with
+  the configured `DefaultDeleteContentPolicy` providing the safety
+  checks (no traversal outside the bucket / directory, etc.).
+
+## Storage location
+
+`m_document.location` is the **path inside whichever content store**
+handled the upload, not an absolute file system path. The actual
+location is decided by the configured `ContentStoreService` bean:
+
+- `FileContentStoreService`
+  (`fineract-document/.../contentstore/service/FileContentStoreService.java`)
+  writes under `${fineract.content.filesystem.root}/<tenant>/<sanitized-path>`.
+- `S3ContentStoreService`
+  (`fineract-document/.../contentstore/service/S3ContentStoreService.java`)
+  writes the same key into the configured S3 bucket.
+
+The provider page explains how the two services are selected by
+`@ConditionalOnProperty` and how their pre/post-upload pipelines wire
+in the policy and detector components.
+
+## Validation
+
+`FileUploadValidator`
+(`fineract-document/.../documentmanagement/api/FileUploadValidator.java`)
+runs before the command is dispatched. It checks:
+
+- The `entityType` is one of the supported values.
+- The reported `Content-Length` matches the multipart payload length
+  (anti-spoofing — `Long fileSize` is read from the `Content-Length`
+  HTTP header in the resource).
+- The `name` and `file` parts are present.
+
+Once validation passes, the actual MIME-type sniff happens later in the
+content-store pipeline through `ContentDetectorManager` (Tika), which
+ensures the *content* matches the *declared* type and that the type is
+on the whitelist.
+
+## Image endpoints in practice
+
+<CodeGroup>
+```bash Upload avatar
+curl -X POST \
+  -F "file=@/tmp/avatar.png" \
+  -H "Authorization: Basic ..." \
+  -H "Fineract-Platform-TenantId: default" \
+  https://fineract.example.com/fineract-provider/api/v1/clients/12/images
+```
+
+```bash Fetch resized as data URL
+curl -G \
+  --data-urlencode "maxWidth=128" \
+  --data-urlencode "maxHeight=128" \
+  --data-urlencode "output=inline_octet" \
+  --data-urlencode "encoding=base64" \
+  -H "Accept: text/plain" \
+  https://fineract.example.com/fineract-provider/api/v1/clients/12/images
+```
+
+```bash Delete avatar
+curl -X DELETE \
+  https://fineract.example.com/fineract-provider/api/v1/clients/12/images
+```
+</CodeGroup>
+
+## Common operational tasks
+
+<AccordionGroup>
+<Accordion title="Allow a new MIME type">
+Edit the whitelist in
+`fineract-document/.../contentstore/policy/WhitelistContentPolicy.java`
+or override the
+`fineract.content.policy.whitelist.*` properties. The Tika detector
+will still verify the actual bytes match.
+</Accordion>
+
+<Accordion title="Migrate document blobs from filesystem to S3">
+Switch the content-store flag (`fineract.content.s3.enabled=true`,
+`fineract.content.filesystem.enabled=false`) and run a one-time
+migration job that streams every `m_document.location` value out of the
+old store and back into the new one through `ContentStoreService` —
+the database rows themselves do not need to change because the key is
+the same.
+</Accordion>
+
+<Accordion title="Bulk delete documents for a closed client">
+Cascade is intentionally **not** at the DB level — the polymorphic FK
+isn't enforceable. The client close handler explicitly queries
+`m_document` by `(parent_entity_type='clients', parent_entity_id=?)`
+and dispatches a `DocumentDeleteCommand` for each row.
+</Accordion>
+
+<Accordion title="Hot-swap a profile picture without breaking the URL">
+`POST /v1/{entityType}/{entityId}/images` is idempotent for the same
+parent — it replaces the binary and the row in place. Existing GET
+URLs continue to work and serve the new bytes on the next download.
+</Accordion>
+</AccordionGroup>
+
+## Related reading
+
+- Content-store providers — see the next page for how the filesystem
+  and S3 implementations are selected.
+- S3 content store — environment-driven configuration and Localstack
+  testing.
+- Content-store policies / detectors / processors — the whitelist,
+  Tika sniffing, traversal guard and image-resize pipeline that this
+  API plugs into.

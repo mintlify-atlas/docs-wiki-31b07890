@@ -1,0 +1,411 @@
+---
+title: "Apache Fineract Repository Layout & Modules"
+sidebarTitle: "Repository Layout"
+description: "Annotated map of the Apache Fineract Gradle multi-module repository: every fineract-* module, custom extensions, Docker and Kubernetes assets."
+---
+
+Apache Fineract is a Gradle multi-project build. The root `settings.gradle`
+declares roughly thirty subprojects, plus a dynamic loader for *custom*
+modules. This page walks through every top-level directory and every
+`fineract-*` module so you can find a feature, contribute a fix, or wire a new
+extension without spelunking.
+
+<Note>
+The canonical list of modules is `settings.gradle` at the repository root.
+If you add a module there, the dynamic `custom/<company>/<category>/<module>`
+loader at the bottom of the same file will not pick it up — only directories
+under `custom/` are auto-included.
+</Note>
+
+## Top-level directory map
+
+```text
+fineract/
+├── settings.gradle              ← module list (source of truth)
+├── build.gradle                 ← root build script
+├── buildSrc/                    ← shared Gradle plugins and conventions
+├── gradle.properties            ← root Gradle properties
+├── static-weaving.gradle        ← JPA static weaving config (see STATIC_WEAVING.md)
+├── config/                      ← Checkstyle, SpotBugs, Docker compose fragments, env files
+├── docker/                      ← Dockerfile sources for the Fineract image
+├── docker-compose*.yml          ← 12 compose variants (see runtime-and-deployment)
+├── kubernetes/                  ← Sample k8s manifests
+├── scripts/                     ← Shell helpers used by CI and developers
+├── custom/                      ← Drop-in custom modules (dynamically included)
+│
+├── fineract-core/                                ← Foundation: tenancy, JPA, events, jobs
+├── fineract-security/                            ← Spring Security filters, basic / OAuth2 / 2FA
+├── fineract-validation/                          ← Cross-cutting validation primitives
+├── fineract-command/                             ← Command-source pipeline (write path)
+├── fineract-command-test/                        ← Shared test utilities for the pipeline
+├── fineract-command-jdbc/                        ← JDBC projections / idempotency
+├── fineract-command-audit/                       ← Audit logging on top of command source
+├── fineract-command-async/                       ← Async (worker) command execution
+├── fineract-command-disruptor/                   ← LMAX Disruptor variant for hot paths
+├── fineract-cob/                                 ← Close-of-Business orchestration
+├── fineract-accounting/                          ← General ledger, journal entries
+├── fineract-charge/                              ← Charges / fees / penalties
+├── fineract-tax/                                 ← Tax components and groups
+├── fineract-rates/                               ← Rate definitions (loan rates etc.)
+├── fineract-branch/                              ← Branch / office hierarchy add-ons
+├── fineract-document/                            ← Document attachment storage
+├── fineract-investor/                            ← External asset owner / participation
+├── fineract-loan/                                ← Standard loan product
+├── fineract-loan-origination/                    ← Loan application / origination workflow
+├── fineract-progressive-loan/                    ← Progressive (declining-balance) loan engine
+├── fineract-progressive-loan-embeddable-schedule-generator/
+├── fineract-working-capital-loan/                ← Working-capital revolving loan
+├── fineract-savings/                             ← Savings, fixed deposit, recurring deposit
+├── fineract-report/                              ← Pentaho / SQL report integration
+├── fineract-mix/                                 ← MIX Market reporting standard
+├── fineract-avro-schemas/                        ← Avro schemas for external events
+├── fineract-client/                              ← Generated Java client SDK
+├── fineract-client-feign/                        ← Generated Feign-based client SDK
+├── fineract-doc/                                 ← AsciiDoc end-user documentation
+├── fineract-db/                                  ← Bootstrap SQL & legacy schema files
+├── fineract-provider/                            ← Spring Boot application: assembles everything
+├── fineract-war/                                 ← WAR packaging for external Tomcat
+│
+├── integration-tests/                            ← End-to-end REST integration tests
+├── twofactor-tests/                              ← 2FA-specific integration tests
+├── oauth2-tests/                                 ← OAuth2-specific integration tests
+├── fineract-e2e-tests-core/                      ← Shared e2e test infrastructure
+└── fineract-e2e-tests-runner/                    ← e2e test runner
+```
+
+## `settings.gradle` excerpt
+
+```groovy
+rootProject.name='fineract'
+include ':fineract-core'
+include ':fineract-security'
+include ':fineract-cob'
+include ':fineract-validation'
+include ':fineract-command'
+include ':fineract-command-test'
+include ':fineract-command-jdbc'
+include ':fineract-command-audit'
+include ':fineract-command-async'
+include ':fineract-command-disruptor'
+include ':fineract-accounting'
+include ':fineract-provider'
+include ':fineract-branch'
+include ':fineract-document'
+include ':fineract-investor'
+include ':fineract-rates'
+include ':fineract-charge'
+include ':fineract-tax'
+include ':fineract-loan-origination'
+include ':fineract-loan'
+include ':fineract-savings'
+include ':fineract-report'
+include ':fineract-mix'
+include ':fineract-war'
+include ':integration-tests'
+include ':twofactor-tests'
+include ':oauth2-tests'
+include ':fineract-client'
+include ':fineract-client-feign'
+include ':fineract-doc'
+include ':fineract-avro-schemas'
+include ':fineract-e2e-tests-core'
+include ':fineract-e2e-tests-runner'
+include 'fineract-progressive-loan'
+include 'fineract-progressive-loan-embeddable-schedule-generator'
+include 'fineract-working-capital-loan'
+include ':custom:docker'
+// NOTE: dynamically load custom modules with pattern "custom -> company -> category -> module"
+```
+
+## Foundation modules
+
+<CardGroup cols={2}>
+<Card title="fineract-core" icon="cube">
+Foundation everyone depends on: tenant resolution, EclipseLink/JPA config,
+business event bus, Quartz wiring, base entities (`AbstractAuditableCustom`,
+`AppUser`), and JSON helpers. Path: `fineract-core/src/main/java/org/apache/fineract/infrastructure/`.
+</Card>
+<Card title="fineract-security" icon="lock">
+Spring Security filter chain, basic + OAuth2 + optional 2FA authentication,
+tenant-aware authentication filter, CORS and HSTS configuration. Depends only
+on `fineract-core`.
+</Card>
+<Card title="fineract-validation" icon="check">
+Cross-cutting validation primitives used by command handlers and JSON
+deserialisers. Has no Fineract project dependencies — it's pure validation
+helpers.
+</Card>
+<Card title="fineract-cob" icon="calendar">
+Close-of-Business orchestration framework: business step interfaces,
+Spring Batch job templates, batch business step service. Depended on by every
+domain that contributes COB steps.
+</Card>
+</CardGroup>
+
+<Card title="fineract-doc" icon="book">
+The AsciiDoc end-user / operator documentation rendered by `./gradlew :fineract-doc:asciidoctor`.
+This is not the same as the wiki you are reading — `fineract-doc` is the
+"book"; this wiki is the "code map".
+</Card>
+
+## The command pipeline modules
+
+The write path runs through five tightly-related modules. They share the
+package prefix `org.apache.fineract.commands.*` and persist into
+`m_portfolio_command_source`.
+
+| Module | Role |
+|--------|------|
+| `fineract-command` | Core `CommandSourceService`, `CommandWrapper`, `NewCommandSourceHandler`, maker-checker flow |
+| `fineract-command-test` | Test fixtures (handler stubs, command builders) shared by every domain's test suite |
+| `fineract-command-jdbc` | JDBC projections, idempotency key store |
+| `fineract-command-audit` | Periodic audit reports & projections on top of the command source table |
+| `fineract-command-async` | Asynchronous (worker-node) command execution, retries, polling |
+| `fineract-command-disruptor` | LMAX Disruptor implementation for very high-throughput write paths |
+
+See `overview/architecture` for the request-flow diagram these modules
+implement.
+
+## Domain (portfolio) modules
+
+Every portfolio module follows the same conventional sub-package layout:
+
+```text
+<module>/src/main/java/org/apache/fineract/<area>/<feature>/
+├── api/             ← JAX-RS resources (*ApiResource.java) + OpenAPI annotations
+├── data/            ← DTOs returned by *ReadPlatformService (read model)
+├── domain/          ← JPA entities, aggregate roots, repositories
+├── handler/         ← CommandSourceHandler implementations (@CommandType)
+├── service/         ← *ReadPlatformService + *WritePlatformService(JpaRepository)Impl
+├── serialization/   ← Gson JsonCommand parsers + DataValidator's
+├── jobs/            ← Spring Batch step / tasklet definitions
+├── exception/       ← PlatformException subclasses (HTTP error mappers)
+└── starter/         ← Spring @Configuration that wires the module's beans
+```
+
+The `starter` package is the integration seam — `fineract-provider`
+component-scans every module, but the actual bean wiring (e.g. choosing which
+`Impl` to bind) lives in each module's `*Configuration` class.
+
+### Loan products
+
+<CardGroup cols={2}>
+<Card title="fineract-loan" icon="money-bill">
+The classic Mifos/Fineract loan implementation: amortisation, repayment
+schedule, charges, delinquency. Depends on `fineract-core`, `fineract-cob`,
+`fineract-accounting`, `fineract-charge`, `fineract-rates`, `fineract-tax`.
+Top package: `org.apache.fineract.portfolio.loanaccount`.
+</Card>
+<Card title="fineract-loan-origination" icon="file-pen">
+Loan application workflow that produces a `Loan` aggregate when approved.
+Depends on `fineract-core`, `fineract-avro-schemas`, `fineract-loan`.
+</Card>
+<Card title="fineract-progressive-loan" icon="chart-line">
+Progressive (declining-balance + advance payment allocation) loan engine.
+Replaces the standard schedule generator for product types that opt in.
+Depends on `fineract-core`, `fineract-accounting`, `fineract-charge`,
+`fineract-loan`.
+</Card>
+<Card title="fineract-progressive-loan-embeddable-schedule-generator" icon="diagram-project">
+The schedule generator pulled out as a self-contained library so external
+tools (and `fineract-progressive-loan`) can call it without bringing in the
+full domain. Good entry point if you want to embed Fineract loan math
+elsewhere.
+</Card>
+<Card title="fineract-working-capital-loan" icon="repeat">
+Revolving working-capital loan product. Depends on `fineract-core`,
+`fineract-loan`, `fineract-accounting`, `fineract-cob`.
+</Card>
+</CardGroup>
+
+### Savings & related
+
+<Card title="fineract-savings" icon="piggy-bank">
+Savings, fixed deposits, recurring deposits and share accounts.
+Package root: `org.apache.fineract.portfolio.savings`. Depends on
+`fineract-core`, `fineract-cob`, `fineract-accounting`, `fineract-charge`,
+`fineract-rates`, `fineract-tax`.
+</Card>
+
+### Cross-cutting product domains
+
+| Module | Owns |
+|--------|------|
+| `fineract-accounting` | Chart of accounts, journal entries, GL closure, product-to-account mapping |
+| `fineract-charge` | Charges, fees, penalties; depends on `fineract-tax` |
+| `fineract-tax` | Tax groups, tax components |
+| `fineract-rates` | Reusable rate definitions consumed by loan/savings products |
+| `fineract-branch` | Office hierarchy and branch-specific add-ons (depends on `fineract-accounting`) |
+| `fineract-document` | Document attachment service + S3 / local storage |
+| `fineract-investor` | External asset owners and loan participation (used in syndication) |
+| `fineract-report` | Pentaho report integration and report mailing |
+| `fineract-mix` | MIX Market (microfinance reporting standard) export |
+
+### Event contract
+
+<Card title="fineract-avro-schemas" icon="file-code">
+Avro `.avsc` files defining the contract for events published to Kafka or JMS.
+Many domain modules depend on it so the event payload types are shared.
+</Card>
+
+## Application assembly
+
+<CardGroup cols={2}>
+<Card title="fineract-provider" icon="server">
+The Spring Boot application that scans and wires every other module. Owns
+`ServerApplication.main()`, Jersey configuration, the application-level
+properties, and the catch-all `infrastructure/` packages
+(`jobs`, `dataqueries`, `configuration`, `bulkimport`, `codes`, `s3`, `sms`,
+`gcm`, `hooks`, `campaigns`, `creditbureau`, `entityaccess`, `event`,
+`reportmailingjob`, `springbatch`, `survey`, `instancemode`).
+</Card>
+<Card title="fineract-war" icon="box">
+Re-packages `fineract-provider` as a deployable `.war` for an external Tomcat
+or Jetty. The default deployment is the Spring Boot self-contained JAR; this
+module exists for institutions that must deploy into a managed servlet
+container.
+</Card>
+</CardGroup>
+
+## Client SDKs
+
+<CardGroup cols={2}>
+<Card title="fineract-client" icon="plug">
+Retrofit2-based generated Java client SDK consumed by integration tests and
+by downstream applications.
+</Card>
+<Card title="fineract-client-feign" icon="plug-circle-bolt">
+OpenFeign-based generated client SDK — same API surface, different
+HTTP-client.
+</Card>
+</CardGroup>
+
+## Test modules
+
+| Module | Purpose |
+|--------|---------|
+| `integration-tests` | REST integration tests against a running server (basic-auth) |
+| `twofactor-tests` | Integration tests with 2FA enabled |
+| `oauth2-tests` | Integration tests with OAuth2 enabled |
+| `fineract-e2e-tests-core` | Shared e2e test infrastructure (Cucumber, Testcontainers) |
+| `fineract-e2e-tests-runner` | Executes the `fineract-e2e-tests-core` scenarios |
+
+## Database & migrations
+
+<Card title="fineract-db" icon="database">
+Holds bootstrap SQL (`mifospltaform-tenants-first-time-install.sql`), legacy
+schema files (`old-schema-files/`) and multi-tenant demo backups. The
+runtime migrations themselves are Liquibase XML in
+`fineract-provider/src/main/resources/db/` and `fineract-core`'s
+`db/changelog` resources.
+</Card>
+
+## Docker, Kubernetes and ops
+
+### Docker
+
+`docker/` contains the `Dockerfile` source; `config/docker/` contains compose
+fragments and env files; `docker-compose*.yml` at the root assemble them into
+runnable stacks:
+
+| File | Stack |
+|------|-------|
+| `docker-compose.yml` | Default (MariaDB-based legacy) |
+| `docker-compose-postgresql.yml` | PostgreSQL only |
+| `docker-compose-postgresql-kafka.yml` | PostgreSQL + Kafka manager/worker split |
+| `docker-compose-postgresql-kafka-msk.yml` | PostgreSQL + AWS MSK Kafka |
+| `docker-compose-postgresql-activemq.yml` | PostgreSQL + ActiveMQ JMS |
+| `docker-compose-postgresql-test-activemq.yml` | PostgreSQL + ActiveMQ for test runs |
+| `docker-compose-mariadb.yml` | MariaDB (deprecated) |
+| `docker-compose-mysql.yml` | MySQL (deprecated) |
+| `docker-compose-development.yml` | Dev overrides (debugger ports, mounted source) |
+| `docker-compose-community-app.yml` | Add the community web app frontend |
+| `docker-compose-web-app.yml` | Add the standard web app frontend |
+| `docker-compose-custom.yml` | Build & run the `custom/docker` image |
+
+See `overview/runtime-and-deployment` for the underlying boot flags.
+
+### Kubernetes
+
+`kubernetes/` ships sample manifests that match the compose files:
+
+```text
+kubernetes/
+├── fineract-mifoscommunity-deployment.yml
+├── fineract-server-deployment.yml
+├── fineractmysql-configmap.yml
+├── fineractmysql-deployment.yml
+├── kubectl-startup.sh
+└── kubectl-shutdown.sh
+```
+
+The deployment YAMLs are templates; production users typically port these to a
+Helm chart of their own.
+
+## Custom modules
+
+The `custom/` directory plus the dynamic loader at the bottom of
+`settings.gradle` let you keep proprietary modules outside the apache/fineract
+tree while still letting them participate in the Gradle build:
+
+```text
+custom/
+├── docker/                      ← Custom Docker image including all custom modules
+└── <company>/<category>/<module>/    ← Auto-included if it has a build.gradle
+```
+
+The convention is `custom/<company>/<category>/<module>`. Anything matching
+that shape gets `include ':custom:<company>:<category>:<module>'` evaluated at
+build time.
+
+## Conventional package layout (recap)
+
+```mermaid
+flowchart LR
+    API[api/<br/>JAX-RS resources] --> SER[serialization/<br/>Gson + Validator]
+    SER --> HND[handler/<br/>CommandSourceHandler]
+    HND --> SVC[service/<br/>*WritePlatformService]
+    SVC --> DOM[domain/<br/>JPA entities + repos]
+    SVC --> DAT[data/<br/>DTOs for reads]
+    DOM --> DB[(PostgreSQL)]
+    JOB[jobs/<br/>Spring Batch steps] --> SVC
+    EXC[exception/<br/>PlatformException] -.thrown by.-> SVC
+    CFG[starter/<br/>@Configuration] -.wires.-> SVC
+    CFG -.wires.-> HND
+```
+
+<Tip>
+A useful sanity check: every domain module has roughly the same shape under
+`src/main/java/org/apache/fineract/`. If you can read one (start with
+`fineract-charge`, it is small), you can read the rest.
+</Tip>
+
+## Where to look for…
+
+| You want to… | Open |
+|--------------|------|
+| Add a REST endpoint | The relevant module's `**/api/*ApiResource.java` |
+| Add a write command | `*ApiResource` + `**/handler/*Handler.java` + `*WritePlatformService` |
+| Add a read query | `**/service/*ReadPlatformServiceImpl.java` (uses `NamedParameterJdbcTemplate`) |
+| Add a JPA entity / column | `**/domain/*.java` + a Liquibase changelog under `fineract-provider/src/main/resources/db/changelog/` |
+| Add a Quartz / Spring Batch job | `**/jobs/` + register in the `m_job` seed data |
+| Add a COB business step | `fineract-cob` + the domain's `cob/` package |
+| Publish an external event | `fineract-avro-schemas` + the domain's `event/` package |
+| Add config property | `fineract.*` in `fineract-provider/src/main/resources/application.properties` + `FineractProperties.java` in `fineract-core` |
+
+## Further reading
+
+<CardGroup cols={2}>
+<Card title="Architecture" href="/overview/architecture">
+How the modules talk: HTTP → command source → domain → JPA.
+</Card>
+<Card title="Module graph" href="/overview/module-graph">
+Inter-module dependency arrows derived from `build.gradle` files.
+</Card>
+<Card title="Runtime & deployment" href="/overview/runtime-and-deployment">
+Boot configurations and Docker/Kubernetes recipes.
+</Card>
+<Card title="Glossary" href="/overview/glossary">
+Domain and Fineract-specific terminology.
+</Card>
+</CardGroup>

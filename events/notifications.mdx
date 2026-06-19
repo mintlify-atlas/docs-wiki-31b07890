@@ -1,0 +1,567 @@
+---
+title: "Notifications — In-App User Alerts"
+sidebarTitle: "Notifications"
+description: "The Apache Fineract notification subsystem: how business events become NotificationData, how Spring or ActiveMQ ships them to NotificationEventListener, and how /v1/notifications serves them to the logged-in user."
+---
+
+Apache Fineract has a dedicated **in-app notification** subsystem that surfaces user-facing
+alerts inside the Fineract Web UI — "a new loan is awaiting your approval", "a savings account
+was activated", "interest has been posted to the accounts you watch", and so on. It piggybacks
+on the [business event bus](/events/business-events) for the **producer** side, but uses
+Spring's `ApplicationEventPublisher` (or an ActiveMQ queue when the cluster is in HA mode) for
+the **delivery** side and stores notifications in its own pair of tables so users can mark them
+read. This page walks the producer, transport, storage, cache, and REST surface end-to-end.
+
+## Where the code lives
+
+Everything sits in
+[`fineract-provider/src/main/java/org/apache/fineract/notification/`](https://github.com/apache/fineract/tree/develop/fineract-provider/src/main/java/org/apache/fineract/notification):
+
+```
+notification/
+├── api/             (NotificationApiResource, NotificationApiResourceSwagger)
+├── cache/           (CacheNotificationResponseHeader)
+├── config/          (MessagingConfiguration  — ActiveMQ wiring)
+├── data/            (NotificationData, NotificationMapperData)
+├── domain/          (Notification, NotificationMapper, repositories)
+├── eventandlistener/ (publishers + listeners for Spring / ActiveMQ)
+├── service/         (read & write services, generator & mapper services)
+└── starter/         (NotificationConfiguration — Spring Boot autoconfig)
+```
+
+## The two tables
+
+Notifications live in **two tables** so the same notification record can be displayed to
+multiple users without duplication:
+
+```java
+// fineract-provider/.../notification/domain/Notification.java
+@Entity
+@Table(name = "notification_generator")
+public class Notification extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "object_type")          private String objectType;       // "loan", "client", ...
+    @Column(name = "object_identifier")    private Long objectIdentifier;   // loan id, client id
+    @Column(name = "action")               private String action;           // "approved", "created"
+    @Column(name = "actor")                private Long actorId;            // user who caused it
+    @Column(name = "is_system_generated")  private boolean isSystemGenerated;
+    @Column(name = "notification_content") private String notificationContent;
+    @Column(name = "created_at")           private LocalDateTime createdAt;
+}
+```
+
+```java
+// fineract-provider/.../notification/domain/NotificationMapper.java
+@Entity
+@Table(name = "notification_mapper")
+public class NotificationMapper extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne @JoinColumn(name = "notification_id")
+    private Notification notification;
+
+    @ManyToOne @JoinColumn(name = "user_id")
+    private AppUser userId;
+
+    @Column(name = "is_read") private boolean isRead;
+    @Column(name = "created_at") private LocalDateTime createdAt;
+}
+```
+
+Pattern: **one row in `notification_generator`** per business event, **N rows in
+`notification_mapper`** — one per recipient user. The "is read" bit lives on the mapper row so
+users mark independent copies as read without affecting each other.
+
+The repositories `NotificationRepository` and `NotificationMapperRepository` are vanilla
+`JpaRepository` interfaces; the service layer (`NotificationGeneratorWritePlatformServiceImpl`
+and `NotificationMapperWritePlatformServiceImpl`) wraps them with simple CRUD plus the
+"fan-out N copies" logic.
+
+## End-to-end flow
+
+```mermaid
+flowchart LR
+    LBE[LoanApprovedBusinessEvent] -->|post-listener| NDS[NotificationDomainServiceImpl]
+    NDS -->|UserNotificationService.notifyUsers(...)| UNS[UserNotificationServiceImpl]
+    UNS -->|build NotificationData<br/>resolve recipients by permission/office| NEP[NotificationEventPublisher]
+
+    subgraph SPR [Default: Spring profile]
+        NEP -->|publishEvent| AC[ApplicationContext]
+        AC --> SNL[SpringNotificationEventListener]
+        SNL --> NEL[NotificationEventListener.receive]
+    end
+
+    subgraph AMQ [Profile: activeMqEnabled]
+        NEP -.->|jmsTemplate.send to NotificationQueue| Q[(ActiveMQ NotificationQueue)]
+        Q --> AML[ActiveMQNotificationEventListener]
+        AML --> NEL
+    end
+
+    NEL -->|notifyUsers(notificationData)| UNS2[UserNotificationServiceImpl#notifyUsers]
+    UNS2 --> G[(notification_generator)]
+    UNS2 --> M[(notification_mapper one row per user)]
+
+    API[/v1/notifications/] --> RPS[NotificationReadPlatformServiceImpl]
+    RPS --> G
+    RPS --> M
+    API -->|response with header| H[CacheNotificationResponseHeader]
+```
+
+The **publisher** picks a transport based on profile; the **listener** for that transport calls
+the same `NotificationEventListener.receive(...)` which delegates to
+`UserNotificationServiceImpl.notifyUsers(NotificationData)`. The latter writes the
+`notification_generator` row, builds one `notification_mapper` row per user-id in the recipient
+set, and persists everything atomically.
+
+## `NotificationDomainServiceImpl` — the producer
+
+The producer is itself a **business-event listener**. At startup,
+`NotificationDomainServiceImpl` registers a post-listener for every business event that should
+trigger a notification:
+
+```java
+// fineract-provider/.../notification/service/NotificationDomainServiceImpl.java
+@PostConstruct
+public void addListeners() {
+    businessEventNotifierService.addPostBusinessEventListener(
+        ClientCreateBusinessEvent.class, new ClientCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        SavingsApproveBusinessEvent.class, new SavingsAccountApprovedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        CentersCreateBusinessEvent.class, new CenterCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        GroupsCreateBusinessEvent.class, new GroupCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        SavingsDepositBusinessEvent.class, new SavingsAccountDepositListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        ShareProductDividentsCreateBusinessEvent.class, new ShareProductDividendCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        FixedDepositAccountCreateBusinessEvent.class, new FixedDepositAccountCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        RecurringDepositAccountCreateBusinessEvent.class, new RecurringDepositAccountCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        SavingsPostInterestBusinessEvent.class, new SavingsPostInterestListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanCreatedBusinessEvent.class, new LoanCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanApprovedBusinessEvent.class, new LoanApprovedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanCloseBusinessEvent.class, new LoanClosedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanChargebackTransactionBusinessEvent.class, new LoanChargebackTransactionListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanCloseAsRescheduleBusinessEvent.class, new LoanCloseAsRescheduledListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanTransactionMakeRepaymentPostBusinessEvent.class, new LoanMakeRepaymentListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        LoanProductCreateBusinessEvent.class, new LoanProductCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        SavingsCreateBusinessEvent.class, new SavingsAccountCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        SavingsCloseBusinessEvent.class, new SavingsAccountClosedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        ShareAccountCreateBusinessEvent.class, new ShareAccountCreatedListener());
+    businessEventNotifierService.addPostBusinessEventListener(
+        ShareAccountApproveBusinessEvent.class, new ShareAccountApprovedListener());
+}
+```
+
+So the list of events that produce notifications is **fixed in code** — you can subscribe to a
+new event by adding another `addPostBusinessEventListener(...)` call and a nested listener class
+that translates the event payload into a `userNotificationService.notifyUsers(...)` call.
+
+Each nested listener looks like:
+
+```java
+private final class LoanApprovedListener implements BusinessEventListener<LoanApprovedBusinessEvent> {
+    @Override public void onBusinessEvent(LoanApprovedBusinessEvent event) {
+        Loan loan = event.get();
+        userNotificationService.notifyUsers(
+            "APPROVE_LOAN",                                  // permission required to be notified
+            "loan",                                           // objectType
+            loan.getId(),                                     // objectIdentifier
+            "Loan with ID " + loan.getId() + " has been approved", // content
+            "approved",                                       // eventType
+            context.authenticatedUser().getId(),              // actor
+            loan.getOfficeId());                              // office scope
+    }
+}
+```
+
+## `UserNotificationServiceImpl` — building the recipient set
+
+`UserNotificationServiceImpl.notifyUsers(permission, objectType, ..., officeId)`
+([source](https://github.com/apache/fineract/blob/develop/fineract-provider/src/main/java/org/apache/fineract/notification/service/UserNotificationServiceImpl.java))
+is where the recipient set is derived:
+
+```java
+@Override
+public void notifyUsers(String permission, String objectType, Long objectIdentifier,
+                        String notificationContent, String eventType,
+                        Long appUserId, Long officeId) {
+
+    if (userNotificationSystemIsEnabled()) {
+        String tenantIdentifier = ThreadLocalContextUtil.getTenant().getTenantIdentifier();
+        Set<Long> userIds = getNotifiableUserIds(officeId, permission);
+        NotificationData notificationData = new NotificationData()
+                .setObjectType(objectType)
+                .setObjectId(objectIdentifier)
+                .setAction(eventType)
+                .setActorId(appUserId)
+                .setContent(notificationContent)
+                .setRead(false)
+                .setSystemGenerated(false)
+                .setTenantIdentifier(tenantIdentifier)
+                .setOfficeId(officeId)
+                .setUserIds(userIds);
+        try {
+            notificationEventPublisher.broadcastNotification(notificationData);
+        } catch (Exception e) {
+            // Avoid rethrowing - don't roll back the business transaction
+            log.error("Error while broadcasting notification event", e);
+        }
+    }
+}
+```
+
+The recipient algorithm in `getNotifiableUserIds(officeId, permission)`:
+
+1. Find all `AppUser` rows whose **office** matches (or whose office is an ancestor of, depending
+   on the org hierarchy).
+2. Intersect with the set of users that hold the required **permission** (`APPROVE_LOAN`,
+   `CREATE_CLIENT`, …) — that's why the producer always passes a permission string.
+3. Remove the actor itself.
+
+That's the "right group of people in the right office sees the right alert" rule. The whole call
+is wrapped in `try/catch` so a broker hiccup never rolls back the loan approval.
+
+`userNotificationSystemIsEnabled()` reads the property
+`fineract.notification.user-notification-system.enabled` (default `true`) — flipping it to
+`false` short-circuits the whole subsystem.
+
+## `NotificationData` — the wire payload
+
+`NotificationData` (in `notification/data/`) is the DTO that travels between publisher and
+listener. It implements `Serializable` because the ActiveMQ profile sends it as a JMS
+`ObjectMessage`. Key fields:
+
+| Field | Meaning |
+| --- | --- |
+| `objectType` | `"loan"`, `"client"`, `"savings"`, `"group"`… |
+| `objectId` | Aggregate identifier (loan id, client id…) |
+| `action` | `"created"`, `"approved"`, `"deposited"`… |
+| `actorId` | User who caused the change |
+| `content` | Human-readable text shown in the UI |
+| `tenantIdentifier` | Multi-tenant routing key |
+| `officeId` | Office scope used by recipient lookup |
+| `userIds` | The pre-computed recipient set |
+| `read`, `systemGenerated` | Flags |
+
+The DTO carries **the recipient set**, not just metadata, so the listener side does not need to
+re-run the (potentially slow) permission lookup — it just persists one mapper row per id.
+
+## Transport — Spring vs ActiveMQ
+
+There are two pairs of `*Publisher` / `*Listener` beans; exactly one pair is active depending on
+the Spring profile.
+
+### Default — Spring's in-process event bus
+
+```java
+// fineract-provider/.../notification/eventandlistener/SpringNotificationEventPublisher.java
+@Service
+@Profile("!activeMqEnabled")
+@RequiredArgsConstructor
+@Slf4j
+public class SpringNotificationEventPublisher implements NotificationEventPublisher {
+
+    private final ApplicationEventPublisher applicationEventPublisher;
+
+    @Override
+    public void broadcastNotification(final NotificationData notificationData) {
+        log.debug("Sending Spring notification event: {}", notificationData);
+        NotificationEvent event = new NotificationEvent(
+            SpringNotificationEventPublisher.class, notificationData, ThreadLocalContextUtil.getContext());
+        applicationEventPublisher.publishEvent(event);
+    }
+}
+```
+
+```java
+// fineract-provider/.../notification/eventandlistener/SpringNotificationEventListener.java
+@Component
+@Profile("!activeMqEnabled")
+@RequiredArgsConstructor
+@Slf4j
+public class SpringNotificationEventListener implements ApplicationListener<NotificationEvent> {
+
+    private final NotificationEventListener notificationEventListener;
+
+    @Override
+    public void onApplicationEvent(@NonNull final NotificationEvent event) {
+        log.debug("Processing Spring notification event {}", event);
+        try {
+            ThreadLocalContextUtil.init(event.getContext());
+            final NotificationData notificationData = event.getNotificationData();
+            notificationEventListener.receive(notificationData);
+        } finally {
+            ThreadLocalContextUtil.reset();
+        }
+    }
+}
+```
+
+This profile is the **single-node default** — everything runs in-process on the publisher's
+thread. Cheap, but doesn't fan out across nodes.
+
+### `activeMqEnabled` profile — JMS for HA
+
+When you run multiple Fineract nodes and want all of them to surface the notification to UI
+sessions that may be attached to any node, you switch profile to `activeMqEnabled` and the JMS
+beans take over:
+
+```java
+// fineract-provider/.../notification/eventandlistener/ActiveMQNotificationEventPublisher.java
+@Service
+@Profile("activeMqEnabled")
+@Conditional(EnableFineractEventsCondition.class)
+@RequiredArgsConstructor
+public class ActiveMQNotificationEventPublisher implements NotificationEventPublisher {
+
+    private final JmsTemplate jmsTemplate;
+
+    @Override
+    public void broadcastNotification(NotificationData notificationData) {
+        Queue queue = new ActiveMQQueue("NotificationQueue");
+        this.jmsTemplate.send(queue, session -> session.createObjectMessage(notificationData));
+    }
+}
+```
+
+```java
+// fineract-provider/.../notification/eventandlistener/ActiveMQNotificationEventListener.java
+@Component
+@Profile("activeMqEnabled")
+@Conditional(EnableFineractEventListenerCondition.class)
+@RequiredArgsConstructor
+public class ActiveMQNotificationEventListener implements SessionAwareMessageListener {
+
+    private final NotificationEventListener notificationEventListener;
+
+    @Override
+    public void onMessage(Message message, Session session) throws JMSException {
+        if (message instanceof ObjectMessage) {
+            NotificationData notificationData = (NotificationData) ((ObjectMessage) message).getObject();
+            notificationEventListener.receive(notificationData);
+        }
+    }
+}
+```
+
+The wiring lives in
+[`MessagingConfiguration`](https://github.com/apache/fineract/blob/develop/fineract-provider/src/main/java/org/apache/fineract/notification/config/MessagingConfiguration.java),
+which builds an `ActiveMQConnectionFactory`, wraps it in `CachingConnectionFactory`, exposes a
+`JmsTemplate`, and registers a `DefaultMessageListenerContainer` against `NotificationQueue`.
+The broker URL defaults to `tcp://localhost:61616` and can be overridden by the `brokerUrl`
+environment property.
+
+Note the two conditions:
+
+- `EnableFineractEventsCondition` — gates the publisher and the broker beans.
+- `EnableFineractEventListenerCondition` — gates the listener. Run nodes with the listener off
+  if you want them to only **emit** notifications and not consume the queue (rare).
+
+## `NotificationEventListener` — landing zone
+
+Both transports converge on a single bean:
+
+```java
+// fineract-provider/.../notification/eventandlistener/NotificationEventListener.java
+@Service
+@RequiredArgsConstructor
+public class NotificationEventListener {
+
+    private final UserNotificationService userNotificationService;
+
+    public void receive(NotificationData notificationData) {
+        userNotificationService.notifyUsers(notificationData);
+    }
+}
+```
+
+`UserNotificationServiceImpl.notifyUsers(NotificationData)` (the no-permission overload) then
+writes the `notification_generator` row and creates one `notification_mapper` row per user id
+in `notificationData.getUserIds()`.
+
+## `/v1/notifications` — the REST surface
+
+```java
+// fineract-provider/.../notification/api/NotificationApiResource.java
+@Path("/v1/notifications")
+@Component
+@Tag(name = "Notification")
+@RequiredArgsConstructor
+public class NotificationApiResource {
+
+    private final PlatformSecurityContext context;
+    private final NotificationReadPlatformService notificationReadPlatformService;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final ToApiJsonSerializer<NotificationData> toApiJsonSerializer;
+    private final SqlValidator sqlValidator;
+
+    @GET
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String getAllNotifications(@Context final UriInfo uriInfo,
+                                      @QueryParam("orderBy")   final String orderBy,
+                                      @QueryParam("limit")     final Integer limit,
+                                      @QueryParam("offset")    final Integer offset,
+                                      @QueryParam("sortOrder") final String sortOrder,
+                                      @QueryParam("isRead")    final boolean isRead) {
+
+        this.context.authenticatedUser();
+        sqlValidator.validate(orderBy);
+        sqlValidator.validate(sortOrder);
+
+        final SearchParameters searchParameters = SearchParameters.builder()
+                .limit(limit).offset(offset).orderBy(orderBy).sortOrder(sortOrder).build();
+
+        final Page<NotificationData> notificationData = isRead
+                ? notificationReadPlatformService.getAllNotifications(searchParameters)
+                : notificationReadPlatformService.getAllUnreadNotifications(searchParameters);
+
+        final ApiRequestJsonSerializationSettings settings =
+                apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+        return toApiJsonSerializer.serialize(settings, notificationData);
+    }
+
+    @PUT
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public void update() {
+        this.context.authenticatedUser();
+        this.notificationReadPlatformService.updateNotificationReadStatus();
+    }
+}
+```
+
+Two operations:
+
+- `GET /v1/notifications?isRead=false&limit=20&offset=0` — paginated list, scoped to the
+  authenticated user via `PlatformSecurityContext.authenticatedUser()`.
+- `PUT /v1/notifications` — mark **all** notifications for the authenticated user as read. The
+  current API does not support marking a single notification read.
+
+`SqlValidator` is used on `orderBy` / `sortOrder` to defeat SQL injection because the read
+service builds `ORDER BY` dynamically.
+
+### Sample response
+
+```json
+{
+  "pageItems": [
+    {
+      "id":          1042,
+      "objectType":  "loan",
+      "objectId":    17,
+      "action":      "approved",
+      "actorId":     21,
+      "content":     "Loan with ID 17 has been approved",
+      "isRead":      false,
+      "isSystemGenerated": false,
+      "tenantIdentifier": "default",
+      "officeId":    1,
+      "createdAt":   "2024-08-01 10:15:32"
+    }
+  ],
+  "totalFilteredRecords": 1
+}
+```
+
+## Cache — `CacheNotificationResponseHeader`
+
+To avoid the SPA polling the full notifications list every few seconds,
+`CacheNotificationResponseHeader` carries a "do you have new notifications since `lastFetch`?"
+hint that can be attached to *any* response:
+
+```java
+// fineract-provider/.../notification/cache/CacheNotificationResponseHeader.java
+public class CacheNotificationResponseHeader {
+
+    private boolean hasNotifications;
+    private Long    lastFetch;
+
+    public CacheNotificationResponseHeader() {}
+    public CacheNotificationResponseHeader(boolean hasNotifications, Long lastFetch) {
+        this.hasNotifications = hasNotifications;
+        this.lastFetch = lastFetch;
+    }
+
+    public boolean hasNotifications() { return hasNotifications; }
+    public void setHasNotifications(boolean hasNotifications) { this.hasNotifications = hasNotifications; }
+
+    public Long getLastFetch() { return lastFetch; }
+    public void setLastFetch(Long lastFetch) { this.lastFetch = lastFetch; }
+}
+```
+
+The cache itself is fronted by the `NotificationGeneratorReadRepositoryWrapperImpl`
+(`.../service/`) which uses a small in-memory hint to answer
+`hasUnreadNotifications(appUserId)` cheaply, refreshing the underlying SQL query only when
+`lastFetch` is older than the cache window. The SPA includes the header in any "ping" response
+and triggers a full `GET /v1/notifications` only when `hasNotifications == true`.
+
+## Configuration
+
+Single property gates the whole feature:
+
+```properties
+fineract.notification.user-notification-system.enabled=${FINERACT_USER_NOTIFICATION_SYSTEM_ENABLED:true}
+```
+
+`UserNotificationServiceImpl.userNotificationSystemIsEnabled()` reads it and short-circuits
+both `notifyUsers(...)` overloads when `false`. There is no per-event toggle — it's all-or-nothing.
+
+For the ActiveMQ profile, the broker URL is read from the `brokerUrl` environment property (see
+`MessagingConfiguration.amqConnectionFactory()`), defaulting to `tcp://localhost:61616`.
+
+## Notifications vs the other event mechanisms
+
+| Mechanism | Audience | Storage | Delivery |
+| --- | --- | --- | --- |
+| **Business event** | In-process Java listeners | None (ephemeral) | Synchronous, in-transaction |
+| **External event** | Downstream services | `m_external_event` outbox | At-least-once over JMS/Kafka |
+| **Hook** | Operator-installed URL / SMS / Elasticsearch | None | Fire-and-forget HTTP |
+| **Notification** | UI users of this Fineract instance | `notification_generator` + `notification_mapper` | Spring or ActiveMQ; persisted per user |
+
+Use notifications **only** when the audience is `AppUser`s logged into this Fineract instance.
+For everything else — micro-services, BI pipelines, third-party SaaS — the external event
+outbox or hooks are better fits.
+
+## Operational notes
+
+- **Multi-node deployments** must set `activeMqEnabled` so a notification raised on node A is
+  written to the DB by whichever node consumes the queue, and so SSE / WebSocket gateways on
+  every node can push to attached SPAs.
+- The system never queues notifications for *offline* users in any special way — they live in
+  the database until the user comes back and reads them.
+- Broker outages are not fatal in the Spring profile (everything stays in-process). They are
+  fatal in the ActiveMQ profile — `JmsTemplate.send` will throw; the publisher catches the
+  exception so the business transaction is not rolled back, but the notification is lost.
+- For very large recipient sets, the `getNotifiableUserIds(officeId, permission)` lookup is the
+  expensive part. The query is JDBC-backed by `NotificationGeneratorReadRepositoryWrapperImpl`.
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Business Events" icon="bolt" href="/events/business-events">
+    The post-listeners that produce notifications.
+  </Card>
+  <Card title="External Events & Producers" icon="paper-plane" href="/events/external-events-and-producers">
+    For machine-to-machine integrations.
+  </Card>
+  <Card title="Hooks Framework" icon="plug" href="/events/hooks-framework">
+    For operator-installed outbound callbacks.
+  </Card>
+  <Card title="Overview" icon="map" href="/events/overview">
+    Side-by-side comparison of all four event mechanisms.
+  </Card>
+</CardGroup>

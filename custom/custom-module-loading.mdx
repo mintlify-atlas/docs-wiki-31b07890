@@ -1,0 +1,490 @@
+---
+title: "Custom Module Loading"
+description: "Add a Gradle module under custom/ in Apache Fineract, register a Spring Boot AutoConfiguration, and override upstream beans cleanly — with concrete examples from the reference ACME modules."
+keywords: ["apache fineract", "custom module", "spring boot auto-configuration", "bean override", "ConditionalOnProperty", "AutoConfiguration.imports", "fineract customization", "gradle subproject"]
+---
+
+This page walks through everything required to add a downstream Gradle module to Apache Fineract under the `custom/` directory and have Spring Boot auto-discover it at runtime. The model is opt-in by design: a fresh upstream checkout with no custom modules behaves exactly like vanilla Fineract; adding a directory under `custom/<company>/<category>/<module>/` and toggling a property is enough to activate your customization. Along the way we cover bean naming conflicts, the override patterns that the reference modules in `custom/acme/` actually use, and the trade-offs of each.
+
+## Anatomy of a custom module
+
+A custom module is a Gradle subproject that lives three levels deep under `custom/`:
+
+```
+custom/
+└── <company>/                # vendor namespace, e.g. acme
+    └── <category>/           # functional area, e.g. loan, event, note, portfolio
+        └── <module>/         # the actual artifact, e.g. starter, service, cob, job
+            ├── build.gradle
+            ├── dependencies.gradle
+            └── src/main/...
+```
+
+The two recurring module flavors found in the reference implementation are:
+
+| Flavor | Role | Example |
+|--------|------|---------|
+| Library module | Pure code (`@Service`, `@Component`, JPA entities, REST resources). No auto-configuration. | `custom/acme/note/service` |
+| Starter module | Holds the `@AutoConfiguration` class and the `AutoConfiguration.imports` file. Depends on one or more library modules. | `custom/acme/note/starter` |
+
+This is the same convention Spring Boot itself uses (the `xxx-autoconfigure` / `xxx-starter` split). Keeping the auto-configuration out of the library module means a downstream user could in principle depend on the library code without activating the auto-configuration.
+
+### `build.gradle` and `dependencies.gradle`
+
+Each module owns two Gradle files. The body of `build.gradle` is intentionally minimal — its only job is to set coordinates and pull in the dependency block. From `custom/acme/note/starter/build.gradle`:
+
+```groovy
+description = 'ACME Fineract Note Starter'
+group = 'com.acme.fineract'
+
+base {
+    archivesName = 'acme-fineract-note-starter'
+}
+
+apply from: 'dependencies.gradle'
+```
+
+And `custom/acme/note/starter/dependencies.gradle`:
+
+```groovy
+dependencies {
+    implementation(project(':custom:acme:note:service'))
+    implementation('org.springframework.boot:spring-boot-starter')
+    testImplementation(project(':fineract-core'))
+    testImplementation(project(':fineract-loan'))
+    testImplementation(project(':fineract-savings'))
+    testImplementation(project(':fineract-provider'))
+    testImplementation('org.springframework.boot:spring-boot-starter-jdbc')
+    testImplementation('org.springframework.boot:spring-boot-starter-data-jpa')
+}
+```
+
+A few details worth calling out:
+
+- The starter module depends on the library module via Gradle's `project(':custom:acme:note:service')` reference — the colon-separated path matches the `:custom:<company>:<category>:<module>` pattern that `settings.gradle` registers automatically.
+- `org.springframework.boot:spring-boot-starter` is the bare minimum for Spring Boot's auto-configuration machinery to be available at compile time.
+- `fineract-core`, `fineract-provider`, and the product subprojects are declared as `testImplementation` only. The starter does not bake them into its compile dependencies, which keeps the dependency graph clean and ensures the starter remains a strict consumer of upstream API. Upstream is always made available to the starter at runtime because the `:custom:docker` image depends on it directly.
+
+## How `settings.gradle` discovers your module
+
+`settings.gradle` at the repo root contains a deterministic three-level scan:
+
+```groovy
+include ':custom:docker'
+file("${rootDir}/custom").eachDir { companyDir ->
+    if ('build' != companyDir.name && 'docker' != companyDir.name) {
+        file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+            if ('build' != categoryDir.name) {
+                file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                    if ('build' != moduleDir.name) {
+                        include ":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Practical implications:
+
+1. **No manifest file**. Adding a new module means creating a directory tree — the `settings.gradle` walker registers it on the next Gradle invocation.
+2. **`build/` directories are skipped at every level**. Stale Gradle output never gets mistaken for a module.
+3. **The `:custom:docker` project is registered first** so it can later resolve dependencies on every sibling that gets discovered.
+4. **Exactly three nesting levels are scanned**. If you want a flat module, the directory still has to live three levels deep. If you want sub-packages inside one module, organize them under `src/main/java`, not under additional `custom/` directories.
+
+## Step-by-step: add a new module
+
+The following recipe creates a brand-new module that adds a custom `LoanCOBBusinessStep` similar to the ACME reference module.
+
+### 1. Create the directory tree
+
+```bash
+mkdir -p custom/acme/loan/mystep/src/main/java/com/acme/fineract/loan/mystep
+mkdir -p custom/acme/loan/mystep/src/main/resources/META-INF/spring
+mkdir -p custom/acme/loan/mystep/src/main/resources/db/custom-changelog
+```
+
+### 2. Write `build.gradle` and `dependencies.gradle`
+
+```groovy
+// custom/acme/loan/mystep/build.gradle
+description = 'ACME Fineract My Step'
+group = 'com.acme.fineract'
+
+base {
+    archivesName = 'acme-fineract-my-step'
+}
+
+apply from: 'dependencies.gradle'
+```
+
+```groovy
+// custom/acme/loan/mystep/dependencies.gradle
+dependencies {
+    implementation(project(':fineract-core'))
+    implementation(project(':fineract-provider'))
+    implementation('org.springframework.boot:spring-boot-starter')
+}
+```
+
+### 3. Add a Spring component
+
+```java
+// custom/acme/loan/mystep/src/main/java/com/acme/fineract/loan/mystep/AcmeMyBusinessStep.java
+package com.acme.fineract.loan.mystep;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.fineract.cob.loan.LoanCOBBusinessStep;
+import org.apache.fineract.portfolio.loanaccount.domain.Loan;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+@ConditionalOnProperty("acme.mystep.enabled")
+public class AcmeMyBusinessStep implements LoanCOBBusinessStep {
+
+    @Override
+    public Loan execute(Loan input) {
+        log.info("ACME my-step ran for loan {}", input.getId());
+        return input;
+    }
+
+    @Override
+    public String getEnumStyledName() {
+        return "ACME_MY_STEP";
+    }
+
+    @Override
+    public String getHumanReadableName() {
+        return "ACME My Business Step";
+    }
+}
+```
+
+### 4. Write the auto-configuration
+
+```java
+// custom/acme/loan/mystep/src/main/java/com/acme/fineract/loan/mystep/AcmeMyStepAutoConfiguration.java
+package com.acme.fineract.loan.mystep;
+
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.context.annotation.ComponentScan;
+
+@AutoConfiguration
+@ComponentScan("com.acme.fineract.loan.mystep")
+public class AcmeMyStepAutoConfiguration {}
+```
+
+### 5. Register the auto-configuration with Spring Boot
+
+Create the imports file:
+
+```
+# custom/acme/loan/mystep/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+com.acme.fineract.loan.mystep.AcmeMyStepAutoConfiguration
+```
+
+This is the only thing Spring Boot needs at runtime to activate your module. The mechanism is described in the Spring Boot reference and is the canonical replacement for the older `META-INF/spring.factories` approach.
+
+### 6. (Optional) add a Liquibase changeset
+
+```xml
+<!-- custom/acme/loan/mystep/src/main/resources/db/custom-changelog/0001_acme_my_step.xml -->
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.1.xsd">
+    <changeSet author="acme" id="1">
+        <createTable tableName="acme_my_step_log">
+            <column autoIncrement="true" name="id" type="BIGINT">
+                <constraints nullable="false" primaryKey="true"/>
+            </column>
+            <column name="loan_id" type="BIGINT"><constraints nullable="false"/></column>
+            <column name="processed_at" type="DATETIME"/>
+        </createTable>
+    </changeSet>
+</databaseChangeLog>
+```
+
+That file will be picked up via `<includeAll path="db/custom-changelog" .../>` in `db.changelog-master.xml` because Liquibase scans the entire classpath for that resource folder.
+
+### 7. Build and run
+
+```bash
+./gradlew :custom:docker:jibDockerBuild
+docker compose -f docker-compose-custom.yml up
+```
+
+If `acme.mystep.enabled=true` is set in the environment, the new business step joins the loan COB pipeline; if it is not set, the module's beans are simply skipped.
+
+## How auto-configuration discovery works at runtime
+
+The Spring Boot 3.x auto-configuration discovery rules are simple:
+
+1. The application classpath is scanned for files at `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`.
+2. Every non-blank, non-comment line is treated as the FQCN of a configuration class.
+3. The class's `@Conditional*` annotations are evaluated; if all conditions pass, the class is instantiated and its `@Bean` methods are processed.
+4. `@ComponentScan` declared on the auto-configuration extends the search for `@Component`, `@Service`, `@Repository`, and `@Controller` annotated classes in the listed packages.
+
+The reference modules show three variants of this pattern.
+
+### Pure component scan (event)
+
+```java
+// custom/acme/event/starter/.../AcmeEventAutoConfiguration.java
+@AutoConfiguration
+@ComponentScan("com.acme.fineract.event.externalevent")
+public class AcmeEventAutoConfiguration {}
+```
+
+No conditions, no `@Bean` methods. Everything under `com.acme.fineract.event.externalevent` becomes part of the application context. This is the right shape when you are adding net-new beans with no risk of colliding with upstream types.
+
+### Opt-in via `@ConditionalOnProperty` (note)
+
+```java
+@AutoConfiguration
+@ComponentScan("com.acme.fineract.portfolio.note")
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteAutoConfiguration {}
+```
+
+The whole configuration is skipped unless `acme.note.enabled` is present in the environment. Combined with `@ConditionalOnProperty` on the individual `@Service` classes (see `AcmeNoteReadPlatformService` and `AcmeNoteWritePlatformService`), this provides defense in depth: even if a downstream import accidentally references one of the service beans, the property gate keeps it dormant.
+
+### `@Bean` override (loan)
+
+```java
+@AutoConfiguration
+@ComponentScan(basePackages = {
+        "com.acme.fineract.loan.cob",
+        "com.acme.fineract.loan.processor",
+        "com.acme.fineract.loan.job"
+})
+@ConditionalOnProperty("acme.loan.enabled")
+public class AcmeLoanAutoConfiguration {
+
+    @Bean
+    public LoanRepaymentScheduleTransactionProcessorFactory loanRepaymentScheduleTransactionProcessorFactory(
+            AcmeLoanRepaymentScheduleTransactionProcessor defaultLoanRepaymentScheduleTransactionProcessor,
+            List<LoanRepaymentScheduleTransactionProcessor> processors) {
+        return new LoanRepaymentScheduleTransactionProcessorFactory(
+                defaultLoanRepaymentScheduleTransactionProcessor, processors);
+    }
+}
+```
+
+This replaces the upstream `LoanRepaymentScheduleTransactionProcessorFactory` bean with one that uses `AcmeLoanRepaymentScheduleTransactionProcessor` as the default. See the override-patterns section below for the rules governing this.
+
+## Bean naming conflicts and override patterns
+
+The most common gotcha when introducing a custom module is collision with a bean that already exists in `fineract-provider`. Spring's behavior depends on a few configuration flags and on which scoping you use.
+
+### The default: no bean overriding
+
+Spring Boot 3.x disables bean definition overriding by default. If two `@Configuration` classes declare a `@Bean` method that produces the same bean name, application startup fails with `BeanDefinitionOverrideException`. This is the safe default and Apache Fineract relies on it. If you accidentally redefine an upstream bean without using one of the patterns below, the application will refuse to start — which is exactly what you want.
+
+### Pattern A: replace upstream with `@Primary` plus a distinct bean name
+
+The most surgical approach is to keep the upstream bean alive but mark your own implementation as `@Primary`:
+
+```java
+@Component
+@Primary
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteReadPlatformService implements NoteReadPlatformService {
+    // ...
+}
+```
+
+Because the new bean carries a different bean name (`acmeNoteReadPlatformService`), there is no collision. Spring's autowiring resolves the `NoteReadPlatformService` type to the `@Primary` candidate. This is what you want when you need the upstream implementation to remain on the context (for, say, a comparison job) but want every other caller to bind to yours.
+
+### Pattern B: replace upstream via the same factory method
+
+This is what `AcmeLoanAutoConfiguration` does: it declares a `@Bean` method whose name matches the upstream method name (`loanRepaymentScheduleTransactionProcessorFactory`). Because Spring's component scanning processes `@AutoConfiguration` classes via Spring Boot's auto-configuration ordering, you can use `@AutoConfiguration(before = ...)` or `@AutoConfiguration(after = ...)` to deterministically position yourself, then use `@ConditionalOnMissingBean` on upstream's definition or override its `@Bean` directly through configuration ordering.
+
+To make this work safely:
+
+- Use a meaningful `@AutoConfiguration` ordering hook so Spring Boot evaluates your config before upstream's.
+- Keep the `@Bean` method signature byte-compatible with the one you are replacing.
+- Guard with `@ConditionalOnProperty` so the override only activates when explicitly enabled.
+
+### Pattern C: shadow a specific `@Service`
+
+The reference note module replaces `NoteReadPlatformService` and `NoteWritePlatformService`:
+
+```java
+@Service
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteReadPlatformService implements NoteReadPlatformService, InitializingBean {
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        log.warn("Note Read Service: '{}'", getClass().getCanonicalName());
+    }
+    // ...
+}
+```
+
+Two key choices:
+
+- The bean name is different from upstream's (Spring derives `acmeNoteReadPlatformService` from the class name). No name collision.
+- The `@ConditionalOnProperty` is mirrored on both the auto-configuration class and the individual `@Service`. If a downstream consumer disables only the property, both layers stay dormant — defense in depth.
+
+To make this approach a true override of an upstream `@Service`, upstream must use `@ConditionalOnMissingBean(NoteReadPlatformService.class)` on its own definition. When upstream does not yet support that pattern, you can:
+
+- Use `@Primary` on your bean and let both live (Pattern A).
+- File an upstream contribution that adds `@ConditionalOnMissingBean` to the relevant `@Configuration`.
+
+### Pattern D: extend the upstream type
+
+For loan transaction processors, the reference implementation simply subclasses the upstream class:
+
+```java
+@Component
+public class AcmeLoanRepaymentScheduleTransactionProcessor
+        extends FineractStyleLoanRepaymentScheduleTransactionProcessor {
+
+    public static final String STRATEGY_CODE = "acme-standard-strategy";
+    public static final String STRATEGY_NAME =
+            "ACME Corp.: standard loan transaction processing strategy";
+
+    public AcmeLoanRepaymentScheduleTransactionProcessor(
+            ExternalIdFactory externalIdFactory,
+            LoanChargeValidator loanChargeValidator,
+            LoanBalanceService loanBalanceService) {
+        super(externalIdFactory, loanChargeValidator, loanBalanceService);
+    }
+
+    @Override
+    public String getCode() { return STRATEGY_CODE; }
+
+    @Override
+    public String getName() { return STRATEGY_NAME; }
+}
+```
+
+Because both the upstream `FineractStyleLoanRepaymentScheduleTransactionProcessor` and `AcmeLoanRepaymentScheduleTransactionProcessor` get `@Component`-scanned, they coexist in the `List<LoanRepaymentScheduleTransactionProcessor>` that the factory accepts. The factory's lookup by `getCode()` then picks the right one at runtime.
+
+### Pattern E: contribute to a provider list
+
+Several upstream components are wired with `SimpleXxxProvider` beans that take a `List<...>`. Your module adds another one:
+
+```java
+// custom/acme/event/externalevent/.../AcmeExternalEventSourceProviderConfig.java
+@Configuration
+public class AcmeExternalEventSourceProviderConfig {
+
+    @Bean
+    public ExternalEventSourceProvider acmeEventSourceProvider() {
+        return new SimpleExternalEventSourceProvider(
+                List.of(new ExternalEventSourceData("com.acme.fineract.event.externalevent")));
+    }
+}
+```
+
+Same pattern in the job module:
+
+```java
+// custom/acme/loan/job/.../AcmeJobNameConfig.java
+@Configuration
+public class AcmeJobNameConfig {
+
+    @Bean
+    public JobNameProvider acmeJobNameProvider() {
+        return new SimpleJobNameProvider(List.of(
+                new JobNameData(
+                        AcmeJobName.ACME_NOOP_JOB.name(),
+                        AcmeJobName.ACME_NOOP_JOB.toString())));
+    }
+}
+```
+
+The upstream registries (`ExternalEventSourceProvider`, `JobNameProvider`, `LoanCOBBusinessStep`, …) are designed to aggregate every bean of the type from the context, so contributing to them never produces a name collision and never requires a property gate.
+
+## Bean naming rules of thumb
+
+A pragmatic decision tree:
+
+1. **Adding a new bean that does not exist upstream?** Just `@Component` it. No conditions needed unless you want a kill switch.
+2. **Adding a candidate to a list that upstream aggregates (`LoanCOBBusinessStep`, `ExternalEventSourceProvider`, `JobNameProvider`)?** Use Pattern E. Optionally gate with `@ConditionalOnProperty` for opt-in deployments.
+3. **Replacing an upstream bean and the upstream definition already uses `@ConditionalOnMissingBean`?** Define your bean with the same type; do not use `@Primary`.
+4. **Replacing an upstream bean and the upstream definition does not use `@ConditionalOnMissingBean`?** Mark yours `@Primary` (Pattern A) and accept that the upstream bean still lives in the context, or replace the upstream factory `@Bean` in your auto-configuration (Pattern B).
+5. **Extending upstream behavior, not replacing it?** Subclass the upstream `@Component` (Pattern D). The upstream and yours coexist; lookup logic picks per request.
+
+<Warning>
+Never enable `spring.main.allow-bean-definition-overriding=true` to "fix" collisions. That flag turns the safety net off globally and makes future merges from upstream silently dangerous — a new upstream `@Bean` with the same name as one of yours will simply not be used, with no error. Prefer the explicit override patterns above.
+</Warning>
+
+## Conditional activation: properties to know
+
+The conditional property names used by the reference modules are:
+
+| Property | Module | Effect |
+|----------|--------|--------|
+| `acme.note.enabled` | `custom/acme/note/starter` and the `@Service` overrides | Activates the note read/write platform replacements |
+| `acme.loan.enabled` | `custom/acme/loan/starter` | Activates the loan COB step, custom processor factory, and the noop job |
+| (none) | `custom/acme/event/starter` | Always-on event source provider |
+
+These properties are evaluated by Spring Boot during context refresh. Setting them in `application.properties`, via `-D` system properties, or — in production — through the Docker environment variables the Fineract image picks up will activate or deactivate the corresponding modules without a rebuild.
+
+## Testing your module
+
+The reference starter modules include Cucumber-based tests that bring up just enough Spring context to verify wiring. The `application-test.properties` file is intentionally empty; the test classes themselves enable or disable properties as needed by registering `TestPropertyValues` or by setting them on the `@SpringBootTest` annotation. Two example test fixtures from `custom/acme/note/starter/src/test/java/com/acme/fineract/portfolio/note/starter/`:
+
+- `TestDefaultConfiguration` — wires only the upstream `org.apache.fineract.portfolio.note.service` package and mocks repositories; used to assert that the upstream beans are loaded when `acme.note.enabled` is not set.
+- `TestOverrideConfiguration` — wires the `com.acme.fineract` package and mocks repositories; used to assert that the ACME services win when the property is set.
+
+Modeling your own integration tests on this pair (default vs. override configurations) gives you a regression net that catches the easiest mistake: forgetting the `@ConditionalOnProperty` and accidentally loading your bean unconditionally.
+
+## What happens at the Docker layer
+
+`:custom:docker`'s `build.gradle` re-runs the same three-level directory walk to add every module as a Jib `implementation` dependency:
+
+```groovy
+dependencies {
+    implementation project(':fineract-core')
+    implementation project(':fineract-provider')
+    // NOTE: dynamically load all custom modules
+    file("${rootDir}/custom").eachDir { companyDir ->
+        if ('build' != companyDir.name && 'docker' != companyDir.name) {
+            file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+                if ('build' != categoryDir.name) {
+                    file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                        if ('build' != moduleDir.name) {
+                            implementation project(":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ...
+}
+```
+
+The result is that every JAR produced by every custom module ends up on the classpath of the `fineract-custom` image. From Spring Boot's perspective the modules are indistinguishable from upstream `fineract-provider` — they all contribute auto-configurations, beans, and changelog files via the same classpath scan. See [Custom Docker image](/custom/custom-docker-image) for the full image build story.
+
+## Common pitfalls
+
+- **Forgetting `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`.** Without that file, Spring Boot will never instantiate your `@AutoConfiguration` class even though it is on the classpath. The compiled bytecode will be present but unused. Always create the file under `src/main/resources/META-INF/spring/`.
+- **Putting the file under `META-INF/spring.factories`.** Spring Boot 3.x removed that legacy lookup path for auto-configurations. The imports file is the canonical replacement.
+- **Component scanning the upstream package.** A `@ComponentScan("org.apache.fineract.portfolio.note")` from your auto-configuration will eagerly instantiate upstream beans inside your configuration's scope, often producing duplicate-bean errors. Always scan your own `com.<vendor>...` package and let upstream's main entry point continue to scan its own.
+- **Naming a `@Bean` method identically to an upstream one without an ordering hook.** Spring Boot evaluates `@AutoConfiguration` classes in a specific order; without `@AutoConfiguration(before = ...)`, the upstream `@Bean` may be processed second and shadow yours. Pin the ordering or use `@ConditionalOnMissingBean` strategies upstream.
+- **Reusing changeset ids across modules.** Liquibase's `DATABASECHANGELOG` table is keyed on (id, author, filename). The `filename` keeps modules separate, but a global naming convention (`0001_acme_*`, `0002_acme_*`, …) avoids confusion when debugging.
+
+## File map
+
+| Concern | Path |
+|---------|------|
+| Module discovery | `settings.gradle` (root) |
+| Reference event starter | `custom/acme/event/starter/` |
+| Reference loan starter | `custom/acme/loan/starter/` |
+| Reference note starter | `custom/acme/note/starter/` |
+| Auto-configuration imports | `<module>/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` |
+| Custom Liquibase changesets | `<module>/src/main/resources/db/custom-changelog/*.xml` |
+| Docker Jib build | `custom/docker/build.gradle` |
+
+Continue to [Custom Docker image](/custom/custom-docker-image) to see how the discovered modules are packaged into a runnable container.

@@ -1,0 +1,309 @@
+---
+title: "Loan Transactions REST API"
+sidebarTitle: "Loan Transactions"
+description: "The Apache Fineract REST API for everything that posts to or charges against a loan account: LoanTransactionsApiResource, LoanChargesApiResource, LoanInterestPauseApiResource, LoanCapitalizedIncomeApiResource, LoanBuyDownFeeApiResource and RepaymentWithPostDatedChecksApiResource."
+---
+
+Loan **state transitions** — approve, disburse, close — live on `LoansApiResource`. Everything that *posts money against* a loan or *attaches a charge to* a loan lives on a small family of sibling resources documented here. Together they cover: repayments, refunds, chargebacks, waivers, write-offs, schedule re-ages and re-amortisations, charge application and waiver, interest-pause variations, capitalized-income tracking for progressive loans, buy-down-fee amortization, and the post-dated cheque workflow used in several South-Asian deployments.
+
+All endpoints mount under `/fineract-provider/api/v1` — see the [REST API Overview](/api/overview).
+
+## Endpoint summary
+
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/loans/{loanId}/transactions/template?command=…` | `LoanTransactionsApiResource.java` | Template for a specific operation: `repayment`, `merchantIssuedRefund`, `payoutRefund`, `goodwillCredit`, `chargeRefund`, `waiveinterest`, `writeoff`, `close-rescheduled`, `close`, `disburse`, `disburseToSavings`, `recoverypayment`, `payCharge`, `refundByCash`, `creditBalanceRefund`, `chargeAdjustment`, `reAge`, `reAmortize`, `interestPaymentWaiver`, `accrual`, `down-payment`. |
+| GET | `/v1/loans/{loanId}/transactions` | `LoanTransactionsApiResource.java` | List of every loan transaction. |
+| GET | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | One transaction (numeric ids). |
+| GET | `/v1/loans/{loanId}/transactions/external-id/{externalTransactionId}` | `LoanTransactionsApiResource.java` | One transaction (external txn id). |
+| POST | `/v1/loans/{loanId}/transactions?command=…` | `LoanTransactionsApiResource.java` | Execute a transaction. The `?command=` value picks the handler. |
+| POST | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | Adjust an existing transaction (`?command=undo`, `chargeback`, `chargeAdjustment`). |
+| PUT | `/v1/loans/{loanId}/transactions/{transactionId}` | `LoanTransactionsApiResource.java` | Undo a waive-charge transaction. |
+| GET | `/v1/loans/{loanId}/transactions/reage-preview` | `LoanTransactionsApiResource.java` | Preview the schedule after a re-age, without persisting. |
+| GET | `/v1/loans/{loanId}/transactions/reamortization-preview` | `LoanTransactionsApiResource.java` | Preview the schedule after a re-amortize. |
+| GET | `/v1/loans/{loanId}/charges` | `LoanChargesApiResource.java` | List of all charges attached to the loan. |
+| GET | `/v1/loans/{loanId}/charges/template` | `LoanChargesApiResource.java` | Charge-pick template for the apply-charge UI. |
+| POST | `/v1/loans/{loanId}/charges` | `LoanChargesApiResource.java` | Apply a charge (one-off, installment fee, or penalty). |
+| POST | `/v1/loans/{loanId}/charges/{loanChargeId}?command=pay\|waive\|adjustment` | `LoanChargesApiResource.java` | Pay, waive or adjust an applied charge. |
+| PUT | `/v1/loans/{loanId}/charges/{loanChargeId}` | `LoanChargesApiResource.java` | Edit a not-yet-charged amount. |
+| DELETE | `/v1/loans/{loanId}/charges/{loanChargeId}` | `LoanChargesApiResource.java` | Remove an unposted charge. |
+| GET | `/v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.java` | List the interest-pause windows on a loan. |
+| POST | `/v1/loans/{loanId}/interest-pauses` | `LoanInterestPauseApiResource.java` | Create an interest-pause window. |
+| PUT | `/v1/loans/{loanId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource.java` | Edit the dates of an interest-pause window. |
+| DELETE | `/v1/loans/{loanId}/interest-pauses/{variationId}` | `LoanInterestPauseApiResource.java` | Remove an interest-pause window. |
+| GET | `/v1/loans/{loanId}/capitalized-incomes/{loanTransactionId}` | `LoanCapitalizedIncomeApiResource.java` | Inspect the allocation for one capitalized-income transaction. |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes` | `LoanCapitalizedIncomeApiResource.java` | All capitalized-income transactions for a loan. |
+| GET | `/v1/loans/{loanId}/buydown-fees/{loanTransactionId}` | `LoanBuyDownFeeApiResource.java` | Buy-down-fee amortization detail. |
+| GET | `/v1/loans/{loanId}/postdatedchecks` | `RepaymentWithPostDatedChecksApiResource.java` | All post-dated cheques attached to a loan. |
+| PUT | `/v1/loans/{loanId}/postdatedchecks/{postDatedCheckId}` | `RepaymentWithPostDatedChecksApiResource.java` | Update / replace a PDC. |
+| DELETE | `/v1/loans/{loanId}/postdatedchecks/{postDatedCheckId}` | `RepaymentWithPostDatedChecksApiResource.java` | Withdraw a PDC. |
+
+Every resource also exposes the matching `external-id/{loanExternalId}/…` mirror.
+
+## `LoanTransactionsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanTransactionsApiResource.java`
+Class path: `@Path("/v1/loans")`
+
+This is the single most overloaded resource in the platform. The POST handler accepts more than twenty distinct `?command=` values and routes each one to a separate `*CommandHandler`. The matrix below is the canonical reference:
+
+| `?command=` | Handler | Produces |
+| --- | --- | --- |
+| `repayment` | `MakeRepaymentLoanCommandHandler` | `REPAYMENT` transaction. |
+| `disburse` | `DisburseLoanCommandHandler` | `DISBURSEMENT` transaction (note: also reachable via `LoansApiResource` state transition). |
+| `disburseToSavings` | `DisburseToSavingsCommandHandler` | `DISBURSEMENT` + linked savings deposit. |
+| `merchantIssuedRefund` | `MerchantIssuedRefundCommandHandler` | `MERCHANT_ISSUED_REFUND`. |
+| `payoutRefund` | `PayoutRefundCommandHandler` | `PAYOUT_REFUND`. |
+| `goodwillCredit` | `GoodwillCreditCommandHandler` | `GOODWILL_CREDIT`. |
+| `chargeRefund` | `ChargeRefundCommandHandler` | `CHARGE_REFUND`. |
+| `chargeAdjustment` | `ChargeAdjustmentCommandHandler` | `CHARGE_ADJUSTMENT`. |
+| `waiveinterest` | `WaiveInterestCommandHandler` | `WAIVE_INTEREST`. |
+| `writeoff` | `WriteOffLoanCommandHandler` | `WRITEOFF`. |
+| `close` | `CloseLoanCommandHandler` | `RECOVERY_REPAYMENT` + close. |
+| `close-rescheduled` | `CloseLoanAsRescheduledCommandHandler` | Close with rescheduled flag. |
+| `recoverypayment` | `RecoveryPaymentLoanCommandHandler` | Post-writeoff recovery. |
+| `creditBalanceRefund` | `CreditBalanceRefundCommandHandler` | `CREDIT_BALANCE_REFUND`. |
+| `refundByCash` | `RefundByCashLoanCommandHandler` | `REFUND_BY_CASH`. |
+| `interestPaymentWaiver` | `InterestPaymentWaiverCommandHandler` | `INTEREST_PAYMENT_WAIVER`. |
+| `down-payment` | `DownPaymentLoanCommandHandler` | `DOWN_PAYMENT`. |
+| `accrual` | (manual periodic accrual) | `ACCRUAL`. |
+| `reAge` | `ReAgeLoanCommandHandler` | Schedule re-age (no money). |
+| `reAmortize` | `ReAmortizeLoanCommandHandler` | Schedule re-amortise (no money). |
+
+The adjust handler (POST against an existing transaction id) accepts:
+
+| `?command=` on `{transactionId}` | Effect |
+| --- | --- |
+| `undo` | Reverses the transaction. The reversal is itself written as a separate, audit-trail-preserving row with `is_reversed=true`. |
+| `chargeback` | Splits the transaction into a chargeback. |
+| `chargeAdjustment` | Apply a charge adjustment against a specific transaction. |
+
+### Symmetry: external-id paths
+
+Every POST and GET above has four URL shapes — `{loanId}`/`external-id/{loanExternalId}` × `{transactionId}`/`external-id/{transactionExternalId}` — and they all route to the same handler after id resolution. The class lists them in `LoansApiResourceSwagger.java`.
+
+### Preview endpoints
+
+`GET /v1/loans/{loanId}/transactions/reage-preview` and `/reamortization-preview` are read-only — they call the schedule generator with the same parameters that a `?command=reAge` / `reAmortize` POST would use, return the new schedule, and **do not** persist anything. The UI uses them so the credit officer can confirm before committing.
+
+### Searching transactions
+
+The resource also publishes the loan-transactions search endpoints — `GET /v1/loans/{loanId}/transactions/search` and `POST /v1/loans/{loanId}/transactions/query` (advanced JSON predicate). They are paginated and used heavily by the COB reconciliation UI.
+
+## `LoanChargesApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanChargesApiResource.java`
+Class path: `@Path("/v1/loans")`
+
+This resource manages the link table between a loan and `m_charge`. A charge can be one of four time models: **disbursement**, **specified-due-date**, **installment-fee**, or **overdue-installment-fee**. The full lifecycle is:
+
+1. `POST /v1/loans/{loanId}/charges` — apply (`m_loan_charge` row, not yet paid).
+2. `POST /v1/loans/{loanId}/charges/{loanChargeId}?command=pay` — pay (writes `m_loan_transaction` of type `CHARGE_PAYMENT`).
+3. `POST /v1/loans/{loanId}/charges/{loanChargeId}?command=waive` — waive.
+4. `POST /v1/loans/{loanId}/charges/{loanChargeId}?command=adjustment` — adjust.
+5. `PUT /v1/loans/{loanId}/charges/{loanChargeId}` — edit an unpaid amount.
+6. `DELETE /v1/loans/{loanId}/charges/{loanChargeId}` — remove an unpaid charge.
+
+The `template` endpoint returns the charges defined on the loan's product (the `charges` block of `LoanProductsApiResource`).
+
+Every method has an external-id mirror — both for the loan and for the charge.
+
+## `LoanInterestPauseApiResource`
+
+File: `fineract-loan/src/main/java/org/apache/fineract/portfolio/interestpauses/api/LoanInterestPauseApiResource.java`
+Class path: `@Path("/v1/loans")`
+
+Interest pauses are time windows during which the loan does **not** accrue interest (used for grace periods, regulatory holds, public-health emergencies). They are stored in `m_loan_term_variations` with `term_type=INTEREST_PAUSE`.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/interest-pauses` | `retrieveInterestPauses` |
+| POST | `/v1/loans/{loanId}/interest-pauses` | `createInterestPause` |
+| PUT | `/v1/loans/{loanId}/interest-pauses/{variationId}` | `updateInterestPause` |
+| DELETE | `/v1/loans/{loanId}/interest-pauses/{variationId}` | `deleteInterestPause` |
+| GET | `/v1/loans/external-id/{loanExternalId}/interest-pauses` | `retrieveInterestPausesByExternalId` |
+| POST | `/v1/loans/external-id/{loanExternalId}/interest-pauses` | `createInterestPauseByExternalId` |
+
+Creating, editing or deleting a pause forces a schedule regeneration via `LoanScheduleService.regenerateRepaymentSchedule()`.
+
+## `LoanCapitalizedIncomeApiResource`
+
+File: `fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanCapitalizedIncomeApiResource.java`
+Class path: `@Path("/v1/loans")`
+
+Specific to the **progressive-loan** schedule type. When fees, premia or grace-period interest are *capitalized* into the principal at disbursement, the platform records each contribution and amortises it across the schedule. This resource is the read API over those allocations.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/deferredincome` / `/capitalized-incomes` | `fetchLoanCapitalizedIncomeData` / `fetchCapitalizedIncomeDetails` |
+| GET | `/v1/loans/{loanId}/capitalized-incomes/{loanTransactionId}` | `retrieveCapitalizedIncomeAllocationData` |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes` | `fetchCapitalizedIncomeDetailsByExternalId` |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes/{loanTransactionId}` | `getCapitalizedIncomeAllocationDataByLoanExternalId` |
+| GET | `/v1/loans/{loanId}/capitalized-incomes/external-id/{loanTransactionExternalId}` | `getCapitalizedIncomeAllocationDataByTransactionExternalId` |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes/external-id/{loanTransactionExternalId}` | `getCapitalizedIncomeAllocationDataByExternalIds` |
+
+The matching write side (the capitalized-income transaction itself) is created during disbursement or via the standard `LoanTransactionsApiResource` flow with the appropriate command.
+
+## `LoanBuyDownFeeApiResource`
+
+File: `fineract-progressive-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoanBuyDownFeeApiResource.java`
+Class path: `@Path("/v1/loans")`
+
+Another progressive-loan-only resource. A **buy-down fee** is the up-front payment a borrower (or a third party) makes to reduce the contractual interest rate. The platform amortises that fee over the loan term; this resource reads the amortisation schedule.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/buydown-fees` | `retrieveLoanBuyDownFeeAmortizationDetails` |
+| GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees` | `retrieveLoanBuyDownFeeAmortizationDetailsByExternalId` |
+| GET | `/v1/loans/{loanId}/buydown-fees/{loanTransactionId}` | `retrieveBuyDownFeesAllocationData` |
+| GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees/{loanTransactionId}` | `getBuyDownFeesAllocationDataByLoanExternalId` |
+| GET | `/v1/loans/{loanId}/buydown-fees/external-id/{loanTransactionExternalId}` | `getBuyDownFeesAllocationDataByTransactionExternalId` |
+| GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees/external-id/{loanTransactionExternalId}` | `getBuyDownFeesAllocationDataByExternalIds` |
+
+## `RepaymentWithPostDatedChecksApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/repaymentwithpostdatedchecks/api/RepaymentWithPostDatedChecksApiResource.java`
+Class path: `@Path("/v1/loans/{loanId}/postdatedchecks")`
+
+Some markets accept a stack of post-dated cheques (PDCs) at disbursement time. The repayment job presents the appropriate cheque on its due date. This resource manages the cheque collection.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/postdatedchecks` | `getPostDatedChecks` |
+| GET | `/v1/loans/{loanId}/postdatedchecks/{installmentId}` | `getPostDatedCheck` |
+| PUT | `/v1/loans/{loanId}/postdatedchecks/{postDatedCheckId}` | `updatePostDatedChecks` |
+| DELETE | `/v1/loans/{loanId}/postdatedchecks/{postDatedCheckId}` | `deletePostDatedCheck` |
+
+The check creation endpoint lives on the parent loans resource (`POST /v1/loans/{loanId}?command=update`) — the cheques arrive in the disbursement payload alongside the schedule.
+
+## Transaction types reference
+
+Every loan transaction lands in `m_loan_transaction` with a `transaction_type_enum` value. The integer codes are stable across releases; see `LoanTransactionType` in `fineract-loan/.../portfolio/loanaccount/domain/`. The most common ones encountered through this API are:
+
+| Code | Type | Created by |
+| --- | --- | --- |
+| 1 | DISBURSEMENT | `?command=disburse` or `disburseToSavings` |
+| 2 | REPAYMENT | `?command=repayment` |
+| 3 | CONTRA | (system) |
+| 4 | WAIVE_INTEREST | `?command=waiveinterest` |
+| 5 | REPAYMENT_AT_DISBURSEMENT | (system, on disburse) |
+| 6 | WRITEOFF | `?command=writeoff` |
+| 7 | MARKED_FOR_RESCHEDULING | `?command=close-rescheduled` |
+| 8 | RECOVERY_REPAYMENT | `?command=recoverypayment` |
+| 9 | WAIVE_CHARGES | `?command=waive` (on a charge) |
+| 10 | ACCRUAL | `?command=accrual` and COB accrual job |
+| 12 | INITIATE_TRANSFER | account transfer in |
+| 13 | APPROVE_TRANSFER | (system) |
+| 14 | WITHDRAW_TRANSFER | (system) |
+| 15 | REJECT_TRANSFER | (system) |
+| 16 | REFUND | `?command=refundByCash` |
+| 17 | CHARGE_PAYMENT | `?command=pay` (on a charge) |
+| 18 | REFUND_FOR_ACTIVE_LOAN | `?command=refund` legacy |
+| 19 | INCOME_POSTING | COB accrual |
+| 20 | CREDIT_BALANCE_REFUND | `?command=creditBalanceRefund` |
+| 21 | MERCHANT_ISSUED_REFUND | `?command=merchantIssuedRefund` |
+| 22 | PAYOUT_REFUND | `?command=payoutRefund` |
+| 23 | GOODWILL_CREDIT | `?command=goodwillCredit` |
+| 24 | CHARGE_REFUND | `?command=chargeRefund` |
+| 25 | CHARGEBACK | `?command=chargeback` on existing txn |
+| 26 | CHARGE_ADJUSTMENT | `?command=chargeAdjustment` |
+| 27 | CHARGE_OFF | (system) |
+| 28 | DOWN_PAYMENT | `?command=down-payment` |
+| 29 | REAGE | `?command=reAge` |
+| 30 | REAMORTIZE | `?command=reAmortize` |
+| 31 | INTEREST_PAYMENT_WAIVER | `?command=interestPaymentWaiver` |
+| 32 | INTEREST_REFUND | (system) |
+| 33 | ACCRUAL_ADJUSTMENT | (system) |
+| 34 | CAPITALIZED_INCOME | Progressive loan |
+| 35 | CAPITALIZED_INCOME_AMORTIZATION | Progressive loan |
+| 36 | BUY_DOWN_FEE | Progressive loan |
+| 37 | BUY_DOWN_FEE_AMORTIZATION | Progressive loan |
+
+## Permissions
+
+The permission catalog for this domain (`m_permission`):
+
+| Permission | Endpoint(s) |
+| --- | --- |
+| `READ_LOAN` | All `GET /v1/loans/{loanId}/transactions*`. |
+| `REPAYMENT_LOAN`, `ADJUST_LOAN` | `?command=repayment`, `?command=undo` on a transaction. |
+| `WAIVEINTERESTPORTION_LOAN` | `?command=waiveinterest`. |
+| `WRITEOFF_LOAN`, `RECOVERYPAYMENT_LOAN`, `CLOSE_LOAN`, `CLOSEASRESCHEDULED_LOAN` | Closing flows. |
+| `CHARGEBACK_LOAN`, `CHARGEREFUND_LOAN`, `CHARGEADJUSTMENT_LOAN` | Adjustments. |
+| `MERCHANTISSUEDREFUND_LOAN`, `PAYOUTREFUND_LOAN`, `GOODWILLCREDIT_LOAN`, `CREDITBALANCEREFUND_LOAN`, `REFUNDBYCASH_LOAN`, `INTERESTPAYMENTWAIVER_LOAN` | Refund / waiver dispatchers. |
+| `REAGE_LOAN`, `REAMORTIZE_LOAN`, `DOWNPAYMENT_LOAN` | Schedule mutations and down-payment. |
+| `READ_LOANCHARGE`, `CREATE_LOANCHARGE`, `UPDATE_LOANCHARGE`, `DELETE_LOANCHARGE`, `WAIVE_LOANCHARGE`, `PAY_LOANCHARGE`, `ADJUSTMENT_LOANCHARGE` | `LoanChargesApiResource`. |
+| `READ_INTERESTPAUSES`, `CREATE_INTERESTPAUSE`, `UPDATE_INTERESTPAUSE`, `DELETE_INTERESTPAUSE` | `LoanInterestPauseApiResource`. |
+| `READ_POSTDATEDCHECKS`, `UPDATE_POSTDATEDCHECKS`, `DELETE_POSTDATEDCHECKS` | `RepaymentWithPostDatedChecksApiResource`. |
+
+Maker-checker can be turned on per permission via `PermissionsApiResource` (see [Security & Users](/api/security-and-users)).
+
+## Search and advanced query payloads
+
+Both `GET /v1/loans/{loanId}/transactions/search` and `POST /v1/loans/{loanId}/transactions/query` accept the same filter primitives. The `search` form pushes them through query parameters (`?fromDate=…&toDate=…&transactionTypes=2,17,21`); the `query` form takes a JSON predicate:
+
+```json
+{
+  "request": {
+    "columnFilters": [
+      { "column": "transaction_type_enum", "filters": [
+          { "operator": "IN", "values": ["2", "17", "21"] }
+      ]},
+      { "column": "transaction_date", "filters": [
+          { "operator": "GTE", "values": ["2024-01-01"] },
+          { "operator": "LT",  "values": ["2024-04-01"] }
+      ]}
+    ],
+    "resultsAreaColumnList": [ "id", "transaction_type_enum", "amount", "transaction_date" ],
+    "paging": { "pageSize": 50, "pageNo": 0 },
+    "sortOrder": [ { "column": "transaction_date", "direction": "DESC" } ]
+  }
+}
+```
+
+The same structure is supported on the savings counterpart.
+
+## Worked example — repay and reconcile
+
+```bash
+TENANT='Fineract-Platform-TenantId: default'
+HDR='Content-Type: application/json'
+
+# Apply a one-off charge
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/loans/911/charges \
+  -d '{ "chargeId": 21, "amount": 5, "dueDate": "15 April 2024",
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+
+# Make a partial repayment
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/loans/911/transactions?command=repayment' \
+  -d '{ "transactionDate": "20 April 2024", "transactionAmount": 100, "paymentTypeId": 1,
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+# → { "loanId": 911, "resourceId": 8821 }
+
+# Undo the repayment (the transaction id from above)
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST 'https://localhost:8443/fineract-provider/api/v1/loans/911/transactions/8821?command=undo' \
+  -d '{ "transactionDate": "20 April 2024",
+        "dateFormat": "dd MMMM yyyy", "locale": "en" }'
+```
+
+## Schema reference
+
+- `m_loan_transaction` — every transaction row, joined to `m_loan` via `loan_id`.
+- `m_loan_repayment_schedule` — the installment schedule that transactions consume.
+- `m_loan_charge` — applied charges. `m_loan_charge_paid_by` links a charge to the repayment that paid it.
+- `m_loan_term_variations` — interest pauses, payment holidays, principal variations.
+- `m_loan_transaction_relation` — charge-back, refund and adjustment links between transactions.
+- `m_loan_postdated_check` — post-dated cheques.
+- `m_loan_transaction_repayment_period_mapping` — which installments a transaction touched (used by progressive loans).
+- `m_loan_capitalized_income_allocation` and `m_loan_buy_down_fee_allocation` — progressive-loan amortisation tables.
+
+## Related domain documents
+
+- [Loans](/api/loans) — loan creation and state transitions.
+- [Loan Products](/api/loan-products) — `transactionProcessingStrategyCode` and the GL mapping that determines what each transaction posts to.
+- [Accounting](/api/accounting) — `JournalEntriesApiResource` and the GL-account taxonomy.
+- `cob/` — Close-of-Business jobs that run accruals, charges and delinquency evaluation against these tables.
+- `progressive-loan/` — the schedule generator behind the capitalized-income and buy-down-fee resources.

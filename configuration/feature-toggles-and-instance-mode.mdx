@@ -1,0 +1,315 @@
+---
+title: "Feature Toggles & Instance Mode"
+description: "How Apache Fineract's fineract.mode.* and fineract.module.* flags split a JVM into read, write, batch-worker and batch-manager roles, and how to combine them into common deployment patterns."
+keywords: ["Apache Fineract", "instance mode", "feature flags", "fineract.mode", "read-only", "batch worker", "deployment", "configuration"]
+---
+
+This page covers two layers of feature toggles that Apache Fineract applies on top of `application.properties`: the **instance-mode flags** (`fineract.mode.*`) that gate HTTP traffic and batch ownership at the JVM level, and the **module / feature flags** (`fineract.module.*`, `fineract.loan.transactionprocessor.*`, `fineract.job.*`) that switch optional sub-systems on or off. Together they let one binary serve very different operational roles — write-enabled API node, read-only reporting replica, dedicated batch worker, or batch coordinator — purely through configuration.
+
+**Source files**
+
+- `fineract-provider/src/main/resources/application.properties`
+- `fineract-core/src/main/java/org/apache/fineract/infrastructure/instancemode/api/FineractInstanceModeConstants.java`
+- `fineract-core/src/main/java/org/apache/fineract/infrastructure/instancemode/filter/FineractInstanceModeApiFilter.java`
+- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/instancemode/api/InstanceModeApiResource.java`
+
+For the operational view (how to choose a topology, how to drain a node, etc.) see [Runtime: Instance Mode](/runtime/instance-mode).
+
+## Instance-mode flags
+
+Four booleans determine what role a Fineract JVM plays:
+
+| Property | Default | Env var | Role |
+| --- | --- | --- | --- |
+| `fineract.mode.read-enabled` | `true` | `FINERACT_MODE_READ_ENABLED` | Accept HTTP `GET` requests against `/api/**`. |
+| `fineract.mode.write-enabled` | `true` | `FINERACT_MODE_WRITE_ENABLED` | Accept HTTP `POST`/`PUT`/`DELETE` requests against `/api/**`. |
+| `fineract.mode.batch-worker-enabled` | `true` | `FINERACT_MODE_BATCH_WORKER_ENABLED` | Execute Spring Batch / partitioned-job steps assigned to this node. |
+| `fineract.mode.batch-manager-enabled` | `true` | `FINERACT_MODE_BATCH_MANAGER_ENABLED` | Coordinate partitioned jobs, accept `/v1/jobs`, `/v1/scheduler`, `/v1/loans/catch-up` traffic. |
+
+These bind to `FineractProperties.FineractModeProperties` and are evaluated on every request by `FineractInstanceModeApiFilter`. The filter logic, abbreviated:
+
+```java
+if (path matches an exception (jobs/scheduler/instance-mode/batches)) {
+    proceed;
+} else if (mode.isReadEnabled() && request is GET) {
+    proceed;
+} else if (mode.isWriteEnabled()) {
+    proceed;
+} else {
+    reject with 405 Method Not Allowed;
+}
+```
+
+Important details from the filter:
+
+- `/v1/instance-mode` is always allowed (so an operator can flip the mode back even on a fully disabled node, when the `test` profile is on).
+- `/v1/jobs`, `/v1/scheduler`, `/v1/loans/catch-up`, `/v1/loans/is-catch-up-running` are allowed only when `batch-manager-enabled=true`.
+- `/v1/batches` is always allowed at the filter level — the per-request method check is enforced inside the batch resource itself, since a batch can contain a mix of `GET` and write operations.
+- Spring Boot Actuator endpoints (`/actuator/**`) bypass the filter entirely — liveness and readiness probes always work.
+
+If a request is rejected, the filter responds with HTTP `405 Method Not Allowed` and an `ApiGlobalErrorResponse.invalidInstanceTypeMethod(method)` body.
+
+### The `InstanceModeApiResource` runtime toggle (test profile only)
+
+Under the Spring profile `test` (`FineractProfiles.TEST`), Fineract exposes a `PUT /v1/instance-mode` endpoint that flips all four flags on a running JVM:
+
+```http
+PUT /fineract-provider/api/v1/instance-mode
+Content-Type: application/json
+
+{
+  "readEnabled": true,
+  "writeEnabled": false,
+  "batchWorkerEnabled": false,
+  "batchManagerEnabled": false
+}
+```
+
+The resource logs a prominent warning when it is activated — it is intended for integration tests only and must **never** be enabled in production. In production, change the flags by restarting the JVM with new environment values.
+
+## Common deployment patterns
+
+The two-by-two combination of read and write maps naturally onto a small set of patterns:
+
+| `read-enabled` | `write-enabled` | `batch-manager` | `batch-worker` | Role |
+| --- | --- | --- | --- | --- |
+| `true` | `true` | `true` | `true` | **All-in-one** — the default; what you get from a single Docker container. |
+| `true` | `true` | `false` | `false` | **API node** — front-of-house, jobs run elsewhere. |
+| `true` | `false` | `false` | `false` | **Read replica** — point at a read-only database for reporting/dashboards. |
+| `false` | `false` | `true` | `true` | **Batch node** — no public HTTP, executes scheduled jobs. |
+| `false` | `false` | `true` | `false` | **Batch manager** — coordinator only, partitions delegated to workers. |
+| `false` | `false` | `false` | `true` | **Batch worker** — picks up partitions assigned by a manager. |
+
+A typical horizontally-scaled topology is therefore:
+
+- **N × API nodes** behind a load balancer with read+write on, batch off.
+- **1 × Batch manager** with read+write off, batch-manager on, batch-worker off.
+- **M × Batch workers** with read+write off, batch-manager off, batch-worker on.
+- Optionally: **1+ read replicas** with `read-enabled=true, write-enabled=false`, pointing the Hikari pool at a read-only DB hostname (set the `fineract.tenant.read-only-*` properties).
+
+## Module flags
+
+These switches exclude entire subsystems from the Spring context, reducing startup time and the JVM footprint when you do not need them.
+
+| Property | Default | Env var |
+| --- | --- | --- |
+| `fineract.module.investor.enabled` | `true` | `FINERACT_MODULE_INVESTOR_ENABLED` |
+| `fineract.module.loan-origination.enabled` | `true` | `FINERACT_MODULE_LOAN_ORIGINATION_ENABLED` |
+
+Module flags are evaluated at bean-definition time via `@ConditionalOnProperty`, so changing them requires a JVM restart.
+
+## Loan transaction processor flags
+
+Apache Fineract ships nine transaction-allocation strategies. Each can be turned off independently — when a strategy is off its `LoanRepaymentScheduleTransactionProcessor` bean is excluded from the application context, and any loan that references it will fail validation at runtime (controlled by `fineract.loan.transactionprocessor.error-not-found-fail`).
+
+| Property | Default | Env var |
+| --- | --- | --- |
+| `fineract.loan.transactionprocessor.creocore.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_CREOCORE_ENABLED` |
+| `…early-repayment.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_EARLY_REPAYMENT_ENABLED` |
+| `…mifos-standard.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_MIFOS_STANDARD_ENABLED` |
+| `…heavensfamily.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_HEAVENSFAMILY_ENABLED` |
+| `…interest-principal-penalties-fees.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_INTEREST_PRINCIPAL_PENALTIES_FEES_ENABLED` |
+| `…principal-interest-penalties-fees.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_PRINCIPAL_INTEREST_PENALTIES_FEES_ENABLED` |
+| `…rbi-india.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_RBI_INDIA_ENABLED` |
+| `…due-penalty-fee-interest-principal-in-advance-…` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_DUE_PENALTY_FEE_INTEREST_PRINCIPAL_IN_ADVANCE_PRINCIPAL_PENALTY_FEE_INTEREST_ENABLED` |
+| `…due-penalty-interest-principal-fee-in-advance-…` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_DUE_PENALTY_INTEREST_PRINCIPAL_FEE_IN_ADVANCE_PENALTY_INTEREST_PRINCIPAL_FEE_ENABLED` |
+| `…advanced-payment-strategy.enabled` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_ADVANCED_PAYMENT_STRATEGY_ENABLED` |
+| `…error-not-found-fail` | `true` | `FINERACT_LOAN_TRANSACTIONPROCESSOR_ERROR_NOT_FOUND_FAIL` |
+
+## Job-related toggles
+
+Individual scheduled jobs can be disabled at startup independently of the instance mode. Even on a batch worker, you can choose to opt out of specific jobs:
+
+| Property | Default | Env var |
+| --- | --- | --- |
+| `fineract.job.loan-cob-enabled` | `true` | `FINERACT_JOB_LOAN_COB_ENABLED` |
+| `fineract.job.journal-entry-aggregation.enabled` | `true` | `FINERACT_JOB_JOURNAL_ENTRY_AGGREGATION_ENABLED` |
+| `fineract.job.stuck-retry-threshold` | `5` | `FINERACT_JOB_STUCK_RETRY_THRESHOLD` |
+
+## Notification, correlation, sampling, tracing
+
+A handful of cross-cutting features can also be toggled at startup:
+
+| Property | Default | Env var |
+| --- | --- | --- |
+| `fineract.notification.user-notification-system.enabled` | `true` | `FINERACT_USER_NOTIFICATION_SYSTEM_ENABLED` |
+| `fineract.logging.json.enabled` | `false` | `FINERACT_LOGGING_JSON_ENABLED` |
+| `fineract.correlation.enabled` | `false` | `FINERACT_LOGGING_HTTP_CORRELATION_ID_ENABLED` |
+| `fineract.correlation.header-name` | `X-Correlation-ID` | `FINERACT_LOGGING_HTTP_CORRELATION_ID_HEADER_NAME` |
+| `fineract.ip-tracking.enabled` | `false` | `FINERACT_CLIENT_IP_TRACKING_ENABLED` |
+| `fineract.sampling.enabled` | `false` | `FINERACT_SAMPLING_ENABLED` |
+| `fineract.events.external.enabled` | `false` | `FINERACT_EXTERNAL_EVENTS_ENABLED` |
+| `management.tracing.enabled` | `false` | `FINERACT_MANAGEMENT_TRACIING_ENABLED` |
+| `management.prometheus.metrics.export.enabled` | `false` | `FINERACT_MANAGEMENT_PROMETHEUS_ENABLED` |
+| `management.otlp.metrics.export.enabled` | `false` | `FINERACT_MANAGEMENT_OLTP_ENABLED` |
+
+## Worked examples
+
+### Read-only reporting node
+
+Use case: a separate JVM dedicated to BI dashboards or ad-hoc SQL reports, pointed at a read-only MariaDB replica.
+
+```bash
+# Mode: read-only API, no jobs
+FINERACT_MODE_READ_ENABLED=true
+FINERACT_MODE_WRITE_ENABLED=false
+FINERACT_MODE_BATCH_MANAGER_ENABLED=false
+FINERACT_MODE_BATCH_WORKER_ENABLED=false
+
+# Datasource: point at the replica
+FINERACT_HIKARI_JDBC_URL=jdbc:mariadb://reports-replica:3306/fineract_tenants
+
+# Tenant read-only datasource
+FINERACT_DEFAULT_TENANTDB_RO_HOSTNAME=reports-replica
+FINERACT_DEFAULT_TENANTDB_RO_PORT=3306
+FINERACT_DEFAULT_TENANTDB_RO_UID=reporter
+FINERACT_DEFAULT_TENANTDB_RO_PWD=...
+```
+
+Any `POST`/`PUT`/`DELETE` request is rejected with a 405 by `FineractInstanceModeApiFilter` before it reaches a handler — so even if a caller accidentally targets this node with a write, the read-only DB is never touched.
+
+### Batch-manager / batch-worker split
+
+Use case: large COB workload that needs to be sharded across several JVMs to fit the COB window.
+
+Manager node:
+
+```bash
+FINERACT_MODE_READ_ENABLED=false
+FINERACT_MODE_WRITE_ENABLED=false
+FINERACT_MODE_BATCH_MANAGER_ENABLED=true
+FINERACT_MODE_BATCH_WORKER_ENABLED=false
+
+# Hand off partitions over JMS or Kafka
+FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_ENABLED=true
+FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+```
+
+Worker nodes (scale out as needed):
+
+```bash
+FINERACT_MODE_READ_ENABLED=false
+FINERACT_MODE_WRITE_ENABLED=false
+FINERACT_MODE_BATCH_MANAGER_ENABLED=false
+FINERACT_MODE_BATCH_WORKER_ENABLED=true
+FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_ENABLED=true
+FINERACT_REMOTE_JOB_MESSAGE_HANDLER_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+
+# Tune the partitioned LOAN_COB
+LOAN_COB_CHUNK_SIZE=200
+LOAN_COB_PARTITION_SIZE=200
+LOAN_COB_THREAD_POOL_CORE_POOL_SIZE=10
+LOAN_COB_THREAD_POOL_MAX_POOL_SIZE=10
+```
+
+### API tier with external batch tier
+
+Use case: small batch fleet, large API fleet.
+
+API JVMs:
+
+```bash
+FINERACT_MODE_READ_ENABLED=true
+FINERACT_MODE_WRITE_ENABLED=true
+FINERACT_MODE_BATCH_MANAGER_ENABLED=false
+FINERACT_MODE_BATCH_WORKER_ENABLED=false
+```
+
+Single batch JVM (or pair, with one as manager):
+
+```bash
+FINERACT_MODE_READ_ENABLED=false
+FINERACT_MODE_WRITE_ENABLED=false
+FINERACT_MODE_BATCH_MANAGER_ENABLED=true
+FINERACT_MODE_BATCH_WORKER_ENABLED=true
+```
+
+This pattern is the most common production layout. Health probes still work on both tiers because the actuator path bypasses the instance-mode filter.
+
+## Filter exception list (reference)
+
+The `FineractInstanceModeApiFilter` allow-list is defined statically in the filter class. The current entries are:
+
+| Path prefix | When allowed |
+| --- | --- |
+| `/v1/jobs` | `batch-manager-enabled=true` |
+| `/v1/scheduler` | `batch-manager-enabled=true` |
+| `/v1/loans/catch-up` | `batch-manager-enabled=true` |
+| `/v1/loans/is-catch-up-running` | `batch-manager-enabled=true` |
+| `/v1/instance-mode` | Always (mode-toggle endpoint). |
+| `/v1/batches` | Always at filter level — individual requests are checked inside the resource. |
+| `/actuator/**` | Always (bypasses the filter). |
+
+If you need to extend the allow-list for a custom path, the cleanest option is to wrap the original filter with your own and short-circuit before delegating. Modifying the upstream filter would require a code change and re-build.
+
+## Patterns at a glance
+
+<CardGroup cols={2}>
+  <Card title="API + batch in one JVM" icon="box">
+    Default `fineract.mode.*` values. Simplest topology — best for small deployments or dev environments.
+  </Card>
+  <Card title="API tier ↔ Batch tier" icon="server">
+    Separate `FINERACT_MODE_BATCH_*=false` API nodes from `FINERACT_MODE_READ_ENABLED=false`/`FINERACT_MODE_WRITE_ENABLED=false` batch nodes. Independent scaling and clean failure isolation.
+  </Card>
+  <Card title="Read replica" icon="database">
+    Spin up extra JVMs with `FINERACT_MODE_WRITE_ENABLED=false`, point them at the read-only database via `fineract.tenant.read-only-*`. Use them for reporting dashboards and exports.
+  </Card>
+  <Card title="Manager + workers" icon="diagram-project">
+    Combine `FINERACT_MODE_BATCH_MANAGER_ENABLED=true,BATCH_WORKER_ENABLED=false` on one coordinator with `…MANAGER_ENABLED=false,WORKER_ENABLED=true` on a horizontally-scaled worker pool. Driven by the partitioned-job framework (`LOAN_COB`).
+  </Card>
+</CardGroup>
+
+## Interaction with Liquibase
+
+When you split roles you usually want **only one** node to run the Liquibase migrations. A common pattern is to disable `spring.liquibase.enabled` on the API and worker nodes and run a separate "schema upgrader" container with `SPRING_PROFILES_ACTIVE=liquibase-only`:
+
+```bash
+# Init container (one-shot)
+SPRING_PROFILES_ACTIVE=liquibase-only
+FINERACT_LIQUIBASE_ENABLED=true
+# This JVM applies migrations and exits.
+
+# API nodes
+FINERACT_LIQUIBASE_ENABLED=false
+FINERACT_MODE_READ_ENABLED=true
+FINERACT_MODE_WRITE_ENABLED=true
+FINERACT_MODE_BATCH_MANAGER_ENABLED=false
+FINERACT_MODE_BATCH_WORKER_ENABLED=false
+
+# Worker nodes
+FINERACT_LIQUIBASE_ENABLED=false
+FINERACT_MODE_READ_ENABLED=false
+FINERACT_MODE_WRITE_ENABLED=false
+FINERACT_MODE_BATCH_MANAGER_ENABLED=false
+FINERACT_MODE_BATCH_WORKER_ENABLED=true
+```
+
+This avoids the race where multiple JVMs try to acquire the Liquibase lock simultaneously at startup, and it surfaces migration failures clearly in CI/CD rather than mixing them with runtime errors.
+
+## Pros and cons of splitting roles
+
+**Pros of separating API and batch tiers**
+
+- Long-running COB jobs cannot starve API threads.
+- You can size the two tiers independently — small, GC-tuned API JVMs and large, heap-rich batch JVMs.
+- Rolling out an API change does not interrupt an in-progress batch (and vice versa).
+- A misbehaving job worker can be restarted without API downtime.
+
+**Cons / complications**
+
+- More moving parts to monitor and deploy.
+- The remote job message handler (JMS or Kafka) must be configured and operated.
+- You need a way to scale the worker pool — Kubernetes Horizontal Pod Autoscaler against a queue-depth metric works well.
+
+**When the default (one JVM does everything) is fine**
+
+- Small to medium tenants where the COB completes well within the nightly window.
+- Development, staging, demo environments.
+- Single-tenant deployments where there is no need to scale beyond one JVM.
+
+## See also
+
+- [Runtime: Instance Mode](/runtime/instance-mode) — operational view, traffic-shaping and drain procedures.
+- [Application Properties Reference](/configuration/application-properties#instance-modes) — the full property table.
+- [Environment Variables](/configuration/environment-variables#instance-mode) — `FINERACT_MODE_*` mapping.
+- [Jobs](/jobs) — partitioned-job tuning interacts with the batch-manager/worker split.

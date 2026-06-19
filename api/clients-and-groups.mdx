@@ -1,0 +1,310 @@
+---
+title: "Clients & Groups REST API"
+sidebarTitle: "Clients & Groups"
+description: "The Apache Fineract REST API surface for clients, groups and centres: ClientsApiResource, ClientIdentifiersApiResource, ClientChargesApiResource, ClientTransactionsApiResource, ClientAddressApiResource, ClientFamilyMembersApiResource, GroupsApiResource, CentersApiResource, GroupsLevelApiResource and ClientSearchV2ApiResource."
+---
+
+The Apache Fineract API exposes the customer-master domain — clients, their identifying documents, charges and transactions, family members and addresses, as well as the group / centre aggregation that microfinance institutions use to organise lending — through a tight cluster of JAX-RS resources living in `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/` and `…/portfolio/group/api/`. Every endpoint mounts under `/fineract-provider/api/v1` as described in the [REST API Overview](/api/overview).
+
+This page lists the most important calls per resource and points at the source file for the long tail.
+
+## Endpoint summary
+
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/clients/template` | `ClientsApiResource.java` | Returns office, code-value and product templates needed to render the client-create form. |
+| GET | `/v1/clients` | `ClientsApiResource.java` | Paged search by office, status, name, externalId, etc. |
+| GET | `/v1/clients/{clientId}` | `ClientsApiResource.java` | Retrieve one client (`?associations=all,parentGroup,charges,collateral,…`). |
+| POST | `/v1/clients` | `ClientsApiResource.java` | Create a client (Pending or directly Active). |
+| PUT | `/v1/clients/{clientId}` | `ClientsApiResource.java` | Update mutable client fields. |
+| DELETE | `/v1/clients/{clientId}` | `ClientsApiResource.java` | Hard-delete a client (Pending only). |
+| POST | `/v1/clients/{clientId}?command=…` | `ClientsApiResource.java` | State transition: `activate`, `reject`, `withdraw`, `close`, `reactivate`, `propose`, `assignStaff`, `unassignStaff`, `proposeAndAccept`, `withdrawTransfer`, `rejectTransfer`, `acceptTransfer`, `updateSavingsAccount`, `undoTransfer`. |
+| GET | `/v1/clients/{clientId}/accounts` | `ClientsApiResource.java` | All loans, savings, and share accounts linked to the client. |
+| GET | `/v1/clients/external-id/{externalId}` | `ClientsApiResource.java` | Same as `/{clientId}` but addressed by `externalId`. |
+| GET | `/v1/clients/{clientId}/identifiers` | `ClientIdentifiersApiResource.java` | List all KYC identifiers. |
+| POST | `/v1/clients/{clientId}/identifiers` | `ClientIdentifiersApiResource.java` | Add a passport / national-ID / driving-licence record. |
+| GET | `/v1/clients/{clientId}/charges` | `ClientChargesApiResource.java` | Charges applied at the client level. |
+| POST | `/v1/clients/{clientId}/charges/{chargeId}?command=pay\|waive` | `ClientChargesApiResource.java` | Pay or waive an existing client charge. |
+| GET | `/v1/clients/{clientId}/transactions` | `ClientTransactionsApiResource.java` | Client-level transactions (charge payments, waivers, reversals). |
+| POST | `/v1/clients/{clientId}/transactions/{transactionId}?command=undo` | `ClientTransactionsApiResource.java` | Reverse a client transaction. |
+| GET | `/v1/client/{clientid}/addresses` | `ClientAddressApiResource.java` | Retrieve all client addresses. |
+| POST | `/v1/client/{clientid}/addresses` | `ClientAddressApiResource.java` | Add an address. |
+| GET | `/v1/clients/{clientId}/familymembers` | `ClientFamilyMembersApiResource.java` | List dependants. |
+| POST | `/v1/clients/{clientId}/familymembers` | `ClientFamilyMembersApiResource.java` | Add a family member record. |
+| GET | `/v1/groups` | `GroupsApiResource.java` | Search groups by office, centre, status, name, externalId. |
+| POST | `/v1/groups` | `GroupsApiResource.java` | Create a group (Pending or Active). |
+| POST | `/v1/groups/{groupId}?command=…` | `GroupsApiResource.java` | Activate, close, transfer, assignStaff, associateClients, disassociateClients, generateCollectionSheet. |
+| GET | `/v1/groups/{groupId}/accounts` | `GroupsApiResource.java` | All accounts attached to the group, including GLIM/GSIM child accounts. |
+| GET | `/v1/centers` | `CentersApiResource.java` | Search centres (groups-of-groups). |
+| POST | `/v1/centers/{centerId}?command=…` | `CentersApiResource.java` | Activate, close, generateCollectionSheet. |
+| GET | `/v1/grouplevels` | `GroupsLevelApiResource.java` | The configured hierarchy levels (Centre → Group → Sub-group …). |
+| POST | `/v1/v2/clients/search` | `ClientSearchV2ApiResource.java` | Free-text search through the new v2 client-search service. |
+
+Every method on every resource is listed alongside its `@Path` and Swagger `@Operation` annotation in the source file — `grep -n '@Path\|@Operation' <file>` is the canonical index.
+
+## `ClientsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientsApiResource.java`
+Class path: `@Path("/v1/clients")`
+
+This is the workhorse of customer onboarding. Each method is a thin shell that either calls `clientReadPlatformService.retrieveOne(...)` or builds a `CommandWrapper` and hands it to `commandsSourceWritePlatformService.logCommandSource(...)`. The `@Path("{clientId}")` POST handler is a single dispatcher that looks at the `?command=` query parameter and translates it into the matching command name:
+
+```java
+// fineract-provider/.../portfolio/client/api/ClientsApiResource.java
+@POST
+@Path("{clientId}")
+public String activate(@PathParam("clientId") final Long clientId,
+        @QueryParam("command") final String commandParam,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapper resourceDetails = builder.withClientId(clientId).withJson(apiRequestBodyAsJson)
+            .activateClient(clientId).build();
+    if (is(commandParam, "reject"))   { /* rejectClient(clientId) */ }
+    if (is(commandParam, "withdraw")) { /* withdrawClient(clientId) */ }
+    if (is(commandParam, "close"))    { /* closeClient(clientId) */ }
+    // … reactivate, propose, assignStaff, unassignStaff, transfer, etc.
+    return toApiJsonSerializer.serialize(commandsSourceWritePlatformService.logCommandSource(commandRequest));
+}
+```
+
+That dispatch table is the single most useful reference for the client lifecycle — see `portfolio/clients.mdx` in this wiki for the full state diagram. The `external-id/{externalId}` overloads do the same things but use the tenant-supplied identifier instead of the numeric primary key.
+
+Bulk endpoints `downloadtemplate` / `uploadtemplate` produce and consume the `.xls` workbook used by the bulk-import feature. They mount inside the same resource and delegate to `BulkImportApiResource` infrastructure.
+
+## `ClientIdentifiersApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientIdentifiersApiResource.java`
+Class path: `@Path("/v1/clients/{clientId}/identifiers")`
+
+KYC identifier sub-resource. The `template` endpoint returns the configured identifier-type codes (e.g. National ID, Passport, Driving Licence) from the `m_code` / `m_code_value` tables. The standard CRUD set is:
+
+| Method | Path | Handler | Notes |
+| --- | --- | --- | --- |
+| GET | `/v1/clients/{clientId}/identifiers/template` | `newClientIdentifierDetails` | Identifier-type code values. |
+| GET | `/v1/clients/{clientId}/identifiers` | `retrieveAllClientIdentifiers` | All KYC documents for the client. |
+| POST | `/v1/clients/{clientId}/identifiers` | `createClientIdentifier` | Add a new ID document. |
+| GET | `/v1/clients/{clientId}/identifiers/{identifierId}` | `retrieveClientIdentifiers` | One identifier. |
+| PUT | `/v1/clients/{clientId}/identifiers/{identifierId}` | `updateClientIdentifer` | Update. |
+| DELETE | `/v1/clients/{clientId}/identifiers/{identifierId}` | `deleteClientIdentifier` | Delete. |
+
+Uniqueness is enforced at the database layer (`uq_client_identifier`).
+
+## `ClientChargesApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientChargesApiResource.java`
+Class path: `@Path("/v1/clients/{clientId}/charges")`
+
+Client-level fees (membership, annual, KYC processing, etc.). The `payOrWaiveClientCharge` handler is the multi-command POST — its dispatch table accepts `command=pay`, `command=waive`, `command=adjustment`. The price is taken from `m_charge` at the time the charge is applied; subsequent updates to the master charge do not propagate.
+
+```java
+@POST
+@Path("{clientId}/charges/{chargeId}")
+public String payOrWaiveClientCharge(
+        @PathParam("clientId") final Long clientId,
+        @PathParam("chargeId") final Long chargeId,
+        @QueryParam("command") final String commandParam,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) { … }
+```
+
+## `ClientTransactionsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientTransactionsApiResource.java`
+Class path: `@Path("/v1/clients")`
+
+Read & undo of client-level transactions (the rows in `m_client_transaction`). Eight URL shapes exist because the resource is fully symmetrical between numeric id and `external-id` for both the client *and* the transaction:
+
+| Path shape | Use |
+| --- | --- |
+| `/{clientId}/transactions` | Numeric id, list. |
+| `/{clientId}/transactions/{transactionId}` | Numeric ids. |
+| `/{clientId}/transactions/external-id/{transactionExternalId}` | Numeric client, external txn. |
+| `/external-id/{clientExternalId}/transactions` | External client, list. |
+| `/external-id/{clientExternalId}/transactions/{transactionId}` | External client, numeric txn. |
+| `/external-id/{clientExternalId}/transactions/external-id/{transactionExternalId}` | Fully external. |
+
+POSTs to any of those forms with no `?command=` are rejected; only `command=undo` is recognised — see the handler in `UndoClientTransactionCommandHandler`.
+
+## `ClientAddressApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientAddressApiResource.java`
+Class path: `@Path("/v1/client")` (note the singular form)
+
+A small CRUD shell over `m_client_address` and the polymorphic `m_address` table. The `template` endpoint dispenses the code values for `addressTypeId`, `countryId`, `stateProvinceId` and so on.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/client/addresses/template` | `getAddressesTemplate` |
+| POST | `/v1/client/{clientid}/addresses` | `addClientAddress` |
+| GET | `/v1/client/{clientid}/addresses` | `getAddresses` |
+| PUT | `/v1/client/{clientid}/addresses` | `updateClientAddress` |
+
+Address structure is configured at runtime through `EntityFieldConfigurationApiResource` — fields can be made required or hidden per tenant.
+
+## `ClientFamilyMembersApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientFamilyMembersApiResource.java`
+Class path: `@Path("/v1/clients/{clientId}/familymembers")`
+
+Standard CRUD over `m_family_members`. Used by lending products that require a guarantor relationship or by demographic reports.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/clients/{clientId}/familymembers/template` | `getTemplate` |
+| GET | `/v1/clients/{clientId}/familymembers` | `getFamilyMembers` |
+| GET | `/v1/clients/{clientId}/familymembers/{familyMemberId}` | `getFamilyMember` |
+| POST | `/v1/clients/{clientId}/familymembers` | `addClientFamilyMembers` |
+| PUT | `/v1/clients/{clientId}/familymembers/{familyMemberId}` | `updateClientFamilyMembers` |
+| DELETE | `/v1/clients/{clientId}/familymembers/{familyMemberId}` | `deleteClientFamilyMembers` |
+
+## `GroupsApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/group/api/GroupsApiResource.java`
+Class path: `@Path("/v1/groups")`
+
+Groups in Fineract are *grouping_type=2* rows in `m_group` (centres are `grouping_type=1`). A group can own its own loans / savings (GLIM = Group Loan with Individual Monitoring, GSIM = Group Savings with Individual Monitoring) or simply be a container of clients.
+
+Key endpoints:
+
+| Method | Path | Handler | Purpose |
+| --- | --- | --- | --- |
+| GET | `/v1/groups/template` | `retrieveTemplate` | Code values, products, staff for the group-create UI. |
+| GET | `/v1/groups` | `retrieveAll` | Paged search. |
+| GET | `/v1/groups/{groupId}` | `retrieveOne` | `?associations=clientMembers,parentGroup,calendars,collectionMeetingCalendar,…`. |
+| POST | `/v1/groups` | `create` | Pending or active group. |
+| POST | `/v1/groups/{groupId}?command=…` | `activateOrGenerateCollectionSheet` | `activate`, `close`, `transferClients`, `associateClients`, `disassociateClients`, `assignRole`, `unassignRole`, `updateRole`, `generateCollectionSheet`, `saveCollectionSheet`. |
+| POST | `/v1/groups/{groupId}/command/unassign_staff` | `unassignLoanOfficer` | Dedicated bulk-unassign call. |
+| PUT | `/v1/groups/{groupId}` | `update` | Mutable fields. |
+| DELETE | `/v1/groups/{groupId}` | `delete` | Pending only. |
+| GET | `/v1/groups/{groupId}/accounts` | `retrieveAccounts` | All loans & savings for the group. |
+| GET | `/v1/groups/{groupId}/glimaccounts` | `retrieveglimAccounts` | Group Loan Individual Monitoring children. |
+| GET | `/v1/groups/{groupId}/gsimaccounts` | `retrieveGsimAccounts` | Group Savings Individual Monitoring children. |
+| GET | `/v1/groups/downloadtemplate` | `getGroupsTemplate` | xls template for bulk import. |
+| POST | `/v1/groups/uploadtemplate` | `postGroupTemplate` | xls bulk import. |
+
+The collection-sheet endpoints feed into `CollectionSheetApiResource` — see `portfolio/collection-sheet.mdx`.
+
+## `CentersApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/group/api/CentersApiResource.java`
+Class path: `@Path("/v1/centers")`
+
+Same shape as `GroupsApiResource` but for `grouping_type=1`. The dispatcher POST accepts `command=activate`, `command=close`, `command=transfer`, `command=generateCollectionSheet`, `command=saveCollectionSheet`.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/centers/template` | `retrieveTemplate` |
+| GET | `/v1/centers` | `retrieveAll` |
+| GET | `/v1/centers/{centerId}` | `retrieveOne` |
+| POST | `/v1/centers` | `create` |
+| PUT | `/v1/centers/{centerId}` | `update` |
+| DELETE | `/v1/centers/{centerId}` | `delete` |
+| POST | `/v1/centers/{centerId}?command=…` | `activate` (dispatcher) |
+| GET | `/v1/centers/{centerId}/accounts` | `retrieveGroupAccount` |
+| GET | `/v1/centers/downloadtemplate` | `getCentersTemplate` |
+| POST | `/v1/centers/uploadtemplate` | `postCentersTemplate` |
+
+## `GroupsLevelApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/group/api/GroupsLevelApiResource.java`
+Class path: `@Path("/v1/grouplevels")`
+
+Single read endpoint exposing the configured hierarchy (the rows in `m_group_level`):
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/v1/grouplevels` | `retrieveAllGroups` |
+
+The hierarchy is read-only via the API — schema changes ship as Liquibase changelogs.
+
+## `ClientSearchV2ApiResource`
+
+File: `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/v2/search/ClientSearchV2ApiResource.java`
+Class path: `@Path("/v2/clients")`
+
+The only **v2** endpoint in this domain. It hosts the new POST-body search that supersedes the older `/v1/clients?sqlSearch=…` query-parameter mechanism. It accepts a structured JSON predicate and returns a paged result with the same envelope as the v1 list endpoints.
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/v2/clients/search` | `searchByText` |
+
+Behind the scenes it goes through `SearchingClientRepository` in `fineract-core/.../portfolio/client/domain/search/`, which provides a JPA Criteria-based search that is friendlier to SQL injection auditing than the legacy `sqlSearch` parameter.
+
+## Permissions
+
+The principal permissions in `m_permission` for this domain:
+
+| Permission | Scope |
+| --- | --- |
+| `READ_CLIENT` | All `GET /v1/clients*`. |
+| `CREATE_CLIENT`, `UPDATE_CLIENT`, `DELETE_CLIENT` | `POST/PUT/DELETE /v1/clients`. |
+| `ACTIVATE_CLIENT`, `CLOSE_CLIENT`, `REJECT_CLIENT`, `WITHDRAW_CLIENT`, `REACTIVATE_CLIENT`, `UNDOREJECT_CLIENT`, `UNDOWITHDRAWAL_CLIENT` | Lifecycle transitions on `POST /v1/clients/{clientId}?command=…`. |
+| `PROPOSETRANSFER_CLIENT`, `ACCEPTTRANSFER_CLIENT`, `REJECTTRANSFER_CLIENT`, `WITHDRAWTRANSFER_CLIENT`, `UNDOTRANSFER_CLIENT` | Inter-office client transfer flow. |
+| `READ_CLIENTIDENTIFIER`, `CREATE_CLIENTIDENTIFIER`, `UPDATE_CLIENTIDENTIFIER`, `DELETE_CLIENTIDENTIFIER` | `ClientIdentifiersApiResource`. |
+| `READ_CLIENTCHARGE`, `CREATE_CLIENTCHARGE`, `WAIVE_CLIENTCHARGE`, `PAY_CLIENTCHARGE`, `DELETE_CLIENTCHARGE` | `ClientChargesApiResource`. |
+| `READ_CLIENT_ADDRESS`, `CREATE_CLIENT_ADDRESS`, `UPDATE_CLIENT_ADDRESS` | `ClientAddressApiResource`. |
+| `READ_FAMILYMEMBERS`, `CREATE_FAMILYMEMBERS`, `UPDATE_FAMILYMEMBERS`, `DELETE_FAMILYMEMBERS` | `ClientFamilyMembersApiResource`. |
+| `READ_GROUP`, `CREATE_GROUP`, `UPDATE_GROUP`, `DELETE_GROUP`, `ACTIVATE_GROUP`, `DISBURSE_GROUP`, `CLOSE_GROUP` | `GroupsApiResource`. |
+| `ASSOCIATECLIENTS_GROUP`, `DISASSOCIATECLIENTS_GROUP`, `TRANSFERCLIENTS_GROUP`, `ASSIGNROLE_GROUP`, `UNASSIGNROLE_GROUP`, `UPDATEROLE_GROUP` | Group-member maintenance. |
+| `READ_CENTER`, `CREATE_CENTER`, `UPDATE_CENTER`, `DELETE_CENTER`, `ACTIVATE_CENTER` | `CentersApiResource`. |
+| `READ_GROUPLEVEL` | `GroupsLevelApiResource`. |
+
+When the `maker-checker` global configuration is on, the corresponding `CHECKER_<PERMISSION>` rows control who can approve a queued command (see `MakercheckersApiResource` and the [Security & Users](/api/security-and-users) page).
+
+## Common query parameters
+
+The two big list endpoints (`/v1/clients` and `/v1/groups`) accept a shared set of paging and filtering parameters:
+
+| Parameter | Purpose |
+| --- | --- |
+| `officeId` | Office-hierarchy scope — includes child offices. |
+| `displayName`, `firstName`, `lastName` | Partial-match by name. |
+| `externalId` | Exact-match by tenant id. |
+| `status` | `all`, `pending`, `active`, `closed`, `rejected`, `withdrawn`, `transferInProgress`, `transferOnHold`. |
+| `orphansOnly=true` | Clients not yet attached to a group (clients endpoint only). |
+| `underHierarchy=…` | Hierarchy text from `m_office`. |
+| `sqlSearch` | Legacy free-form predicate — prefer `ClientSearchV2ApiResource` for new code. |
+| `paged=true`, `offset`, `limit`, `orderBy`, `sortOrder` | Pagination & sort. |
+
+`?associations=` lets one read pull in linked data without a second round trip — values include `all`, `clientMembers` (groups), `parentGroup`, `charges`, `transactions`, `roles`, `meeting`, `calendars`, `collectionMeetingCalendar`, `parentHierarchy`.
+
+## Worked example — onboard a client into a group
+
+```bash
+TENANT='Fineract-Platform-TenantId: default'
+HDR='Content-Type: application/json'
+
+# 1. Create the client (active immediately)
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/clients \
+  -d '{
+    "officeId": 1, "firstname": "Jane", "lastname": "Doe",
+    "externalId": "JD-0001",
+    "active": true, "activationDate": "01 April 2024",
+    "legalFormId": 1, "dateFormat": "dd MMMM yyyy", "locale": "en"
+  }'
+# → { "clientId": 4711, "resourceId": 4711 }
+
+# 2. Attach the client to an existing group
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST "https://localhost:8443/fineract-provider/api/v1/groups/12?command=associateClients" \
+  -d '{ "clientMembers": [4711] }'
+
+# 3. Add a KYC identifier
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/clients/4711/identifiers \
+  -d '{ "documentTypeId": 1, "documentKey": "NID-12345678", "status": "Active" }'
+
+# 4. Add an address (using the template's expected keys)
+curl -k -u admin:password -H "$TENANT" -H "$HDR" \
+  -X POST https://localhost:8443/fineract-provider/api/v1/client/4711/addresses \
+  -d '{ "addressTypeId": 17, "city": "Nairobi", "countryIdCodeValue": 60,
+        "isActive": true }'
+```
+
+## Related domain documents
+
+- `portfolio/clients.mdx` — entity model, lifecycle states and command-handler graph for clients.
+- `portfolio/groups.mdx` — `Group` entity, parent/child semantics, GSIM/GLIM internals.
+- `portfolio/centers.mdx` — centres, collection meetings and recurring-calendar integration.
+- `portfolio/client-identifiers-and-addresses.mdx` — JPA mappings for identifiers and the polymorphic address store.
+- `portfolio/client-family-members.mdx` — family-member schema and relationship code-values.
+- `portfolio/search.mdx` — the legacy `SearchApiResource` and how it relates to `ClientSearchV2ApiResource`.

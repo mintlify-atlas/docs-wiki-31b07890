@@ -1,0 +1,300 @@
+---
+title: "Apache Fineract Validation Module Architecture Overview"
+sidebarTitle: "Validation Module"
+description: "Map of the Apache Fineract fineract-validation Gradle module — reusable Jakarta Bean Validation constraints applied across Fineract JSON request DTOs."
+---
+
+Apache Fineract carries a small dedicated Gradle module — `fineract-validation` — that holds a handful of **custom Jakarta Bean Validation constraints** the rest of the codebase reuses on request DTOs. The module is deliberately tiny: every constraint is a thin `@interface` + matching `ConstraintValidator` pair, and the whole module pulls only `jakarta.validation`, Hibernate Validator (the reference implementation), `commons-lang3`, and Lombok. It exists so that Fineract domain logic can decorate JSON request beans with `@LocalDate`, `@DateFormat`, `@Locale`, and `@EnumValue` annotations and let the standard Bean Validation lifecycle catch invalid input *before* it ever reaches a write platform service.
+
+This page explains where the module fits, how the constraints are wired, and why splitting them out into their own Gradle module matters. The complete enumeration of every constraint lives in [Custom constraints](/validation/custom-constraints).
+
+## Module layout
+
+```text
+fineract-validation/
+├── build.gradle
+├── dependencies.gradle
+└── src/
+    ├── main/java/org/apache/fineract/validation/constraints/
+    │   ├── DateFormat.java          ← annotation
+    │   ├── DateFormatValidator.java ← jakarta.validation.ConstraintValidator
+    │   ├── EnumValue.java
+    │   ├── EnumValueValidator.java
+    │   ├── LocalDate.java           ← class-level constraint (multi-field)
+    │   ├── LocalDateValidator.java
+    │   ├── Locale.java
+    │   └── LocaleValidator.java
+    └── test/java/org/apache/fineract/validation/constraints/
+        ├── DateFormatValidationTest.java
+        ├── LocalDateValidationTest.java
+        └── LocaleValidationTest.java
+```
+
+That's it — no services, no controllers, no Spring boilerplate. The validators are POJOs registered automatically by Hibernate Validator's annotation scanner the moment the JAR is on the classpath.
+
+## Why a dedicated Gradle module
+
+The constraints could have lived next to the DTOs they validate — but pulling them into `fineract-validation` carries three benefits:
+
+<CardGroup cols={2}>
+  <Card title="No transitive Spring dependency" icon="cube">
+    Other modules can use the annotations without dragging in Spring or any Fineract domain types. The `fineract-core` and feature modules consume `fineract-validation` as a plain Java compile dep.
+  </Card>
+  <Card title="Reusable across all DTOs" icon="recycle">
+    Date format, locale, enum-value, and composite local-date checks are not Fineract-specific — they apply to every JSON request the platform parses.
+  </Card>
+  <Card title="Standalone testability" icon="vial">
+    The test sub-package boots a minimal Hibernate Validator + Spring `MessageSourceAutoConfiguration` to exercise constraints in isolation, without any of the Fineract platform up.
+  </Card>
+  <Card title="Standard Bean Validation" icon="check-double">
+    Each constraint follows the Jakarta Bean Validation 3.0 contract verbatim — Hibernate Validator picks them up via `META-INF/services` and the `@Constraint(validatedBy = ...)` meta-annotation.
+  </Card>
+</CardGroup>
+
+## How constraints are applied
+
+The Fineract pattern is the same as any Spring + Bean-Validation project: decorate a JAX-RS or Spring request DTO with the constraint annotations, mark the controller parameter `@Valid`, and let the platform's exception mapper translate any `ConstraintViolationException` into a 400 response.
+
+A canonical example is `BusinessDateUpdateRequest` in `fineract-core` — it uses all four constraints at once:
+
+```java
+// fineract-core/src/main/java/org/apache/fineract/infrastructure/businessdate/data/api/BusinessDateUpdateRequest.java
+import org.apache.fineract.validation.constraints.DateFormat;
+import org.apache.fineract.validation.constraints.EnumValue;
+import org.apache.fineract.validation.constraints.LocalDate;
+import org.apache.fineract.validation.constraints.Locale;
+
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@LocalDate(dateField = "date", formatField = "dateFormat", localeField = "locale")
+public class BusinessDateUpdateRequest implements Serializable {
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.date-format.not-blank}")
+    @DateFormat
+    private String dateFormat;
+
+    @Schema(description = "Type of business date", example = "BUSINESS_DATE", allowableValues = { "BUSINESS_DATE", "COB_DATE" })
+    @EnumValue(enumClass = BusinessDateType.class, message = "{org.apache.fineract.businessdate.type.invalid}")
+    @NotNull(message = "{org.apache.fineract.businessdate.type.not-blank}")
+    private String type;
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.date.not-blank}")
+    private String date;
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.locale.not-blank}")
+    @Locale
+    private String locale;
+}
+```
+
+What that buys:
+
+- `@DateFormat` on `dateFormat` — rejects any `String` that is not a valid `DateTimeFormatter` pattern.
+- `@EnumValue(enumClass = BusinessDateType.class)` on `type` — rejects any string that is not (case-insensitively) one of the `BusinessDateType` enum names.
+- `@Locale` on `locale` — rejects strings that do not match a JVM-known BCP-47 locale.
+- `@LocalDate(...)` at the **class level** — rejects the bean as a whole if `date`, `dateFormat`, and `locale` together do not parse into a valid `java.time.LocalDate`.
+
+The four pieces are independent — you can use `@DateFormat` on its own to validate a `dateFormat` string, or `@Locale` on its own. `@LocalDate` is the composite check that combines all three.
+
+## Wiring at the call site
+
+There is nothing Fineract-specific about hooking the validator in. Anywhere Hibernate Validator is configured — typically via Spring Boot's auto-configuration — the constraints will fire automatically:
+
+```mermaid
+flowchart LR
+    A[JAX-RS resource method] --> B[@Valid parameter]
+    B --> C[Hibernate Validator scans annotations]
+    C --> D{constraints satisfied?}
+    D -- no --> E[ConstraintViolationException]
+    E --> F[Global exception mapper → HTTP 400 with i18n message]
+    D -- yes --> G[Resource method body runs]
+```
+
+The Fineract integration test config (and the module's own test classes) shows how to bootstrap the validator without the rest of the platform:
+
+```java
+@Configuration
+@Import({ MessageSourceAutoConfiguration.class })
+static class TestConfig {
+
+    @Bean
+    public jakarta.validation.Validator validator() {
+        return Validation.byProvider(HibernateValidator.class).configure().buildValidatorFactory().getValidator();
+    }
+}
+```
+
+That is also what `fineract-validation`'s own test classes (`DateFormatValidationTest`, `LocaleValidationTest`, `LocalDateValidationTest`) use to drive validation in unit tests.
+
+## Constraint metadata
+
+Each constraint is a standard Jakarta Bean Validation annotation:
+
+```java
+@Documented
+@Constraint(validatedBy = DateFormatValidator.class)
+@Target({ ElementType.FIELD, ElementType.PARAMETER })
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DateFormat {
+
+    String message() default "{org.apache.fineract.validation.date-format}";
+
+    Class<?>[] groups() default {};
+
+    Class<? extends Payload>[] payload() default {};
+}
+```
+
+The `message` defaults use Spring `MessageSource` keys, so installations can override the rendered error text in their own `messages.properties`:
+
+| Default key                                            | Constraint    |
+| ------------------------------------------------------ | ------------- |
+| `org.apache.fineract.validation.date-format`           | `@DateFormat` |
+| `org.apache.fineract.validation.enum`                  | `@EnumValue`  |
+| `org.apache.fineract.validation.local-date`            | `@LocalDate`  |
+| `org.apache.fineract.validation.locale`                | `@Locale`     |
+
+Most call sites override the message per field, as in the `BusinessDateUpdateRequest` example above:
+
+```java
+@EnumValue(enumClass = BusinessDateType.class, message = "{org.apache.fineract.businessdate.type.invalid}")
+```
+
+## Targets
+
+The `@Target` on each annotation tells you where it is allowed to appear:
+
+| Annotation    | Allowed targets                       | Why                                                                          |
+| ------------- | ------------------------------------- | ---------------------------------------------------------------------------- |
+| `@DateFormat` | `FIELD`, `PARAMETER`                  | Validates a single `String`, so it works on bean fields and method args.     |
+| `@EnumValue`  | `FIELD`                               | Bean-only — the validator initialises from a class literal in `enumClass()`. |
+| `@Locale`     | `FIELD`, `PARAMETER`                  | Single-string check, usable on either.                                       |
+| `@LocalDate`  | `TYPE`                                | Composite — reflects across the bean to pull `date`, `format`, `locale`.     |
+
+The `@LocalDate` constraint is the only class-level one. It is annotated `@Target({ ElementType.TYPE })` and reads its three target field names from annotation attributes — that is how the validator knows which fields to introspect.
+
+## Where these constraints get used
+
+The `fineract-validation` module is consumed by every module that builds request DTOs from JSON. The biggest users include:
+
+- **`fineract-core`** — `BusinessDateUpdateRequest`, account / org request beans, command parameter validation.
+- **`fineract-provider`** — every JAX-RS request payload, e.g. the loan re-age and re-amortise preview endpoints in `portfolio/loanaccount/api/request/`.
+- **`fineract-loan`** / **`fineract-savings`** / **`fineract-accounting`** — module-specific DTOs that all use `@LocalDate` / `@DateFormat` / `@Locale` on the now-standard `(date, dateFormat, locale)` field trio.
+
+Grep example:
+
+```text
+fineract-core/.../BusinessDateUpdateRequest.java
+fineract-provider/.../loanaccount/api/request/ReAgePreviewRequest.java
+fineract-provider/.../loanaccount/api/request/ReAmortizationPreviewRequest.java
+```
+
+Anywhere Fineract takes a request with a free-form date, it uses the `@LocalDate` composite constraint to enforce that the trio actually parses.
+
+## What this module does NOT include
+
+<Note>
+`fineract-validation` deliberately stays out of business-rule territory. It only contains *format* and *type* checks — things that can be evaluated from a single bean without touching the database or any Fineract service. Domain-level validations (does this office exist? is this currency one of the configured ones?) live closer to the action, typically inside `DataValidatorBuilder` in `fineract-core`. The two systems compose: Bean Validation rejects garbled input before it reaches a service; `DataValidatorBuilder` rejects requests that pass the basic checks but violate platform rules.
+</Note>
+
+## Bean Validation runtime model
+
+Hibernate Validator is the underlying implementation. Once the module is on the classpath:
+
+<Steps>
+  <Step title="Annotations are picked up reflectively">
+    Hibernate Validator scans annotated fields when a class is first validated and caches the constraint metadata.
+  </Step>
+  <Step title="Validators are instantiated lazily">
+    The first `validate(bean)` call instantiates the matching `ConstraintValidator` (e.g. `DateFormatValidator`). Subsequent validations reuse the instance.
+  </Step>
+  <Step title="initialize(annotation) is called">
+    For `@EnumValue` and `@LocalDate`, the validator reads the annotation parameters (`enumClass`, `dateField`, `formatField`, `localeField`) once at init.
+  </Step>
+  <Step title="isValid(value, context) returns boolean">
+    The validator returns `true` if the value satisfies the constraint, `false` to register a violation against the default message key.
+  </Step>
+  <Step title="Violations bubble up as ConstraintViolationException">
+    Hibernate Validator aggregates all violations on the bean into a single exception thrown from `@Valid`. Fineract's exception mapper turns the exception into a 400 with one `ApiParameterError` per violation.
+  </Step>
+</Steps>
+
+## Adding a constraint
+
+If you need a new format check that is reused across modules:
+
+<Steps>
+  <Step title="Create the @interface">
+    Add `MyCheck.java` in `fineract-validation/src/main/java/org/apache/fineract/validation/constraints/`. Annotate with `@Constraint(validatedBy = MyCheckValidator.class)`, `@Target`, and `@Retention(RUNTIME)`. Declare `message()`, `groups()`, `payload()` plus any parameters the validator needs.
+  </Step>
+  <Step title="Implement the validator">
+    Create `MyCheckValidator` implementing `ConstraintValidator<MyCheck, T>`. Read parameters in `initialize(MyCheck)`; return `boolean` from `isValid(T, ConstraintValidatorContext)`.
+  </Step>
+  <Step title="Add a unit test">
+    Mirror the style of `DateFormatValidationTest` or `LocaleValidationTest` — boot a minimal Spring context with `MessageSourceAutoConfiguration` and assert against the validator.
+  </Step>
+  <Step title="Apply at call site">
+    Decorate the relevant request DTO field or class with the new annotation. No further wiring needed.
+  </Step>
+</Steps>
+
+## Per-constraint reference
+
+The four built-in constraints are catalogued in their own page with the full `@interface` source plus a description of the `ConstraintValidator` logic for each:
+
+<CardGroup cols={1}>
+  <Card title="Custom constraints reference" href="/validation/custom-constraints">
+    Side-by-side reference of `@DateFormat`, `@EnumValue`, `@Locale`, and `@LocalDate` — what each one checks, where it lives, and how it parses its input.
+  </Card>
+</CardGroup>
+
+## Build / dependency footprint
+
+`fineract-validation/build.gradle` declares the module description and applies the standard `java` + `eclipse` plugins; the dependency block (in `dependencies.gradle`) is intentionally minimal:
+
+- `jakarta.validation:jakarta.validation-api` — the Bean Validation contract.
+- `org.hibernate.validator:hibernate-validator` — the reference implementation.
+- `org.apache.commons:commons-lang3` — for `StringUtils.isBlank` inside the validators.
+- `org.projectlombok:lombok` — annotation processor only.
+- Test scope: `spring-boot-starter-test` plus `spring-boot-autoconfigure` for `MessageSourceAutoConfiguration`.
+
+There is no Spring runtime dependency in the main scope. A downstream module that wants to use a constraint only needs `compileOnly` access — Hibernate Validator picks the JAR up at runtime via the standard `META-INF` discovery.
+
+## Composition with DataValidatorBuilder
+
+Two validation systems coexist in Fineract — they are complementary:
+
+```mermaid
+flowchart TD
+    A[Incoming JSON request] --> B[Hibernate Validator]
+    B -->|@DateFormat / @Locale / @EnumValue / @LocalDate| C{format ok?}
+    C -- no --> D[ConstraintViolationException → HTTP 400]
+    C -- yes --> E[Service layer]
+    E --> F[DataValidatorBuilder]
+    F -->|office exists? currency configured? user has permission?| G{rule ok?}
+    G -- no --> H[PlatformApiDataValidationException → HTTP 400]
+    G -- yes --> I[Command dispatch]
+```
+
+`fineract-validation` answers "Is the JSON shape correct?" — `DataValidatorBuilder` (in `fineract-core`) answers "Are the referenced entities valid in this Fineract instance?". The two error envelopes both translate to HTTP 400 in the global exception mapper but carry different `ApiParameterError` shapes; clients can disambiguate by inspecting the `developerMessage` / `code` fields.
+
+## Why only four constraints
+
+Fineract's REST surface deliberately keeps the constraint set small. The four annotations cover the four kinds of "wrong shape" that can't be expressed by stock Bean Validation:
+
+- **Strings that must be a `DateTimeFormatter` pattern** — `@DateFormat`.
+- **Strings that must be a JVM-known BCP-47 locale** — `@Locale`.
+- **Strings that must name an enum constant** — `@EnumValue`.
+- **A `(date, format, locale)` trio that must parse together** — `@LocalDate`.
+
+Anything else — string length, regex patterns, numeric ranges — is covered by `jakarta.validation.constraints.*` (`@Size`, `@Pattern`, `@DecimalMin`, …) and does not need a Fineract-specific annotation. The module deliberately resists scope creep so it stays cheap to depend on.
+
+## Where to go next
+
+<CardGroup cols={1}>
+  <Card title="Custom constraints reference" href="/validation/custom-constraints">
+    Full per-constraint deep dive with annotation source, validator behaviour, and call-site examples.
+  </Card>
+</CardGroup>

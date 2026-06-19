@@ -1,0 +1,437 @@
+---
+title: "Embeddable Progressive Loan Schedule Generator"
+sidebarTitle: "Embeddable Generator"
+description: "Use Apache Fineract's progressive loan schedule generator as a stand-alone JAR — entry points, build, dependencies and a runnable Main.java example."
+---
+
+The Apache Fineract project ships a separate Gradle module,
+`fineract-progressive-loan-embeddable-schedule-generator`, whose only purpose is to package the **progressive
+loan schedule generator** as a stand-alone JAR that can be dropped onto any Java 17+ classpath. It is
+intended for places where the full Fineract server is not appropriate — frontends that want to project a
+schedule before submitting a loan, microservices that need a pricing quote, command-line tools, regulator
+reports, and so on.
+
+<Tip>
+The module is *very thin* — one production class (`EmbeddableProgressiveLoanScheduleGenerator`), one
+sample (`misc/Main.java`), and a Gradle Shadow configuration that shades only `fineract-core`,
+`fineract-loan` and `fineract-progressive-loan` into a single fat JAR. No Spring, no JPA, no HTTP server.
+</Tip>
+
+## Where it lives
+
+```text
+fineract-progressive-loan-embeddable-schedule-generator/
+├── README.md                                  — build + sample usage instructions
+├── build.gradle                               — shadowJar configuration
+├── dependencies.gradle                        — only the three Fineract modules
+├── misc/
+│   └── Main.java                              — CI smoke-test + worked example
+├── src/main/java/org/apache/fineract/portfolio/loanaccount/loanschedule/domain/
+│   └── EmbeddableProgressiveLoanScheduleGenerator.java
+└── src/test/java/.../EmbeddableProgressiveLoanScheduleGeneratorTest.java
+```
+
+## What it exposes
+
+A single public type, `EmbeddableProgressiveLoanScheduleGenerator`, with one `generate(...)` method:
+
+```java
+// fineract-progressive-loan-embeddable-schedule-generator/.../EmbeddableProgressiveLoanScheduleGenerator.java
+public class EmbeddableProgressiveLoanScheduleGenerator {
+
+    private final ProgressiveLoanScheduleGenerator scheduleGenerator;
+
+    public EmbeddableProgressiveLoanScheduleGenerator() {
+        final ScheduledDateGenerator scheduledDateGenerator = new DefaultScheduledDateGenerator();
+        final EMICalculator emiCalculator = new ProgressiveEMICalculator(scheduledDateGenerator);
+        this.scheduleGenerator = new ProgressiveLoanScheduleGenerator(scheduledDateGenerator, emiCalculator,
+                new NoopInterestScheduleModelRepositoryWrapper());
+    }
+
+    public LoanSchedulePlan generate(final MathContext mc, final LoanRepaymentScheduleModelData modelData) {
+        return scheduleGenerator.generate(mc, modelData);
+    }
+}
+```
+
+The constructor wires the three collaborators the generator needs **by hand**, bypassing Spring entirely:
+
+- `DefaultScheduledDateGenerator` — the period date generator from `fineract-loan`.
+- `ProgressiveEMICalculator` — the EMI maths kernel covered on the [EMI calculator
+  page](./emi-calculator).
+- `NoopInterestScheduleModelRepositoryWrapper` — a private inner class that returns empty/zero for every
+  repository operation, allowing the generator to run without any database.
+
+The no-op repository is the key trick that makes the embeddable version work:
+
+```java
+private static final class NoopInterestScheduleModelRepositoryWrapper
+        implements InterestScheduleModelRepositoryWrapper {
+
+    @Override public Optional<ProgressiveLoanModel> findOneByLoanId(Long loanId)  { return Optional.empty(); }
+    @Override public Optional<ProgressiveLoanModel> findOneByLoan(Loan loan)      { return Optional.empty(); }
+
+    @Override
+    public Optional<ProgressiveLoanInterestScheduleModel> extractModel(
+            Optional<ProgressiveLoanModel> progressiveLoanModel) { return Optional.empty(); }
+
+    @Override
+    public ProgressiveLoanInterestScheduleModel writeInterestScheduleModel(
+            Loan loan, ProgressiveLoanInterestScheduleModel model) { return null; }
+
+    @Override
+    public Optional<ProgressiveLoanInterestScheduleModel> readProgressiveLoanInterestScheduleModel(
+            Long loanId, ILoanConfigurationDetails detail, Integer installmentAmountInMultipliesOf) {
+        return Optional.empty();
+    }
+
+    @Override public boolean hasValidModelForDate(Long loanId, LocalDate targetDate) { return false; }
+
+    @Override
+    public Optional<ProgressiveLoanInterestScheduleModel> getSavedModel(Loan loan, LocalDate businessDate) {
+        return Optional.empty();
+    }
+
+    @Override public Long removeByLoanId(Long loanId) { return 0L; }
+}
+```
+
+The wrapper is only exercised by mid-life loan operations (prepayment quote, delinquency recalculation,
+per-period interest till date). For a fresh schedule projection — the embeddable JAR's only use case —
+those methods are never called, so returning `Optional.empty()` everywhere is sound.
+
+## Inputs and outputs
+
+`generate(mc, modelData)` calls straight into `ProgressiveLoanScheduleGenerator.generate(...)`:
+
+```java
+// fineract-progressive-loan/.../loanschedule/domain/ProgressiveLoanScheduleGenerator.java
+public LoanSchedulePlan generate(final MathContext mc, final LoanRepaymentScheduleModelData modelData) {
+    LoanApplicationTerms loanApplicationTerms = LoanApplicationTerms.assembleFrom(modelData, mc);
+    return LoanSchedulePlan.from(generate(mc, loanApplicationTerms, null, null));
+}
+```
+
+| In/Out | Type                                | Origin                                                            |
+|--------|-------------------------------------|-------------------------------------------------------------------|
+| Input  | `MathContext`                       | Standard `java.math.MathContext` — precision + `RoundingMode`     |
+| Input  | `LoanRepaymentScheduleModelData`    | Plain record in `fineract-loan` carrying all loan terms           |
+| Output | `LoanSchedulePlan`                  | Projection of the `LoanScheduleModel` for export-friendly use     |
+
+The `LoanRepaymentScheduleModelData` record carries everything the generator needs to project a schedule:
+
+- `startDate`, `disbursementDate`, `disbursedAmount`, `currency` (a `CurrencyData`).
+- `noRepayments`, `repaymentFrequency`, `repaymentFrequencyType` (`DAYS` / `WEEKS` / `MONTHS`).
+- `annualNominalInterestRate`.
+- `isDownPaymentEnabled`, `downPaymentPercentage`.
+- `daysInMonthType` (`ACTUAL`, `DAYS_30`), `daysInYearType` (`ACTUAL`, `DAYS_360`, `DAYS_365`, `DAYS_364`, ...).
+- `installmentAmountInMultiplesOf` (optional rounding granularity).
+- `fixedLength`, `interestRecognitionOnDisbursementDate`, `daysInYearCustomStrategy`.
+- `interestMethod` (`DECLINING_BALANCE`, `FLAT`).
+- `allowPartialPeriodInterestCalculation`.
+
+The output `LoanSchedulePlan` shape is documented on the [schedule generator
+page](./schedule-generator) — a list of `LoanSchedulePlanPeriod` (one of `LoanSchedulePlanDisbursementPeriod`,
+`LoanSchedulePlanDownPaymentPeriod` or `LoanSchedulePlanRepaymentPeriod`) plus aggregate totals.
+
+## Build configuration
+
+The build uses the **Gradle Shadow** plugin to produce one fat JAR that contains only the three required
+modules. Every other transitive dependency is excluded so the resulting artifact is as small as possible:
+
+```groovy
+// fineract-progressive-loan-embeddable-schedule-generator/build.gradle
+description = 'Fineract Progressive Loan Embeddable Schedule Generator'
+
+apply plugin: 'com.gradleup.shadow'
+apply plugin: 'java'
+apply from: 'dependencies.gradle'
+
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+var requiredModuleNames = [
+        'fineract-core',
+        'fineract-loan',
+        'fineract-progressive-loan',
+]
+
+tasks.named('shadowJar', ShadowJar) {
+    dependencies {
+        exclude((dep) -> !requiredModuleNames.any( (reqModName) -> dep.moduleName.contains(reqModName)))
+    }
+    minimize() {
+        exclude("*.xml")
+    }
+}
+```
+
+The `minimize()` step uses class-level reachability analysis to throw away every class that the public
+entry-point graph does not actually need. The `exclude("*.xml")` clause keeps the META-INF resources Spring
+expects (the embeddable mode itself does not use them, but they may be referenced by static initialisers
+that would otherwise crash).
+
+The dependency declaration is short:
+
+```groovy
+// fineract-progressive-loan-embeddable-schedule-generator/dependencies.gradle
+dependencies {
+    implementation(project(path: ':fineract-progressive-loan'))
+    implementation(project(path: ':fineract-loan'))
+    testImplementation(project(path: ':fineract-core'))
+
+    annotationProcessor 'org.projectlombok:lombok'
+    annotationProcessor 'org.mapstruct:mapstruct-processor'
+}
+```
+
+`fineract-core` is pulled in as a `testImplementation` because the only production code that touches its
+types is already reached transitively through `fineract-loan` and `fineract-progressive-loan`.
+
+## Building the JAR
+
+The module's `README.md` documents the build:
+
+```shell
+./gradlew :fineract-progressive-loan-embeddable-schedule-generator:shadowJar
+```
+
+The output lands in
+`fineract-progressive-loan-embeddable-schedule-generator/build/libs/fineract-progressive-loan-embeddable-schedule-generator-<version>-SNAPSHOT-all.jar`.
+
+## Runnable example: `misc/Main.java`
+
+The repository ships a `Main.java` that is **used by CI** as a smoke test — if the shaded JAR is broken
+(missing class, broken minimisation, classpath conflict), the build fails. It also serves as the canonical
+example of how to use the JAR from outside Fineract:
+
+```java
+// fineract-progressive-loan-embeddable-schedule-generator/misc/Main.java
+import org.apache.fineract.organisation.monetary.data.CurrencyData;
+import org.apache.fineract.portfolio.common.domain.DaysInMonthType;
+import org.apache.fineract.portfolio.common.domain.DaysInYearType;
+import org.apache.fineract.portfolio.common.domain.DaysInYearCustomStrategyType;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.data.LoanSchedulePlan;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.data.LoanSchedulePlanDisbursementPeriod;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.data.LoanSchedulePlanDownPaymentPeriod;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.data.LoanSchedulePlanPeriod;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.data.LoanSchedulePlanRepaymentPeriod;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.domain.EmbeddableProgressiveLoanScheduleGenerator;
+import org.apache.fineract.portfolio.loanaccount.loanschedule.domain.LoanRepaymentScheduleModelData;
+import org.apache.fineract.portfolio.loanproduct.domain.InterestMethod;
+
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+
+public class Main {
+    public static void main(String[] args) throws InterruptedException {
+        MathContext mc = new MathContext(12, RoundingMode.HALF_UP);
+        EmbeddableProgressiveLoanScheduleGenerator calculator = new EmbeddableProgressiveLoanScheduleGenerator();
+
+        final CurrencyData currency = new CurrencyData("usd", "US Dollar", 2, null, "usd", "$");
+        final LocalDate startDate = LocalDate.of(2024, 1, 1);
+        final LocalDate disbursementDate = LocalDate.of(2024, 1, 1);
+        final BigDecimal disbursedAmount = BigDecimal.valueOf(100);
+
+        final int noRepayments = 6;
+        final int repaymentFrequency = 1;
+        final String repaymentFrequencyType = "MONTHS";
+        final BigDecimal downPaymentPercentage = args.length > 0 ? new BigDecimal(args[0]) : BigDecimal.ZERO;
+        final boolean isDownPaymentEnabled = BigDecimal.ZERO.compareTo(downPaymentPercentage) != 0;
+        final BigDecimal annualNominalInterestRate = BigDecimal.valueOf(7.0);
+        final DaysInMonthType daysInMonthType = DaysInMonthType.DAYS_30;
+        final DaysInYearType  daysInYearType  = DaysInYearType.DAYS_360;
+        final Integer installmentAmountInMultiplesOf = null;
+        final Integer fixedLength = null;
+        final Boolean interestRecognitionOnDisbursementDate = false;
+        final DaysInYearCustomStrategyType dasInYearCustomStrategy = null;
+        final InterestMethod interestMethod = InterestMethod.DECLINING_BALANCE;
+        final boolean allowPartialPeriodInterestCalculation = true;
+
+        var config = new LoanRepaymentScheduleModelData(startDate, currency, disbursedAmount, disbursementDate,
+                noRepayments, repaymentFrequency, repaymentFrequencyType, annualNominalInterestRate,
+                isDownPaymentEnabled, daysInMonthType, daysInYearType, downPaymentPercentage,
+                installmentAmountInMultiplesOf, fixedLength, interestRecognitionOnDisbursementDate,
+                dasInYearCustomStrategy, interestMethod, allowPartialPeriodInterestCalculation, false);
+
+        final LoanSchedulePlan plan = calculator.generate(mc, config);
+        printPlan(plan);
+    }
+
+    static void printPlan(final LoanSchedulePlan plan) throws InterruptedException {
+        System.out.println("#------ Loan Schedule -----------------#");
+        System.out.printf("  Number of Periods: %d%n", plan.getPeriods().stream()
+                .filter(period -> !(period instanceof LoanSchedulePlanDisbursementPeriod)).count());
+        System.out.printf("  Loan Term in Days: %d%n", plan.getLoanTermInDays());
+        System.out.printf("  Total Disbursed Amount: %s%n", plan.getTotalDisbursedAmount());
+        System.out.printf("  Total Interest Amount: %s%n",  plan.getTotalInterestAmount());
+        System.out.printf("  Total Repayment Amount: %s%n", plan.getTotalRepaymentAmount());
+        System.out.println("#------ Repayment Schedule ------------#");
+
+        for (LoanSchedulePlanPeriod period : plan.getPeriods()) {
+            if (period instanceof LoanSchedulePlanDisbursementPeriod dp) {
+                System.out.printf("  Disbursement - Date: %s, Amount: %s%n",
+                        dp.periodDueDate(), dp.getPrincipalAmount());
+            } if (period instanceof LoanSchedulePlanDownPaymentPeriod rp) {
+                System.out.printf("  Down payment Period: #%d, Due Date: %s, Balance: %s, "
+                                + "Principal: %s, Total: %s, Total Outstanding Balance: %s%n",
+                        rp.periodNumber(), rp.periodDueDate(), rp.getOutstandingLoanBalance(),
+                        rp.getPrincipalAmount(), rp.getTotalDueAmount(), rp.getTotalOutstandingLoanBalance());
+            } if (period instanceof LoanSchedulePlanRepaymentPeriod rp) {
+                System.out.printf("  Repayment Period: #%d, Due Date: %s, Balance: %s, "
+                                + "Principal: %s, Interest: %s, Total: %s, Total Outstanding Balance: %s%n",
+                        rp.periodNumber(), rp.periodDueDate(), rp.getOutstandingLoanBalance(),
+                        rp.getPrincipalAmount(), rp.getInterestAmount(), rp.getTotalDueAmount(),
+                        rp.getTotalOutstandingLoanBalance());
+            }
+        }
+    }
+}
+```
+
+### Running it
+
+The README walks through the exact commands (Java 17+ required):
+
+```shell
+java -version       # openjdk version "17.0.3" 2022-04-19 LTS
+
+javac -cp fineract-progressive-loan-embeddable-schedule-generator-1.11.0-SNAPSHOT-all.jar Main.java
+
+java  -cp fineract-progressive-loan-embeddable-schedule-generator-1.11.0-SNAPSHOT-all.jar:. Main
+```
+
+The expected output for the 100 USD / 6-installment / 7% / 30-360 declining-balance configuration is the
+canonical declining-balance amortisation:
+
+```text
+#------ Loan Schedule -----------------#
+  Number of Periods: 6
+  Loan Term in Days: 182
+  Total Disbursed Amount: 100.00
+  Total Interest Amount: 2.05
+  Total Repayment Amount: 102.05
+#------ Repayment Schedule ------------#
+  Disbursement - Date: 2024-01-01, Amount: 100.00
+  Repayment Period: #1, Due Date: 2024-02-01, Balance: 83.57, Principal: 16.43, Interest: 0.58, Total: 17.01
+  Repayment Period: #2, Due Date: 2024-03-01, Balance: 67.05, Principal: 16.52, Interest: 0.49, Total: 17.01
+  Repayment Period: #3, Due Date: 2024-04-01, Balance: 50.43, Principal: 16.62, Interest: 0.39, Total: 17.01
+  Repayment Period: #4, Due Date: 2024-05-01, Balance: 33.71, Principal: 16.72, Interest: 0.29, Total: 17.01
+  Repayment Period: #5, Due Date: 2024-06-01, Balance: 16.90, Principal: 16.81, Interest: 0.20, Total: 17.01
+  Repayment Period: #6, Due Date: 2024-07-01, Balance:  0.00, Principal: 16.90, Interest: 0.10, Total: 17.00
+```
+
+Passing a non-zero down-payment percentage as the first argument (`java ... Main 20`) flips
+`isDownPaymentEnabled` to true and produces a `LoanSchedulePlanDownPaymentPeriod` on the disbursement date.
+
+## How it relates to the in-server generator
+
+```mermaid
+flowchart TB
+    subgraph Server[Full Fineract server]
+        Loan[Loan aggregate]
+        Cfg[ProgressiveLoanAccountConfiguration]
+        Repo[InterestScheduleModelRepositoryWrapperImpl<br/>writes to m_loan_progressive_model]
+        Gen[ProgressiveLoanScheduleGenerator]
+        EMI[ProgressiveEMICalculator]
+        DateGen[DefaultScheduledDateGenerator]
+        Spring[Spring DI]
+
+        Spring --> Cfg --> Repo --> Gen
+        Spring --> DateGen --> Gen
+        Spring --> EMI --> Gen
+        Loan --> Gen
+    end
+
+    subgraph Embedded[Embeddable JAR]
+        EmbGen[EmbeddableProgressiveLoanScheduleGenerator]
+        NoopRepo[NoopInterestScheduleModelRepositoryWrapper]
+        EMIe[new ProgressiveEMICalculator(...)]
+        DateGenE[new DefaultScheduledDateGenerator()]
+        EmbGen -->|hand-wires| DateGenE
+        EmbGen -->|hand-wires| EMIe
+        EmbGen -->|hand-wires| NoopRepo
+        EmbGen -->|reuses| Gen2[same ProgressiveLoanScheduleGenerator class]
+    end
+
+    Server -. same .- Embedded
+```
+
+The two configurations share **exactly the same** `ProgressiveLoanScheduleGenerator`, `EMICalculator` and
+`DefaultScheduledDateGenerator` classes. The only difference is the wiring: Spring with a JPA-backed
+`InterestScheduleModelRepositoryWrapperImpl` vs. constructor-injection with a no-op wrapper. Anything you
+compute through the embeddable JAR is bit-identical to what the same loan would produce inside the running
+server.
+
+## Test coverage
+
+The module ships a sanity test, `EmbeddableProgressiveLoanScheduleGeneratorTest.java`, that asserts the
+exact numbers above:
+
+```java
+// fineract-progressive-loan-embeddable-schedule-generator/src/test/.../EmbeddableProgressiveLoanScheduleGeneratorTest.java
+@Test
+void testGenerate() {
+    MathContext mc = new MathContext(12, RoundingMode.HALF_UP);
+    EmbeddableProgressiveLoanScheduleGenerator calculator = new EmbeddableProgressiveLoanScheduleGenerator();
+    // ... build LoanRepaymentScheduleModelData ...
+    final LoanSchedulePlan plan = calculator.generate(mc, config);
+
+    Assertions.assertEquals(182,   plan.getLoanTermInDays());
+    Assertions.assertEquals(100.00, toDouble(plan.getTotalDisbursedAmount()));
+    Assertions.assertEquals(2.05,   toDouble(plan.getTotalInterestAmount()));
+    Assertions.assertEquals(102.05, toDouble(plan.getTotalRepaymentAmount()));
+
+    Assertions.assertEquals(7, plan.getPeriods().size());
+    checkPeriod(plan.getPeriods().get(0), LocalDate.of(2024, 1, 1), LocalDate.of(2024, 1, 1), 100.0, 100.0);
+    checkPeriod(plan.getPeriods().get(1), 1, LocalDate.of(2024, 1, 1), LocalDate.of(2024, 2, 1),
+                16.43, 0.58, 0.0, 0.0, 17.01, 83.57, 85.04);
+    // ... five more rows ...
+}
+```
+
+## Limitations
+
+Because the no-op repository wrapper returns `Optional.empty()` for every snapshot read/write, the
+embeddable JAR **cannot** be used for any feature that needs the persisted interest model:
+
+- Pre-payment quotes on a live loan (`ProgressiveLoanScheduleGenerator.calculatePrepaymentAmount(...)`).
+- The per-period interest till date query (`getPeriodInterestTillDate(...)`).
+- The next-repayment delinquency recalculation
+  (`ProgressivePossibleNextRepaymentCalculationServiceImpl.calculateInterestRecalculationFutureOutstandingValue(...)`).
+
+For those, you must call the running Fineract server through its REST API. The embeddable JAR is a
+**projection tool** for the initial schedule of a hypothetical loan, not a substitute for the server.
+
+## File map
+
+```text
+fineract-progressive-loan-embeddable-schedule-generator/
+├── README.md
+├── build.gradle                         — shadowJar + minimize configuration
+├── dependencies.gradle                  — three modules only
+├── misc/Main.java                       — runnable CI smoke test / example
+├── src/main/java/.../loanschedule/domain/
+│   └── EmbeddableProgressiveLoanScheduleGenerator.java
+└── src/test/java/.../loanschedule/domain/
+    └── EmbeddableProgressiveLoanScheduleGeneratorTest.java
+```
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="circle-info" href="./overview">
+    Why the progressive engine exists and how it plugs into the existing `Loan` aggregate.
+  </Card>
+  <Card title="Schedule Generator" icon="list-ol" href="./schedule-generator">
+    The same `ProgressiveLoanScheduleGenerator` class the embeddable JAR wraps, now in its Spring-managed
+    form.
+  </Card>
+  <Card title="EMI Calculator" icon="calculator" href="./emi-calculator">
+    The maths the JAR ultimately runs.
+  </Card>
+  <Card title="Installments" icon="table-rows" href="./repayment-schedule-installment">
+    The shape of the `LoanSchedulePlanRepaymentPeriod` rows the JAR returns.
+  </Card>
+</CardGroup>

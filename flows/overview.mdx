@@ -1,0 +1,301 @@
+---
+title: "Key flows in Apache Fineract: an index for tracing requests"
+sidebarTitle: "Flows Overview"
+description: "Index of end-to-end runtime flows in Apache Fineract — request lifecycle, command bus, loans, savings, COB, events, maker-checker."
+---
+
+This page indexes the **key runtime flows** in Apache Fineract. Each linked flow page walks one request, job, or background task end-to-end with a Mermaid sequence diagram, the Java classes touched at each step, and the file paths where you can read the source.
+
+Use this overview to figure out **which flow page to open** when you are debugging a specific symptom or onboarding a new contributor to a subsystem. The flows are grouped by surface area: synchronous API requests, write paths through the command bus, domain-specific journeys (loan and savings), and asynchronous machinery (COB, events, maker-checker).
+
+<Info>
+All flows assume the standard Spring Boot + Jersey deployment in `fineract-provider` running in **monolith mode**. The `fineract-war` module deploys the same code as a WAR; the `instance-mode` configuration can disable some flows (for example, only the **batch** instance runs scheduler-triggered COB).
+</Info>
+
+## How to read a flow page
+
+Every flow page in this group follows the same structure:
+
+| Section | What it contains |
+| --- | --- |
+| Frontmatter & opening | One-paragraph summary of the flow's purpose. |
+| Sequence diagram | A Mermaid `sequenceDiagram` with the actual class names from the codebase. |
+| Step-by-step table | Each numbered step, the file path, and the method invoked. |
+| Notes | Edge cases — retries, transactions, idempotency, rollback. |
+| Related flows | Cross-links to neighbouring flow pages. |
+
+The diagrams use **fully qualified class names** the first time a participant appears, then short names afterwards. Where a participant is an interface plus its `…Impl`, the diagram shows the interface and the table calls out the implementation.
+
+## The ten flows
+
+<CardGroup cols={2}>
+  <Card title="HTTP request lifecycle" icon="globe" href="/flows/http-request-lifecycle">
+    Servlet → Jersey → security filters → tenant resolution → JAX-RS resource → command bus → handler → service → JPA → response.
+  </Card>
+  <Card title="Command dispatch flow" icon="arrow-right-arrow-left" href="/flows/command-dispatch-flow">
+    Inside the command bus: `CommandWrapperBuilder` → `CommandSourceService` → `SynchronousCommandProcessingService` → handler → audit.
+  </Card>
+  <Card title="Loan application to disbursal" icon="file-invoice-dollar" href="/flows/loan-application-to-disbursal">
+    Submit application → approve → disburse → schedule generation → journal entries.
+  </Card>
+  <Card title="Loan repayment flow" icon="money-bill-transfer" href="/flows/loan-repayment-flow">
+    `LoanRepaymentCommandHandler` → `LoanWritePlatformService.makeLoanRepayment()` → transaction processor → schedule recalculation → journal entries → events.
+  </Card>
+  <Card title="Savings deposit & interest posting" icon="piggy-bank" href="/flows/savings-deposit-and-interest-posting">
+    `DepositSavingsAccountCommandHandler` → `SavingsAccountWritePlatformService.deposit()`. Plus the nightly `POST_INTEREST_FOR_SAVINGS` job.
+  </Card>
+  <Card title="COB execution flow" icon="moon" href="/flows/cob-execution-flow">
+    Loan close-of-business: scheduler → partitioner → lock loans → run business steps → release locks → increment COB date.
+  </Card>
+  <Card title="External event flow" icon="bell" href="/flows/external-event-flow">
+    Command finishes → hook → `BusinessEvent` → `external_event` outbox → `SEND_ASYNCHRONOUS_EVENTS` job → Kafka/JMS → `PURGE_EXTERNAL_EVENTS`.
+  </Card>
+  <Card title="Maker-checker flow" icon="user-check" href="/flows/maker-checker-flow">
+    Maker submits → `RollbackTransactionNotApprovedException` parks the command → checker approves through `MakercheckersApiResource` → handler runs.
+  </Card>
+  <Card title="Tenant resolution flow" icon="building" href="/flows/tenant-resolution-flow">
+    `Fineract-Platform-TenantId` header → `TenantAwareBasicAuthenticationFilter` → `JdbcTenantDetailsService` (cached) → `ThreadLocalContextUtil` → `RoutingDataSource`.
+  </Card>
+</CardGroup>
+
+## When to read which page
+
+<AccordionGroup>
+  <Accordion title="I am debugging a 401, 403, or a missing tenant" icon="lock">
+    Start with [HTTP request lifecycle](/flows/http-request-lifecycle) to see the filter ordering, then drill into [tenant resolution](/flows/tenant-resolution-flow) for the multi-tenant specifics (`Fineract-Platform-TenantId` header parsing, `tenants` catalogue, per-tenant connection pool).
+  </Accordion>
+  <Accordion title="A POST returns 200 but nothing changed" icon="circle-exclamation">
+    Read [command dispatch flow](/flows/command-dispatch-flow). The `SynchronousCommandProcessingService` may have rolled back due to maker-checker (see [maker-checker flow](/flows/maker-checker-flow)) or returned an idempotent replay of a prior `CommandSource` row.
+  </Accordion>
+  <Accordion title="A loan never gets disbursed even after approval" icon="hand-holding-dollar">
+    The state machine is in [loan application to disbursal](/flows/loan-application-to-disbursal). Each transition (`submit`, `approve`, `disburse`) is a distinct command with its own handler; check `m_loan.loan_status_id` and the `m_portfolio_command_source` audit row.
+  </Accordion>
+  <Accordion title="A repayment didn't update the schedule" icon="calendar">
+    See [loan repayment flow](/flows/loan-repayment-flow). The schedule recalculation runs inside `LoanAccountDomainService.makeRepayment()` and is driven by the loan's transaction processing strategy.
+  </Accordion>
+  <Accordion title="Interest hasn't been posted to a savings account" icon="percent">
+    [Savings deposit & interest posting](/flows/savings-deposit-and-interest-posting) covers the synchronous `DEPOSIT` command and the nightly `POST_INTEREST_FOR_SAVINGS` Spring Batch job that partitions accounts across a thread pool.
+  </Accordion>
+  <Accordion title="Why is a loan stuck `locked_by_cob_chunk_processing`?" icon="lock-keyhole">
+    Read [COB execution flow](/flows/cob-execution-flow). The `m_loan_account_locks` table is written by `ApplyLoanLockTasklet` at the start of a partition and cleared by `LoanItemWriter` after the business steps run; stuck locks usually mean the worker crashed mid-step.
+  </Accordion>
+  <Accordion title="Kafka topic is silent even though commands succeed" icon="bullhorn">
+    [External event flow](/flows/external-event-flow) explains the outbox pattern: events are written to `external_event` inside the same transaction as the command result, then drained by `SendAsynchronousEventsTasklet` into Kafka or JMS.
+  </Accordion>
+</AccordionGroup>
+
+## Cross-cutting concepts
+
+Several runtime concerns appear in **every** flow. The flow pages call them out where relevant; the canonical references are:
+
+- **`ThreadLocalContextUtil`** — holds the tenant, the business date, the auth token, and the action context for the current request thread. Set by `TenantAwareBasicAuthenticationFilter`, consumed by `RoutingDataSource` and by every JPA repository.
+- **`FineractRequestContextHolder`** — per-request attribute bag used to carry the `commandSourceId` and the `idempotencyKeyStoreFlag` between filters and the command bus.
+- **`BusinessEventNotifierService`** — the in-process publisher every domain service calls when state changes. Listeners hang off it; external events are then forwarded to the `ExternalEventService` outbox.
+- **`ConfigurationDomainService`** — checks global toggles like `isMakerCheckerEnabledForTask(...)`, `isCOBBulkEventEnabled()`, `isSameMakerCheckerEnabled()` that change branch behaviour inside the flows.
+
+## Source modules touched by these flows
+
+| Module | Role in the flows |
+| --- | --- |
+| `fineract-provider` | Hosts the JAX-RS resources, Spring Security config, Spring Batch wiring, and the `JpaRepositoryImpl` write services. |
+| `fineract-core` | Command bus core (`SynchronousCommandProcessingService`, `CommandSourceService`, `CommandWrapperBuilder`), tenant resolution, event infrastructure. |
+| `fineract-security` | `TenantAwareBasicAuthenticationFilter`, `TwoFactorAuthenticationFilter`. |
+| `fineract-loan` | Loan handlers, `LoanWritePlatformService`, `LoanApplicationWritePlatformService`, COB business steps for loans. |
+| `fineract-savings` | `SavingsAccountWritePlatformService` interface and savings domain. |
+| `fineract-cob` | COB framework (`COBBusinessStep`, `COBBusinessStepService`, locking primitives). |
+| `fineract-accounting` | Journal entry posting, `JournalEntryBusinessEvent`. |
+
+<Tip>
+The actual call graph is best explored with your IDE's "Find Usages" on the entry points called out in each flow page — the diagrams are accurate at the level of major participants, but every flow has detail (validators, mappers, datatable hooks) that would clutter the picture.
+</Tip>
+
+## Diagram conventions
+
+- **Solid arrows** (`->>`): synchronous method calls.
+- **Dashed arrows** (`-->>`): returns.
+- **`Note over X`**: a side effect (database write, ThreadLocal mutation, transaction boundary).
+- **`alt` / `opt`** blocks: branches based on configuration toggles or input.
+
+The diagrams omit the obvious: every method that takes a `JsonCommand` is implicitly inside a `@Transactional` boundary (declared on the handler or the service), and every JPA repository call goes through the `RoutingDataSource` to the per-tenant connection pool.
+
+## Synchronous vs asynchronous flows
+
+The ten flows split cleanly into two halves:
+
+<Tabs>
+  <Tab title="Synchronous (request thread)">
+    These flows run on the Tomcat worker thread that took the HTTP request. They share a transaction, a tenant, and a business date.
+
+    - HTTP request lifecycle
+    - Command dispatch flow
+    - Loan application to disbursal (per transition)
+    - Loan repayment flow
+    - Savings deposit (the first half)
+    - Maker-checker flow (the maker's POST and the checker's POST)
+    - Tenant resolution flow
+
+    Failure here returns an HTTP error to the client.
+  </Tab>
+  <Tab title="Asynchronous (worker / scheduler)">
+    These flows run on Spring Batch worker pools or Quartz scheduler threads. They restore the tenant from a captured `FineractContext` and run with `ActionContext.COB` (for nightly closure) or `ActionContext.JOB`.
+
+    - COB execution flow
+    - External event flow (the drain side)
+    - Savings interest posting (the nightly half)
+
+    Failure here logs and either retries (Spring Batch fault tolerance) or is reported via `BusinessEvent`s and the job history.
+  </Tab>
+</Tabs>
+
+## What this group does *not* cover
+
+Some equally important flows are documented elsewhere because they belong to a single module:
+
+| Flow | Lives at |
+| --- | --- |
+| Liquibase migration sequence on startup | [Liquibase & startup](/runtime/liquibase-and-startup). |
+| Batch API (`/api/v1/batches`) sub-request fan-out | [Batch API overview](/batch/overview). |
+| Spring Batch job framework internals | [Background jobs framework](/core/jobs-framework). |
+| Inline loan COB (synchronous catch-up triggered by an API write) | [Inline COB](/cob/internal-and-catchup-apis). |
+| Two-factor authentication enrolment | [Two-factor authentication](/security/two-factor-authentication). |
+| OAuth2 token exchange | [Basic auth and OAuth2](/security/basic-auth-and-oauth2). |
+| Accounting closure and reversal | [Accounting overview](/accounting/overview). |
+
+The runtime flows above are the **horizontal** view of how a request becomes a row; the module pages give the **vertical** view of one subsystem in depth.
+
+## Reading order if you are new
+
+If this is your first day with the codebase, read in this order:
+
+1. [HTTP request lifecycle](/flows/http-request-lifecycle) — the skeleton.
+2. [Tenant resolution flow](/flows/tenant-resolution-flow) — fills in the multi-tenant detail.
+3. [Command dispatch flow](/flows/command-dispatch-flow) — the write skeleton.
+4. [Loan repayment flow](/flows/loan-repayment-flow) — a real-world example you can play with against the demo dataset.
+5. [Maker-checker flow](/flows/maker-checker-flow) — the gotcha that makes the platform feel different from a CRUD API.
+6. [External event flow](/flows/external-event-flow) — what downstream consumers see.
+7. [COB execution flow](/flows/cob-execution-flow) — the biggest async machinery.
+8. The remaining domain flows ([loan application to disbursal](/flows/loan-application-to-disbursal) and [savings](/flows/savings-deposit-and-interest-posting)) as needed.
+
+## Recurring patterns across flows
+
+A small set of patterns recurs across the ten pages. Recognising them shortens future reads:
+
+| Pattern | Where it appears |
+| --- | --- |
+| **Transactional outbox** | [External event flow](/flows/external-event-flow). The same shape (write a row in the same txn, drain it later) underpins all asynchronous downstream notification. |
+| **Audit row in `REQUIRES_NEW` transaction** | [Command dispatch](/flows/command-dispatch-flow). Used so a maker-checker rollback still leaves the audit row in place. |
+| **`ThreadLocal`-backed tenant context** | [Tenant resolution](/flows/tenant-resolution-flow). Every flow that fans out to worker threads explicitly captures and restores it. |
+| **Per-(entity, action) Spring bean** | [Command dispatch](/flows/command-dispatch-flow), and every domain flow that lists handlers. |
+| **Spring Batch tasklet with paged read + thread-pool fan-out** | [Savings interest posting](/flows/savings-deposit-and-interest-posting) and [external event send](/flows/external-event-flow). |
+| **Partitioned Spring Batch step with row-level locking** | [COB execution](/flows/cob-execution-flow). |
+| **`BusinessEventNotifierService` raising both internal listeners and the outbox** | All write flows. |
+
+Many features the platform offers (idempotency, retry, maker-checker, hook firing, outbox, COB) are **cross-cutting**: they are implemented once in `fineract-core` and `fineract-cob`, and every domain flow inherits them by going through the command bus.
+
+## Versioning and compatibility note
+
+The flows described here are accurate as of the codebase under `/home/daytona/repos/apache/fineract/` at the time these pages were generated. Method signatures and class layout in `fineract-core`, `fineract-loan`, and `fineract-cob` have been stable since the 1.x line — the names listed in the file maps are what you will find in any 1.8+ release. The Spring Batch and Resilience4j integrations were introduced in the 1.6 / 1.7 lines; older deployments may not have the retry wrapper around `SynchronousCommandProcessingService.executeCommand(...)`.
+
+If you are reading these pages against a fork or an older release, use the file maps to navigate but verify the exact method bodies in your tree before relying on a particular line of code.
+
+## Cheat sheet: which class owns what
+
+A 30-second mental model:
+
+| Concern | Owning class | Module |
+| --- | --- | --- |
+| Pick a tenant pool | `RoutingDataSource` | `fineract-core` |
+| Cache tenant metadata | `JdbcTenantDetailsService` (`@Cacheable("tenantsById")`) | `fineract-core` |
+| Authenticate basic / OAuth | `TenantAwareBasicAuthenticationFilter` / `TenantAwareOAuth2AuthenticationFilter` | `fineract-security` |
+| Map JAX-RS resources | `JerseyConfig` (`@ApplicationPath("/api")`) | `fineract-provider` |
+| Build the command wrapper | `CommandWrapperBuilder` | `fineract-core` |
+| Dispatch and persist audit | `SynchronousCommandProcessingService` + `CommandSourceService` | `fineract-core` |
+| Pick the handler bean | `CommandHandlerProvider` (`@CommandType` lookup) | `fineract-core` |
+| Park a command for review | `RollbackTransactionNotApprovedException` thrown inside `CommandSourceService.processCommand` | `fineract-core` |
+| Approve / reject a parked command | `MakercheckersApiResource` + `PortfolioCommandSourceWritePlatformServiceImpl` | `fineract-provider` |
+| Publish in-process events | `BusinessEventNotifierServiceImpl` | `fineract-core` |
+| Write events to outbox | `ExternalEventService.postEvent(...)` | `fineract-core` |
+| Drain outbox | `SendAsynchronousEventsTasklet` | `fineract-core` |
+| Run nightly COB | `LoanCOBManagerConfiguration.loanCOBJob` (manager) + `LoanCOBWorkerConfiguration.loanCOBWorkerStep` (worker) | `fineract-provider` |
+| Lock loans during COB | `LoanLockingServiceImpl` + `ApplyLoanLockTasklet` + `m_loan_account_locks` | `fineract-provider` + `fineract-cob` |
+| Block writes while locked | `LoanCOBApiFilter` | `fineract-provider` |
+| Make a loan repayment | `LoanRepaymentCommandHandler` → `LoanWritePlatformServiceJpaRepositoryImpl.makeLoanRepayment` → `LoanAccountDomainServiceJpa.makeRepayment` | `fineract-loan` + `fineract-provider` |
+| Make a savings deposit | `DepositSavingsAccountCommandHandler` → `SavingsAccountWritePlatformServiceJpaRepositoryImpl.deposit` | `fineract-provider` |
+| Post nightly savings interest | `PostInterestForSavingTasklet` → `SavingsSchedularInterestPosterTask` | `fineract-provider` + `fineract-savings` |
+
+## Common terminology
+
+The flow pages use the platform's own vocabulary. A quick lexicon:
+
+| Term | Meaning |
+| --- | --- |
+| **Command** | A serialisable instruction to mutate state (`CommandWrapper` + `JsonCommand` body). |
+| **Source row** | The audit row in `m_portfolio_command_source` that records the command. |
+| **Handler** | A `@CommandType`-annotated Spring bean that executes one (entity, action). |
+| **Maker** | The user who submits a command. |
+| **Checker** | The user who approves or rejects a parked command. |
+| **Business event** | An in-process `BusinessEvent<T>` raised by domain code; consumed by listeners and (optionally) the outbox. |
+| **External event** | A row in `external_event` representing a business event that has crossed the process boundary. |
+| **Hook** | A configured downstream URL or topic that webhooks events to. |
+| **COB** | Close of Business — the nightly batch that advances each loan's `last_closed_business_date`. |
+| **Inline COB** | A synchronous catch-up for a single loan, triggered when a write arrives before COB has caught up. |
+| **Business date** | The "today" the platform thinks it is. Distinct from wall-clock for testing and catch-up. |
+| **Pivot date** | A cut-over date that limits how much historical data is loaded per account for performance. |
+| **GLIM / GSIM** | Group Loan / Savings Individual Monitoring — group aggregates with per-member sub-accounts. |
+
+When a flow page uses one of these without re-defining it, this table is the canonical source.
+
+## Where the diagrams' classes live
+
+Every Mermaid diagram on a flow page names actual Java classes. The module split is:
+
+- `fineract-core` — bus, tenants, events, hooks, idempotency, infrastructure base classes.
+- `fineract-security` — auth filters, user details, 2FA.
+- `fineract-loan` and `fineract-progressive-loan` — loan handlers, write service interfaces, scheduling.
+- `fineract-savings` — savings interfaces and per-task wrappers.
+- `fineract-cob` — COB framework (`COBBusinessStep`, `COBBusinessStepService`, locking primitives).
+- `fineract-accounting` — journal entries, GL events.
+- `fineract-provider` — all the `*JpaRepositoryImpl` write services, the JAX-RS resources, Spring Security configuration, Spring Batch wiring, COB Quartz integration.
+- `fineract-war` — packaging of `fineract-provider` for traditional servlet containers.
+
+The single most useful "if I had to grep one folder" advice: `fineract-provider/src/main/java/org/apache/fineract/` contains roughly 80% of the code these flows walk through.
+
+## Quick incident playbook
+
+If something is broken in production, use this table as a triage starting point. Each row links to the flow page that walks the offending machinery.
+
+| Symptom | First page to open | Second pass |
+| --- | --- | --- |
+| `400` with `InvalidTenantIdentifierException` | [Tenant resolution](/flows/tenant-resolution-flow). | Check `fineract_tenants.tenants` for the identifier. |
+| `401` / `403` immediately on any request | [HTTP request lifecycle](/flows/http-request-lifecycle). | Auth, permission, or COB filter. |
+| `403` with `rollbackTransaction: true` and a `commandId` | [Maker-checker](/flows/maker-checker-flow). | The parked command is in `m_portfolio_command_source` with `status=2`. |
+| Loan write rejected with "Loan is locked" | [COB execution](/flows/cob-execution-flow). | `m_loan_account_locks` has a row. |
+| Repayment posted but schedule unchanged | [Loan repayment](/flows/loan-repayment-flow). | Check `LoanTransactionProcessingService` strategy bean. |
+| Nightly job ran with no errors but no journal entries | [COB execution](/flows/cob-execution-flow) or [savings interest posting](/flows/savings-deposit-and-interest-posting). | The `business_date` parameter may have been wrong. |
+| Kafka topic silent | [External event flow](/flows/external-event-flow). | `external_event` count grows but `SENT` count doesn't. |
+| Same command processed twice | [Command dispatch](/flows/command-dispatch-flow). | Idempotency key resolver — header missing or non-deterministic body. |
+| Webhook fires for a rolled-back command | [Command dispatch](/flows/command-dispatch-flow). | Check `isEnclosingTransaction` branch — should defer to `afterCommit`. |
+| Worker thread sees the wrong tenant | [Tenant resolution](/flows/tenant-resolution-flow). | The submitting code didn't capture a `FineractContext`. |
+
+For everything else, start with [HTTP request lifecycle](/flows/http-request-lifecycle) and follow the trail.
+
+## Suggested next steps
+
+Once you have read the flows, the natural follow-ups are the deep-dive module pages:
+
+<CardGroup cols={2}>
+  <Card title="Command bus" icon="bolt" href="/command/overview">
+    Detailed class catalogue for the bus, the audit table, retries, async dispatch.
+  </Card>
+  <Card title="COB framework" icon="moon" href="/cob/overview">
+    Business steps, locking primitives, partitioner, inline COB.
+  </Card>
+  <Card title="Events" icon="bell" href="/events/overview">
+    Business event hierarchy, listeners, hooks, external event configuration.
+  </Card>
+  <Card title="Loan domain" icon="hand-holding-dollar" href="/loan/overview">
+    Loan aggregate, transaction processors, schedule generators.
+  </Card>
+</CardGroup>
+
+The flow pages are deliberately concise; the module pages are deep. Use the flows to know **what** to read, the modules to know **how** each piece works in full.

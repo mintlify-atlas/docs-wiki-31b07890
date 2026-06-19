@@ -1,0 +1,499 @@
+---
+title: "Command Handlers Catalogue — Every @CommandType Mapped"
+sidebarTitle: "Handlers Catalogue"
+description: "How CommandHandlerProvider discovers @CommandType beans, the handler package layout across modules, and ~30 representative handlers grouped by domain."
+---
+
+Apache Fineract ships **~460 `*CommandHandler.java` classes** across its
+Gradle modules. Every one of them is a Spring `@Service` that implements
+`NewCommandSourceHandler` and carries a `@CommandType(entity, action)`
+annotation. At startup, `CommandHandlerProvider` builds a single
+`HashMap<String, String>` keyed by `entity + "|" + action` so that
+`SynchronousCommandProcessingService` can hand a `CommandWrapper` to the
+right handler in O(1). This page documents the discovery mechanism, the
+handler package layout, and a representative sample of ~30 handlers grouped
+by domain.
+
+## The two-piece registration mechanism
+
+### `@CommandType` — the marker
+
+```java
+// fineract-core/src/main/java/org/apache/fineract/commands/annotation/CommandType.java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+@Documented
+public @interface CommandType {
+
+    /** Returns the name of the entity for this {@link CommandType}. */
+    String entity();
+
+    /** Return the name of the action for this {@link CommandType}. */
+    String action();
+}
+```
+
+The marker is intentionally minimal: two strings. Convention is uppercase
+constants from
+`fineract-core/.../commands/domain/CommandWrapperConstants.java`
+(`ENTITY_LOAN`, `ACTION_DISBURSE`, …) but a handful of handlers reference
+their own `*ApiConstants` (e.g.
+`ClientApiConstants.CLIENT_CHARGES_RESOURCE_NAME`).
+
+The combination `entity + "_" + action` is also the **task permission code**
+(e.g. `DISBURSE_LOAN`), which is what `validateHasPermissionTo(...)` checks
+inside `PortfolioCommandSourceWritePlatformServiceImpl.logCommandSource(...)`.
+
+### `NewCommandSourceHandler` — the contract
+
+```java
+// fineract-core/src/main/java/org/apache/fineract/commands/handler/NewCommandSourceHandler.java
+public interface NewCommandSourceHandler {
+
+    CommandProcessingResult processCommand(JsonCommand command);
+}
+```
+
+A single method. Every handler:
+
+1. Pulls ids and parsed fields out of `JsonCommand`.
+2. Delegates to a `*WritePlatformService` for the actual domain work.
+3. Returns the service's `CommandProcessingResult` (or `CommandProcessingResult.empty()`).
+4. Optionally wraps the call in `try/catch` for data-integrity issues and
+   delegates to `DataIntegrityErrorHandler`.
+
+### `CommandHandlerProvider` — bean scan + dispatch table
+
+```java
+// fineract-core/src/main/java/org/apache/fineract/commands/provider/CommandHandlerProvider.java
+@Component
+public class CommandHandlerProvider implements ApplicationContextAware, InitializingBean {
+
+    private final HashMap<String, String> registeredHandlers = new HashMap<>();
+    private ApplicationContext            applicationContext;
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        initializeHandlerRegistry();
+    }
+
+    private void initializeHandlerRegistry() {
+        final String[] beans = applicationContext.getBeanNamesForAnnotation(CommandType.class);
+        if (ArrayUtils.isNotEmpty(beans)) {
+            for (final String name : beans) {
+                final CommandType type = applicationContext.findAnnotationOnBean(name, CommandType.class);
+                try {
+                    if (type != null) {
+                        registeredHandlers.put(type.entity() + "|" + type.action(), name);
+                    } else {
+                        log.error("Unable to register command handler '{}'!", name);
+                    }
+                } catch (final Throwable th) {
+                    log.error("Unable to register command handler '{}'!", name, th);
+                }
+            }
+        }
+    }
+
+    public NewCommandSourceHandler getHandler(final String entity, final String action) {
+        Preconditions.checkArgument(StringUtils.isNoneEmpty(entity), "An entity must be given!");
+        Preconditions.checkArgument(StringUtils.isNoneEmpty(action), "An action must be given!");
+
+        final String key = entity + "|" + action;
+        if (!registeredHandlers.containsKey(key)) {
+            throw new UnsupportedCommandException(key);
+        }
+        return (NewCommandSourceHandler) applicationContext.getBean(registeredHandlers.get(key));
+    }
+}
+```
+
+Three behaviours worth knowing:
+
+- **`applicationContext.getBeanNamesForAnnotation(CommandType.class)`** —
+  Spring walks the bean factory, so any `@Service`/`@Component` annotated with
+  `@CommandType` is picked up regardless of which Gradle module it lives in.
+- **Map keyed by `entity|action`, valued by bean name** — the bean is fetched
+  lazily on lookup, allowing prototype scopes (though all current handlers
+  are singletons).
+- **Duplicates overwrite silently** — if two handlers claim the same
+  `entity|action`, the last one wins. The handler set is convention-driven, so
+  this is in practice a non-issue.
+
+`UnsupportedCommandException` is thrown for unknown keys; it surfaces as a
+`501 Not Implemented` through Fineract's error mapper.
+
+## Where handler packages live
+
+Every domain module that owns commands also owns a `handler/` package.
+Listing the packages shows the scope of the bus:
+
+```
+fineract-accounting/.../accounting/accrual/handler/                  (3)
+fineract-accounting/.../accounting/closure/handler/                  (3)
+fineract-accounting/.../accounting/financialactivityaccount/handler/ (3)
+fineract-accounting/.../accounting/glaccount/handler/                (3)
+fineract-accounting/.../accounting/rule/handler/                     (3)
+fineract-branch/.../organisation/teller/handler/                     (10)
+fineract-charge/.../portfolio/charge/handler/                        (3)
+fineract-core/.../infrastructure/cache/handler/                      (1)
+fineract-core/.../organisation/monetary/handler/                     (3)
+fineract-core/.../portfolio/paymenttype/handler/                     (3)
+fineract-document/.../documentmanagement/handler/                    (5)
+fineract-loan/.../portfolio/delinquency/handler/                     (8)
+fineract-loan/.../portfolio/loanaccount/handler/                     (~60)
+fineract-loan/.../portfolio/loanaccount/guarantor/handler/           (2)
+fineract-loan/.../portfolio/loanaccount/rescheduleloan/handler/      (3)
+fineract-loan/.../portfolio/loanproduct/handler/                     (3)
+fineract-loan/.../portfolio/interestpauses/handler/                  (2)
+fineract-loan-origination/.../portfolio/loanorigination/handler/     (5)
+fineract-progressive-loan/.../portfolio/loanaccount/handler/         (varies)
+fineract-mix/.../mix/handler/                                        (3)
+fineract-provider/.../accounting/journalentry/handler/               (4)
+fineract-provider/.../accounting/provisioning/handler/               (2)
+fineract-provider/.../adhocquery/handler/                            (3)
+fineract-provider/.../infrastructure/accountnumberformat/handler/    (3)
+fineract-provider/.../infrastructure/campaigns/email/handler/        (9)
+fineract-provider/.../infrastructure/campaigns/sms/handler/          (6)
+fineract-provider/.../infrastructure/codes/handler/                  (6)
+fineract-provider/.../infrastructure/configuration/handler/          (3+)
+fineract-provider/.../infrastructure/creditbureau/handler/           (9)
+fineract-provider/.../infrastructure/dataqueries/handler/            (14)
+fineract-provider/.../infrastructure/entityaccess/handler/           (2)
+fineract-provider/.../infrastructure/hooks/handler/                  (3)
+fineract-provider/.../infrastructure/jobs/handler/                   (1)
+fineract-provider/.../infrastructure/reportmailingjob/handler/       (3)
+fineract-provider/.../infrastructure/sms/handler/                    (3)
+fineract-provider/.../infrastructure/survey/handler/                 (2)
+fineract-provider/.../organisation/holiday/handler/                  (4)
+fineract-provider/.../organisation/office/handler/                   (4)
+fineract-provider/.../organisation/provisioning/handler/             (6)
+fineract-provider/.../organisation/staff/handler/                    (2)
+fineract-provider/.../organisation/workingdays/handler/              (1)
+fineract-provider/.../portfolio/account/handler/                     (6)
+fineract-provider/.../portfolio/calendar/handler/                    (3)
+fineract-provider/.../portfolio/client/handler/                      (26)
+fineract-provider/.../portfolio/collateral/handler/                  (3)
+fineract-provider/.../portfolio/collateralmanagement/handler/        (5)
+fineract-provider/.../portfolio/collectionsheet/handler/             (1)
+fineract-provider/.../portfolio/fund/handler/                        (2)
+fineract-provider/.../portfolio/group/handler/                       (22)
+fineract-provider/.../portfolio/interestratechart/handler/           (6)
+fineract-provider/.../portfolio/loanaccount/handler/                 (~26, post-loan split)
+fineract-provider/.../portfolio/loanproduct/productmix/handler/      (3)
+fineract-provider/.../portfolio/meeting/handler/                     (4)
+fineract-provider/.../portfolio/note/handler/                        (2)
+fineract-provider/.../portfolio/rate/handler/                        (3)
+fineract-provider/.../portfolio/savings/handler/                     (~85)
+fineract-provider/.../portfolio/shareaccounts/handler/               (11)
+fineract-provider/.../portfolio/shareproducts/handler/               (5)
+fineract-provider/.../portfolio/transfer/handler/                    (6)
+fineract-provider/.../template/handler/                              (3)
+fineract-provider/.../useradministration/handler/                    (12)
+fineract-rates/.../portfolio/floatingrates/handler/                  (2)
+fineract-tax/.../portfolio/tax/handler/                              (4)
+fineract-working-capital-loan/.../workingcapitalloan*/handler/       (~24 across 4 packages)
+fineract-command-test/.../command/test/sample/handler/               (2, test-only)
+```
+
+The two biggest packages by count are
+`org.apache.fineract.portfolio.savings.handler` (~85) and
+`org.apache.fineract.portfolio.loanaccount.handler` (~60 in `fineract-loan`,
+~26 more in `fineract-provider`).
+
+## Anatomy of a handler
+
+The canonical pattern is two-method-thick:
+
+```java
+// fineract-loan/.../portfolio/loanaccount/handler/DisburseLoanCommandHandler.java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "DISBURSE")
+public class DisburseLoanCommandHandler implements NewCommandSourceHandler {
+
+    private final LoanWritePlatformService    writePlatformService;
+    private final DataIntegrityErrorHandler   dataIntegrityErrorHandler;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        try {
+            return this.writePlatformService.disburseLoan(command.entityId(), command, false);
+        } catch (final JpaSystemException | DataIntegrityViolationException dve) {
+            dataIntegrityErrorHandler.handleDataIntegrityIssues(command, dve.getMostSpecificCause(), dve,
+                    "loan.disbursement", "Disbursement");
+            return CommandProcessingResult.empty();
+        }
+    }
+}
+```
+
+And for a transactional repayment:
+
+```java
+// fineract-loan/.../portfolio/loanaccount/handler/LoanRepaymentCommandHandler.java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "REPAYMENT")
+public class LoanRepaymentCommandHandler implements NewCommandSourceHandler {
+
+    private final LoanWritePlatformService   writePlatformService;
+    private final DataIntegrityErrorHandler  dataIntegrityErrorHandler;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        try {
+            boolean isRecoveryRepayment = false;
+            return this.writePlatformService.makeLoanRepayment(LoanTransactionType.REPAYMENT,
+                    command.getLoanId(), command, isRecoveryRepayment);
+        } catch (final JpaSystemException | DataIntegrityViolationException dve) {
+            dataIntegrityErrorHandler.handleDataIntegrityIssues(command, dve.getMostSpecificCause(), dve,
+                    "loan.repayment", "Repayment");
+            return CommandProcessingResult.empty();
+        }
+    }
+}
+```
+
+Style notes:
+
+- **`@Service` + `@RequiredArgsConstructor`** (Lombok) — every handler is a
+  Spring singleton with constructor injection.
+- **`@Transactional`** on the public method — handlers participate in the
+  command bus's transaction (see
+  [Command Implementation](/command/command-implementation)).
+- **No fields beyond services** — handlers don't hold mutable state.
+- **`DataIntegrityErrorHandler`** is the standard place to translate
+  database constraint violations into platform exceptions.
+
+## ~30 representative handlers
+
+Below are tables of handlers grouped by domain area. Each row shows the
+`entity` / `action` pair and the handler class. The catalogue is intentionally
+representative, not exhaustive — there are ~460 in total.
+
+### Loan domain (fineract-loan, fineract-provider)
+
+| `entity`   | `action`            | Handler                                           | Domain method                                              |
+|------------|---------------------|---------------------------------------------------|------------------------------------------------------------|
+| `LOAN`     | `CREATE`            | `LoanApplicationSubmittalCommandHandler`          | `LoanApplicationWritePlatformService.submitApplication`    |
+| `LOAN`     | `UPDATE`            | `LoanApplicationModificationCommandHandler`       | `…modifyApplication`                                       |
+| `LOAN`     | `DELETE`            | `LoanApplicationDeletionCommandHandler`           | `…deleteApplication`                                       |
+| `LOAN`     | `APPROVE`           | `LoanApplicationApprovalCommandHandler`           | `…approveApplication`                                      |
+| `LOAN`     | `APPROVALUNDO`      | `LoanApplicationApprovalUndoCommandHandler`       | `…undoApplicationApproval`                                 |
+| `LOAN`     | `REJECT`            | `LoanApplicationRejectedCommandHandler`           | `…rejectApplication`                                       |
+| `LOAN`     | `WITHDRAW`          | `LoanApplicationWithdrawnByApplicantCommandHandler` | `…applicantWithdrawsFromApplication`                     |
+| `LOAN`     | `DISBURSE`          | `DisburseLoanCommandHandler`                      | `LoanWritePlatformService.disburseLoan`                    |
+| `LOAN`     | `DISBURSETOSAVINGS` | `DisburseLoanToSavingsCommandHandler`             | `…disburseLoanToSavings`                                   |
+| `LOAN`     | `REPAYMENT`         | `LoanRepaymentCommandHandler`                     | `…makeLoanRepayment(REPAYMENT, …)`                         |
+| `LOAN`     | `CHARGEOFF`         | `ChargeOffLoanCommandHandler`                     | `…chargeOff`                                               |
+| `LOAN`     | `CLOSE`             | `CloseLoanCommandHandler`                         | `…closeLoan`                                               |
+| `LOAN`     | `FORECLOSURE`       | `ForeClosureCommandHandler`                       | `…forecloseLoan`                                           |
+| `LOAN`     | `GOODWILLCREDIT`    | `LoanGoodwillCreditCommandHandler`                | `…makeLoanRepayment(GOODWILL_CREDIT, …)`                   |
+| `LOANCHARGE` | `CREATE`          | `AddLoanChargeCommandHandler`                     | `…addLoanCharge`                                           |
+| `LOANCHARGE` | `DELETE`          | `DeleteLoanChargeCommandHandler`                  | `…deleteLoanCharge`                                        |
+
+### Savings domain (fineract-provider/portfolio/savings/handler)
+
+| `entity`            | `action`           | Handler                                  | Notes                                          |
+|---------------------|--------------------|------------------------------------------|------------------------------------------------|
+| `SAVINGSACCOUNT`    | `CREATE`           | `CreateSavingsAccountCommandHandler`     | submit savings application                     |
+| `SAVINGSACCOUNT`    | `APPROVE`          | `ApproveSavingsAccountCommandHandler`    | manager approves application                   |
+| `SAVINGSACCOUNT`    | `ACTIVATE`         | `ActivateSavingsAccountCommandHandler`   | activate post-approval                         |
+| `SAVINGSACCOUNT`    | `DEPOSIT`          | `DepositSavingsAccountCommandHandler`    | money in                                       |
+| `SAVINGSACCOUNT`    | `WITHDRAWAL`       | `WithdrawSavingsAccountCommandHandler`   | money out                                      |
+| `SAVINGSACCOUNT`    | `CALCULATEINTEREST`| `CalculateInterestSavingsAccountCommandHandler` | nightly job target                       |
+| `SAVINGSACCOUNT`    | `POSTINTEREST`     | `PostInterestSavingsAccountCommandHandler`| post accrued interest                          |
+| `SAVINGSACCOUNT`    | `CLOSE`            | `CloseSavingsAccountCommandHandler`      | terminate account                              |
+| `SAVINGSACCOUNTCHARGE` | `CREATE`        | `CreateSavingsAccountChargeCommandHandler`| add a charge to a savings account            |
+
+### Client / Group portfolio (fineract-provider/portfolio/client|group/handler)
+
+| `entity`        | `action`                  | Handler                                    | Notes                                  |
+|-----------------|---------------------------|--------------------------------------------|----------------------------------------|
+| `CLIENT`        | `CREATE`                  | `CreateClientCommandHandler`                | onboard a client                       |
+| `CLIENT`        | `UPDATE`                  | `UpdateClientCommandHandler`                | edit profile fields                    |
+| `CLIENT`        | `ACTIVATE`                | `ActivateClientCommandHandler`              | flip pending → active                  |
+| `CLIENT`        | `CLOSE`                   | `CloseClientCommandHandler`                 | close the client                       |
+| `CLIENT`        | `REJECT`                  | `RejectClientCommandHandler`                | reject application                     |
+| `CLIENT`        | `ASSIGNSTAFF`             | `AssignClientStaffCommandHandler`           | attach loan officer                    |
+| `CLIENT`        | `PROPOSETRANSFER`         | `ProposeClientTransferCommandHandler`       | move client between offices            |
+| `CLIENTIDENTIFIER` | `CREATE`               | `CreateClientIdentifierCommandHandler`      | KYC identifier                         |
+| `GROUP`         | `CREATE`                  | `CreateGroupCommandHandler`                 | create JLG/group                       |
+| `GROUP`         | `ASSOCIATECLIENTS`        | `AssociateClientsToGroupCommandHandler`     | add clients to a group                 |
+| `GROUP`         | `DISASSOCIATECLIENTS`     | `DisassociateClientsFromGroupCommandHandler`| remove clients from a group            |
+| `CENTER`        | `CREATE`                  | `CreateCenterCommandHandler`                | group of groups                        |
+
+### Accounting (fineract-accounting + fineract-provider)
+
+| `entity`        | `action`              | Handler                                  | Notes                                 |
+|-----------------|-----------------------|------------------------------------------|---------------------------------------|
+| `GLACCOUNT`     | `CREATE` / `UPDATE` / `DELETE` | `CreateGLAccountCommandHandler` / `UpdateGLAccountCommandHandler` / `DeleteGLAccountCommandHandler` | Chart of accounts |
+| `JOURNALENTRY`  | `CREATE`              | `CreateJournalEntryCommandHandler`        | manual journal entry                 |
+| `JOURNALENTRY`  | `REVERSE`             | `ReverseJournalEntryCommandHandler`       | undo with mirror entry               |
+| `ACCOUNTINGRULE` | `CREATE`             | `CreateAccountingRuleCommandHandler`      | reusable account templates           |
+| `GLCLOSURE`     | `CREATE`              | `CreateGLClosureCommandHandler`           | period close                          |
+| `FINANCIALACTIVITYACCOUNT` | `CREATE`   | `CreateFinancialActivityAccountMappingCommandHandler` | map activities ↔ GL accounts |
+
+### Organisation (fineract-branch, fineract-provider)
+
+| `entity`        | `action`        | Handler                                   | Notes                                |
+|-----------------|-----------------|-------------------------------------------|--------------------------------------|
+| `OFFICE`        | `CREATE`        | `CreateOfficeCommandHandler`               | branch hierarchy                     |
+| `OFFICE`        | `UPDATE`        | `UpdateOfficeCommandHandler`               |                                      |
+| `STAFF`         | `CREATE`        | `CreateStaffCommandHandler`                | loan officer / teller                |
+| `HOLIDAY`       | `CREATE`        | `CreateHolidayCommandHandler`              | per-office holiday calendar          |
+| `TELLER`        | `CREATE`        | `CreateTellerCommandHandler`               | teller / cashier                     |
+| `TELLER`        | `ALLOCATECASHIER` | `AllocateCashierToTellerCommandHandler`  | assign cashier shift                 |
+
+### Configuration & infrastructure
+
+| `entity`                | `action`        | Handler                                                  | Notes                                  |
+|-------------------------|-----------------|----------------------------------------------------------|----------------------------------------|
+| `CONFIGURATION`         | `UPDATE`        | `UpdateGlobalConfigurationCommandHandler`                 | toggle e.g. maker-checker per task     |
+| `PERMISSION`            | `UPDATE`        | `UpdatePermissionsCommandHandler`                         | edit role-permission grid              |
+| `ROLE`                  | `CREATE`        | `CreateRoleCommandHandler`                                | user-administration role               |
+| `USER`                  | `CREATE`        | `CreateUserCommandHandler`                                | app user                               |
+| `USER`                  | `CHANGEPWD`     | `ChangePasswordCommandHandler`                            | self-service password change           |
+| `SCHEDULER`             | `EXECUTEJOB`    | `ExecuteJobCommandHandler`                                | run named scheduled job                |
+| `EMAIL_CAMPAIGN`        | `CREATE`        | `CreateEmailCampaignCommandHandler`                       | engagement campaigns                   |
+| `SMSCAMPAIGN`           | `ACTIVATE`      | `ActivateSmsCampaignCommandHandler`                       | switch on a campaign                   |
+| `ENTITYMAPPING`         | `CREATE`        | `CreateEntityToEntityMappingCommandHandler`               | entity access mappings                 |
+
+## Entity catalogue
+
+Pulling the distinct `entity` strings from every `@CommandType` shows the
+shape of the bus. The list below is **every distinct entity in use today**
+(counts taken from a `grep` over `*CommandHandler.java`):
+
+```
+ACCOUNTINGRULE, ACCOUNTNUMBERFORMAT, ACCOUNTTRANSFER, ADDRESS, ADHOC,
+CALENDAR, CENTER, CHARGE, CLIENT, CLIENTIDENTIFIER, CODE, CODEVALUE,
+COLLATERAL, COLLATERAL_PRODUCT, COLLECTIONSHEET, CONFIGURATION, CREATE,
+CREDITBUREAU_CONFIGURATION, CREDITBUREAU_LOANPRODUCT_MAPPING, CREDITREPORT,
+DELETE, DELINQUENCY_ACTION, DELINQUENCY_BUCKET, DELINQUENCY_RANGE, EMAIL,
+EMAIL_CAMPAIGN, EMAIL_CONFIGURATION, ENTITYMAPPING, ENTITY_DATATABLE_CHECK,
+EXTERNALSERVICES, FAMILYMEMBERS, FINANCIALACTIVITYACCOUNT, FIXEDDEPOSITACCOUNT,
+FIXEDDEPOSITPRODUCT, FLOATINGRATE, FUND, GLACCOUNT, GLCLOSURE, GLIMLOAN, GROUP,
+GSIMACCOUNT, GUARANTOR, HOLIDAY, JOURNALENTRY, LIKELIHOOD, LOAN, LOANCHARGE,
+LOANPRODUCT, LOAN_AVAILABLE_DISBURSEMENT_AMOUNT, LOAN_ORIGINATOR, OFFICE,
+OFFICETRANSACTION, ORGANISATIONCREDITBUREAU, PASSWORD_PREFERENCES,
+PERIODICACCRUALACCOUNTING, PERMISSION, PROVISIONCATEGORY, PROVISIONCRITERIA,
+PROVISIONENTRIES, PROVISIONJOURNALENTRIES, RATE, RECURRINGDEPOSITACCOUNT,
+RECURRINGDEPOSITPRODUCT, REPORT, RESCHEDULELOAN, ROLE, SAVINGSACCOUNT,
+SAVINGSACCOUNTCHARGE, SAVINGSPRODUCT, SCHEDULER, SHAREACCOUNT, SHAREPRODUCT,
+SMS, SMSCAMPAIGN, STANDINGINSTRUCTION, TAXCOMPONENT, TAXGROUP, TELLER, UPDATE,
+USER, WAIVECHARGE, WC_DELINQUENCY_ACTION, WORKINGCAPITALBREACH,
+WORKINGCAPITALLOAN, WORKINGCAPITALLOANPRODUCT, WORKINGCAPITALNEARBREACH
+```
+
+Plus a handful of handlers that source their entity from a `*ApiConstants`
+constant (`ClientApiConstants.CLIENT_CHARGES_RESOURCE_NAME`,
+`CommandWrapperConstants.ENTITY_WORKINGCAPITALLOAN`, etc.) — these resolve to
+strings in the same UPPERCASE namespace.
+
+## How a `CommandWrapper` ends up at a handler
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as JAX-RS resource
+    participant Builder as CommandWrapperBuilder
+    participant SCPS as SynchronousCommand<br/>ProcessingService
+    participant Provider as CommandHandlerProvider
+    participant Map as registeredHandlers<br/>HashMap&lt;String,String&gt;
+    participant Spring as ApplicationContext
+    participant Handler as @CommandType handler
+
+    API->>Builder: disburseLoanApplication(17).withJson(body)
+    Builder-->>API: CommandWrapper{<br/>entityName=LOAN,<br/>actionName=DISBURSE,<br/>entityId=17}
+    API->>SCPS: executeCommand(wrapper, command, false)
+    SCPS->>Provider: getHandler("LOAN", "DISBURSE")
+    Provider->>Map: get("LOAN|DISBURSE")
+    Map-->>Provider: "disburseLoanCommandHandler"
+    Provider->>Spring: getBean("disburseLoanCommandHandler", NewCommandSourceHandler.class)
+    Spring-->>Provider: DisburseLoanCommandHandler singleton
+    Provider-->>SCPS: handler
+    SCPS->>Handler: processCommand(jsonCommand)
+    Handler-->>SCPS: CommandProcessingResult
+```
+
+## Special branches in `findCommandHandler`
+
+Not every command goes through the `entity|action` map.
+`SynchronousCommandProcessingService.findCommandHandler(wrapper)` has hand-coded
+fast paths for two families of "transversal" operations:
+
+```java
+// fineract-core/.../SynchronousCommandProcessingService.java (excerpt)
+if (wrapper.isDatatableResource()) {
+    if (wrapper.isCreateDatatable()) {
+        handler = applicationContext.getBean("createDatatableCommandHandler", NewCommandSourceHandler.class);
+    } else if (wrapper.isDeleteDatatable()) {
+        handler = applicationContext.getBean("deleteDatatableCommandHandler", NewCommandSourceHandler.class);
+    } else if (wrapper.isUpdateDatatable()) {
+        handler = applicationContext.getBean("updateDatatableCommandHandler", NewCommandSourceHandler.class);
+    } else if (wrapper.isCreate()) {
+        handler = applicationContext.getBean("createDatatableEntryCommandHandler", NewCommandSourceHandler.class);
+    } else if (wrapper.isUpdateMultiple()) {
+        handler = applicationContext.getBean("updateOneToManyDatatableEntryCommandHandler", NewCommandSourceHandler.class);
+    } /* … */
+} else if (wrapper.isNoteResource()) {
+    if (wrapper.isCreate()) {
+        handler = applicationContext.getBean("createNoteCommandHandler", NewCommandSourceHandler.class);
+    } else if (wrapper.isUpdate()) {
+        handler = applicationContext.getBean("updateNoteCommandHandler", NewCommandSourceHandler.class);
+    } /* … */
+}
+```
+
+- **Datatables** — handlers in
+  `fineract-provider/.../infrastructure/dataqueries/handler/` are looked up by
+  bean name because the URL pattern (`/datatables/...`) is the discriminator,
+  not a fixed entity string.
+- **Notes** — `fineract-provider/.../portfolio/note/handler/` is shared across
+  client, group, loan, savings, and loan-transaction notes.
+
+For everything else the `@CommandType` map wins.
+
+## Worked example end to end
+
+`POST /v1/loans/17/transactions?command=repayment` body `{"transactionAmount": 1000, …}`:
+
+1. `LoansApiResource.executeCommand(...)` (in `fineract-provider/.../portfolio/loanaccount/api/`):
+   ```java
+   CommandWrapper commandRequest = new CommandWrapperBuilder()
+           .loanRepaymentTransaction(loanId)
+           .withJson(apiRequestBodyAsJson)
+           .build();
+   return this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+   ```
+2. `CommandWrapperBuilder.loanRepaymentTransaction(loanId)` sets
+   `actionName = ACTION_REPAYMENT`, `entityName = ENTITY_LOAN`, `loanId = …`.
+3. `PortfolioCommandSourceWritePlatformServiceImpl.logCommandSource` checks
+   `validateHasPermissionTo("REPAYMENT_LOAN")`.
+4. `SynchronousCommandProcessingService.executeCommand` saves the
+   `UNDER_PROCESSING` `CommandSource`, then calls
+   `CommandHandlerProvider.getHandler("LOAN", "REPAYMENT")`.
+5. `CommandHandlerProvider` returns the bean named `loanRepaymentCommandHandler`.
+6. `LoanRepaymentCommandHandler.processCommand(jsonCommand)` calls
+   `loanWritePlatformService.makeLoanRepayment(LoanTransactionType.REPAYMENT, loanId, command, false)`.
+7. The domain service returns a `CommandProcessingResult` that
+   `SynchronousCommandProcessingService` then writes back as the row's `result`
+   and flips status to `PROCESSED`.
+
+## Cross-references
+
+- [Command Implementation](/command/command-implementation) — the dispatcher
+  side; how the wrapper becomes a handler call.
+- [Maker-Checker & Audits](/command/maker-checker-and-audits) — how
+  `entity_<action>` permissions feed the approval flow.
+- [Command Core SPI](/command/command-core) — the *new* generic handler
+  interface (`CommandHandler<REQ, RES>`) that does **not** use `@CommandType`.
+  The catalogue above is for the provider-side `NewCommandSourceHandler` API,
+  which is what every real domain handler implements today.
+- `fineract-core/.../commands/domain/CommandWrapperConstants.java` — the
+  master list of `ENTITY_*` and `ACTION_*` string constants used by
+  `CommandWrapperBuilder` and the `@CommandType` annotations.

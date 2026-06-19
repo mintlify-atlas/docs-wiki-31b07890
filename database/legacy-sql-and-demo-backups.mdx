@@ -1,0 +1,319 @@
+---
+title: "Legacy SQL and Demo Backups under fineract-db/"
+sidebarTitle: "Legacy SQL & Demo Backups"
+description: "What still lives in Apache Fineract's fineract-db/ directory: the Flyway-era tenant-store bootstrap, the four old-schema-files/ baseline SQL files, and every bundled multi-tenant demo backup (bare-bones, default-demo, latam-demo, CEDA, GK-Maarg)."
+---
+
+Although every Apache Fineract install today is provisioned by Liquibase, the repository still ships a `fineract-db/` directory full of raw SQL. These files predate the Liquibase migration and are **not** executed at runtime by the application, but they are still useful for three things: bootstrapping a tenant-store on environments that cannot run Liquibase, reading the original schema as a historical reference, and **restoring one of the bundled demo tenants** for QA / training / screenshots.
+
+This page walks every file in `fineract-db/`, says what state of the database it captures, and explains when (and when not) to use it.
+
+## Directory layout
+
+```text fineract-db/
+mifospltaform-tenants-first-time-install.sql
+old-schema-files/
+  0001a-mifosplatform-core-ddl-latest.sql
+  0002-mifosx-base-reference-data-utf8.sql
+  0003-mifosx-permissions-and-authorisation-utf8.sql
+  0004-mifosx-core-reports-utf8.sql
+multi-tenant-demo-backups/
+  0001-mifos-platform-shared-tenants.sql
+  bk_mifostenant_default.sql
+  bare-bones-demo/
+    README.md
+    bk_bare_bones_demo.sql
+  default-demo/
+    README.md
+    bk_mifostenant-default.sql
+    extra-datatables-and-code-values.sql
+  latam-demo/
+    README.md
+    bk_latam.sql
+    datatables-on-latam-demo.sql
+  ceda/
+    README.md
+    bk_ceda_trial.sql
+    bk_core_with_custom_and_coa.sql
+    ceda-schema-customisations.sql
+    ceda-user-office-product-setup.sql
+  gk-maarg/
+    0001b-gk-datatables.sql
+```
+
+Three sub-areas, each with a different purpose:
+
+| Path | Purpose | Schema target |
+| --- | --- | --- |
+| `mifospltaform-tenants-first-time-install.sql` | Original (Flyway-era) tenant-store bootstrap | `fineract_tenants` |
+| `old-schema-files/` | Original (Flyway-era) per-tenant DDL + base data + permissions + reports | per-tenant (e.g. `fineract_default`) |
+| `multi-tenant-demo-backups/` | mysqldump snapshots of pre-made tenant-store rows and demo per-tenant databases | both |
+
+All files are MySQL dialect (they originate from `mysqldump` against MySQL/MariaDB). PostgreSQL deployments cannot consume them directly.
+
+## The Flyway-era tenant-store bootstrap
+
+`fineract-db/mifospltaform-tenants-first-time-install.sql` is a single MySQL dump that creates and seeds the **tenant-store** (`fineract_tenants`). The header makes its provenance clear:
+
+```sql fineract-db/mifospltaform-tenants-first-time-install.sql
+-- MySQL dump 10.13  Distrib 5.1.60, for Win32 (ia32)
+--
+-- Host: localhost    Database: fineract_tenants
+-- ------------------------------------------------------
+-- Server version    5.1.60-community
+```
+
+It creates three tables:
+
+| Table | Role |
+| --- | --- |
+| `schema_version` | **Flyway**'s metadata table — the predecessor to Liquibase's `DATABASECHANGELOG` |
+| `tenants` | The original (pre-Liquibase) shape of the tenants catalog |
+| `timezones` | The IANA timezone reference data |
+
+Notice the original `tenants` row that the file seeds:
+
+```sql fineract-db/multi-tenant-demo-backups/0001-mifos-platform-shared-tenants.sql
+INSERT INTO `tenants` VALUES
+  (1,'default','Default Demo Tenant','fineract_default','Asia/Kolkata',
+   NULL,NULL,NULL,NULL,'localhost','3306','root','mysql',1);
+```
+
+Compare that with the modern Liquibase shape: in this dump, host/port/user/password live **directly on the `tenants` row** as columns `schema_server`, `schema_server_port`, `schema_username`, `schema_password`. The current schema splits those out into the `tenant_server_connections` table; the migration history is captured in changelog `0001_initial_schema.xml` (the new shape) and `0004_readonly_database_connection.xml` (the read-only replica columns added on top).
+
+### When you'd actually run it
+
+You should generally **not** run this file against a fresh installation — Liquibase will set up the same tenant-store with the modern shape (including read-only replica support and encrypted passwords). The file is useful when:
+
+- You are restoring a backup of a pre-2.x installation that still uses the Flyway-era shape.
+- You are trying to inspect the original DDL without spinning up Liquibase.
+- You are writing tooling that has to migrate from a pre-Liquibase Fineract install to a current one.
+
+## `old-schema-files/` — the original per-tenant DDL
+
+The four files under `fineract-db/old-schema-files/` are the **original** (pre-Liquibase) per-tenant schema, split into four pieces:
+
+```text fineract-db/old-schema-files/
+0001a-mifosplatform-core-ddl-latest.sql               ← core DDL (CREATE TABLE …)
+0002-mifosx-base-reference-data-utf8.sql              ← reference data (currencies, codes, enums)
+0003-mifosx-permissions-and-authorisation-utf8.sql    ← m_permission / m_role / m_appuser rows
+0004-mifosx-core-reports-utf8.sql                     ← stretchy_report rows
+```
+
+A peek at the DDL file shows that the original schema already had the table prefixes still in use today:
+
+```sql fineract-db/old-schema-files/0001a-mifosplatform-core-ddl-latest.sql
+CREATE TABLE `m_currency` ...
+CREATE TABLE `m_organisation_currency` ...
+CREATE TABLE `c_configuration` ...
+CREATE TABLE `m_code` ...
+CREATE TABLE `m_code_value` ...
+CREATE TABLE `m_document` ...
+CREATE TABLE `r_enum_value` ...
+CREATE TABLE `x_registered_table` ...
+CREATE TABLE IF NOT EXISTS `m_calendar` ...
+CREATE TABLE IF NOT EXISTS `m_calendar_instance` ...
+CREATE TABLE `m_office` ...
+CREATE TABLE `m_office_transaction` ...
+CREATE TABLE `m_permission` ...
+CREATE TABLE `m_role` ...
+CREATE TABLE `m_role_permission` ...
+CREATE TABLE `m_appuser` ...
+CREATE TABLE `m_appuser_role` ...
+CREATE TABLE `m_portfolio_command_source` ...
+CREATE TABLE `m_charge` ...
+CREATE TABLE `m_fund` ...
+```
+
+The numeric prefixes (`0001a-`, `0002-`, `0003-`, `0004-`) are the Flyway naming convention: Flyway sorts migrations lexically and runs them in that order. Today the equivalent of these four files is the much-larger `fineract-provider/src/main/resources/db/changelog/tenant/parts/0001_initial_schema.xml` plus `0002_initial_data.xml` — but they are not byte-for-byte identical because two decades of Liquibase changesets have edited the schema since the original DDL was captured.
+
+These files are kept around as **historical reference**, not as a production install path.
+
+## `multi-tenant-demo-backups/` — pre-made tenant snapshots
+
+This directory is the most genuinely useful piece of `fineract-db/`. It contains `mysqldump` snapshots of several **pre-populated tenant configurations** that you can restore as-is when you want a working environment without going through the Liquibase bootstrap + UI clicks.
+
+The contents fall into two categories: a **shared tenants snapshot** and a **per-tenant database backup** for each demo.
+
+### `0001-mifos-platform-shared-tenants.sql` — the shared tenant-store snapshot
+
+A single tenant-store snapshot that registers all the demo tenants at once. The file dumps `tenants` and `timezones` and inserts:
+
+```sql fineract-db/multi-tenant-demo-backups/0001-mifos-platform-shared-tenants.sql
+INSERT INTO `tenants` VALUES
+  (1,'default','Default Demo Tenant','fineract_default','Asia/Kolkata',
+   NULL,NULL,NULL,NULL,'localhost','3306','root','mysql',1);
+```
+
+Restoring this into a MariaDB / MySQL instance gives you a tenant-store with the `default` tenant already pointing at the local server.
+
+### `bk_mifostenant_default.sql` — the per-tenant database for the default tenant
+
+Top-level companion to the shared-tenants file: `bk_mifostenant_default.sql` (~1,920 lines) is a dump of the `fineract_default` per-tenant database with a representative seed of clients, loans, savings, journal entries, products, permissions, and users. Restoring it gives the `default` tenant an immediately-usable demo.
+
+The pair `0001-mifos-platform-shared-tenants.sql` + `bk_mifostenant_default.sql` is the "smallest working multi-tenant install" — a tenant-store pointing at a per-tenant database, both populated.
+
+### `bare-bones-demo/` — the smallest viable tenant
+
+```text fineract-db/multi-tenant-demo-backups/bare-bones-demo/
+README.md
+bk_bare_bones_demo.sql
+```
+
+Per its README, the bare-bones tenant contains:
+
+> - DDL of latest schema
+> - Minimum reference data required for deployment of platform which is:
+>   - One selected currency (US Dollar by default)
+>   - One root / head office called 'Head Office'
+>   - All permissions supported/needed by latest release of software
+>   - One role called 'Super user' with 'Full Authorisation'
+>   - One application user `mifos` / `password` associated with `Head Office` and the `Super user` role
+> - One `code` called 'Client Identifier' with default values `{ 'Passport number' }`
+> - One enable/disable configuration entry called `maker-checker` (off by default)
+> - No products (loans / deposit / savings)
+> - No charges, staff, clients, groups, accounts, or chart of accounts
+
+This is what to restore when you want the absolute minimum needed to log in and click around — useful for screenshots, smoke tests, and tutorials that should not be biased by pre-existing data.
+
+### `default-demo/` — a small "happy path" tenant
+
+```text fineract-db/multi-tenant-demo-backups/default-demo/
+README.md
+bk_mifostenant-default.sql
+extra-datatables-and-code-values.sql
+```
+
+Per its README:
+
+> - DDL of latest schema
+> - Minimum reference data required for deployment of platform which is:
+>   - Several Latin-American currencies as the selected currency set
+>   - One root office called 'Latam HO'
+>   - All permissions supported/needed by latest release
+>   - One role called 'Super user'
+>   - One application user `quipo` / `quipo`
+> - Minimum amount of data to support legacy-docs interaction.
+
+The `extra-datatables-and-code-values.sql` companion adds a small set of code-value rows and datatables on top of the base backup, used by the legacy docs walkthroughs:
+
+```sql fineract-db/multi-tenant-demo-backups/default-demo/extra-datatables-and-code-values.sql
+INSERT INTO `m_code_value`(`code_id`,`code_value`,`order_position`) ...
+INSERT INTO `m_code`...
+```
+
+### `latam-demo/` — the larger Latin-American demo
+
+```text fineract-db/multi-tenant-demo-backups/latam-demo/
+README.md
+bk_latam.sql                       ← 1,832 lines
+datatables-on-latam-demo.sql        ← extra datatable definitions / inserts
+```
+
+Same shape as the default demo but the full Latin-American dataset (multiple currencies, a richer office tree, more sample data). Per its README, includes:
+
+> - One root office 'Latam HO'
+> - One application user `quipo` / `quipo`
+> - One code 'Client Identifier' with default values `{ 'Passport number' }`
+> - `maker-checker` configuration (off by default)
+
+### `ceda/` — the CEDA Microfinance customization sample
+
+```text fineract-db/multi-tenant-demo-backups/ceda/
+README.md
+bk_ceda_trial.sql
+bk_core_with_custom_and_coa.sql
+ceda-schema-customisations.sql
+ceda-user-office-product-setup.sql
+```
+
+The README explains:
+
+> CEDA Microfinance (Kampala, Uganda)
+> This demo database contains:
+> - DDL of latest schema
+> - Minimum reference data required for deployment of platform
+> - Customisations for CEDA on `m_code`/`m_code_value` tables, extra datatables for client and loan data capture
+> - Extra reports over and beyond core reports customisation for CEDA operations
+
+What each file does:
+
+| File | Purpose |
+| --- | --- |
+| `bk_ceda_trial.sql` | Full mysqldump of a working CEDA tenant, including DDL, reference data, customisations, and CEDA-specific reports |
+| `bk_core_with_custom_and_coa.sql` | A backup with CEDA's customisations applied **on top of** a populated chart of accounts |
+| `ceda-schema-customisations.sql` | Just the CEDA-specific datatable / code customisations, applicable on top of a vanilla tenant |
+| `ceda-user-office-product-setup.sql` | Office hierarchy + users + product setup tailored to CEDA |
+
+This is the canonical example of a real-world "fork" of the schema: a small SQL overlay on top of a vanilla tenant that adds organisation-specific datatables, code values, and reports without forking the codebase.
+
+### `gk-maarg/` — datatables-only fragment
+
+```text fineract-db/multi-tenant-demo-backups/gk-maarg/
+0001b-gk-datatables.sql
+```
+
+A small fragment — 58 lines — that just creates a custom datatable (`risk_analysis`) used by the GK-Maarg deployment:
+
+```sql fineract-db/multi-tenant-demo-backups/gk-maarg/0001b-gk-datatables.sql
+CREATE TABLE `risk_analysis` ( ... );
+```
+
+It is **not** a full tenant backup; it is meant to be layered on top of an existing tenant database.
+
+## Choosing a demo backup
+
+| Use case | Restore |
+| --- | --- |
+| First-time install, want everything wired up so I can log in | `0001-mifos-platform-shared-tenants.sql` + `bk_mifostenant_default.sql` |
+| Smoke test / CI seed / clean screenshots | `bare-bones-demo/bk_bare_bones_demo.sql` |
+| Walkthrough of the legacy "default demo" | `default-demo/bk_mifostenant-default.sql` (+ `extra-datatables-and-code-values.sql`) |
+| Larger sample with Latin-American currencies | `latam-demo/bk_latam.sql` (+ `datatables-on-latam-demo.sql`) |
+| Example of organisation-specific customisations | `ceda/bk_ceda_trial.sql` (or `ceda/ceda-schema-customisations.sql` overlay on a vanilla tenant) |
+| Just a `risk_analysis` datatable | `gk-maarg/0001b-gk-datatables.sql` (layered on top) |
+
+## Restoring a demo (rough recipe)
+
+The dumps are MariaDB / MySQL-format. A typical restore looks like:
+
+```sh
+# 1. Create empty databases
+mysql -uroot -e "CREATE DATABASE fineract_tenants;
+                 CREATE DATABASE fineract_default;"
+
+# 2. Load the shared tenant-store snapshot
+mysql -uroot fineract_tenants < fineract-db/multi-tenant-demo-backups/0001-mifos-platform-shared-tenants.sql
+
+# 3. Load the per-tenant database backup of your choice
+mysql -uroot fineract_default < fineract-db/multi-tenant-demo-backups/default-demo/bk_mifostenant-default.sql
+
+# 4. (Optional) Layer customisations on top
+mysql -uroot fineract_default < fineract-db/multi-tenant-demo-backups/default-demo/extra-datatables-and-code-values.sql
+```
+
+When the application boots against those databases with `spring.liquibase.enabled=true` (the default), Liquibase will detect any changesets that are newer than what the dump contained and apply them — bringing the restored snapshot forward to the current schema version. So even an older demo backup will "catch up" to the latest schema as long as you let Liquibase run on first boot.
+
+## What is **not** here
+
+Some things you might expect in `fineract-db/` but won't find:
+
+- **PostgreSQL versions of these dumps.** All files are MySQL/MariaDB. PostgreSQL installs build from Liquibase only.
+- **Production migration scripts.** Use Liquibase for those.
+- **A dump of the latest Liquibase-managed schema.** The authoritative source for the current schema is the changelogs under `fineract-provider/src/main/resources/db/changelog/` and the per-module `db/changelog/tenant/module/*/` directories, not anything in `fineract-db/`.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Database overview" href="/database/overview" icon="database">
+    The supported database engines, the two-database model, and how Liquibase replaces the SQL files documented above.
+  </Card>
+  <Card title="Liquibase changelogs" href="/database/liquibase-changelogs" icon="layer-group">
+    The Liquibase changelogs that build the modern schema and the historical "initial switch" from the Flyway-era SQL on this page.
+  </Card>
+  <Card title="Tenant vs. tenant-store" href="/database/tenant-vs-tenant-store" icon="server">
+    The current tenant-store schema (`tenants`, `tenant_server_connections`, `timezones`) and how the legacy single-table layout in `mifospltaform-tenants-first-time-install.sql` maps onto it.
+  </Card>
+  <Card title="Reporting overview" href="/reporting/overview" icon="chart-line">
+    The stretchy-report rows seeded by `old-schema-files/0004-mifosx-core-reports-utf8.sql` and the modern reporting subsystem that runs them.
+  </Card>
+</CardGroup>
